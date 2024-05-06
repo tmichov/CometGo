@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"io"
+	"os"
 
 	"golang.org/x/net/websocket"
 )
@@ -10,7 +11,19 @@ import (
 func (s *Server) handleWS(ws *websocket.Conn) {
 	fmt.Println("new incoming connection for client:", ws.RemoteAddr())
 
+	if ws.Request().Host != os.Getenv("APP_URL") {
+		ws.Close()
+		return
+	}
+
+	fmt.Println("connection accepted")
+
 	s.conns[ws] = true
+	defer func() {
+		fmt.Println("closing connection for client:", ws.RemoteAddr())
+		delete(s.conns, ws)
+		ws.Close()
+	}()
 
 	s.readLoop(ws)
 }
