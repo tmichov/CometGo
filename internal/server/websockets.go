@@ -18,7 +18,10 @@ func (s *Server) handleWS(ws *websocket.Conn) {
 
 	fmt.Println("connection accepted")
 
-	s.conns[ws] = true
+	if !s.conns[ws] {
+		s.conns[ws] = true
+	}
+	
 	defer func() {
 		fmt.Println("closing connection for client:", ws.RemoteAddr())
 		delete(s.conns, ws)
@@ -30,9 +33,8 @@ func (s *Server) handleWS(ws *websocket.Conn) {
 
 func (s *Server) readLoop(ws *websocket.Conn) {
 	buf := make([]byte, 1024)
-
 	for {
-		n, err := ws.Read(buf) 
+		n, err := ws.Read(buf)
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -41,12 +43,10 @@ func (s *Server) readLoop(ws *websocket.Conn) {
 			continue
 		}
 
-		msg := buf[n]
-		fmt.Println(string(msg))
+		msg := buf[:n]
 
-		ws.Write([]byte("Thank you for the msg!"))
+		fmt.Println("received msg:", string(msg))
 	}
-
 }
 
 

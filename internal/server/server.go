@@ -19,6 +19,8 @@ type Server struct {
 	db database.Service
 
 	conns map[*websocket.Conn]bool
+
+	routes http.Handler
 }
 
 func NewServer() *http.Server {
@@ -30,10 +32,11 @@ func NewServer() *http.Server {
 		conns: make(map[*websocket.Conn]bool),
 	}
 
+	NewServer.RegisterRoutes()
 	// Declare Server config
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", NewServer.port),
-		Handler:      NewServer.RegisterRoutes(),
+		Handler:      NewServer.routes,
 		IdleTimeout:  time.Minute,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,

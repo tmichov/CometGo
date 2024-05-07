@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes as RRoutes, Route } from "react-router-dom";
 
-const ROUTES = import.meta.glob('/src/pages/**/[a-z[]*.tsx', {eager: true})
+const ROUTES = import.meta.glob('/src/pages/**/[a-z[]*.tsx', {eager: true}) as Record<string, any>;
 
 let routes = Object.keys(ROUTES).map((route) => {
 	let path = route
@@ -50,6 +50,7 @@ const customRoutes = routes.map((route, i) => {
 		<Route key={`route-${i}`} path={route.path} element={route.element} />
 	)
 });
+
 
 export default function RoutesList() {
 	return (
