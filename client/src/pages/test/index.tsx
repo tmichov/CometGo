@@ -1,10 +1,13 @@
-import { getDDPClient } from "../../ddp"
+import { Comet } from "../../Comet/comet"
 
 function Index() {
-	const client = getDDPClient()
 	const handleClick = () => {
-		client.subscribe('users')	
+		Comet.call("task.insert", {
+			title: "Test",
+			description: "Test description",
+		})
 	}
+
 	return (
 		<>
 			<h1>Index</h1>

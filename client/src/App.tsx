@@ -1,8 +1,8 @@
 import './App.css'
 import RoutesList from './routes'
-import { getDDPClient } from './ddp'
+import { Comet } from './Comet/comet'
 
-getDDPClient()
+Comet.init()
 
 function App() {
 	return (

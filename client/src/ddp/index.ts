@@ -1,5 +1,4 @@
 import { env } from "../util/env";
-import { Random } from "../util/random";
 
 class DDPClient {
 	private ws: WebSocket|null = null;
@@ -7,7 +6,6 @@ class DDPClient {
 	private host: string = env('DDP_HOST', 'localhost');
 	private port: number = env('DDP_PORT', 8000, 'number');
 	private path: string = env('DDP_PATH', '/ws');
-	private subscriptions: any[] = [];
 
 	constructor() {
 		this.connect();	
@@ -39,16 +37,7 @@ class DDPClient {
 		this.ws?.close();
 	}
 
-	subscribe(channel: string) {
-		console.log(this.subscriptions);
-		this.subscriptions.push({
-			id: Random.id()
-		});
-
-		this._send({msg: "sub", id: "1", name: channel});
-	}
-
-	private _send(obj: object) {
+	_send(obj: object) {
 		this.ws?.send(JSON.stringify(obj));
 	}
 
@@ -60,6 +49,10 @@ class DDPClient {
 			console.log("errored: ", data);
 		}
 
+	}
+	
+	_ping() {
+		this._send({msg: "ping"});
 	}
 }
 

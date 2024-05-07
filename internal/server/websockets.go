@@ -1,12 +1,19 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 
 	"golang.org/x/net/websocket"
 )
+
+type Message struct {
+	Msg string `json:"msg"`
+	Id string `json:"id"`
+	Name string `json:"name"`
+}
 
 func (s *Server) handleWS(ws *websocket.Conn) {
 	fmt.Println("new incoming connection for client:", ws.RemoteAddr())
@@ -46,7 +53,22 @@ func (s *Server) readLoop(ws *websocket.Conn) {
 		msg := buf[:n]
 
 		fmt.Println("received msg:", string(msg))
+
+		var data Message
+		err = json.Unmarshal([]byte(msg), &data)
+
+		if err != nil {
+			fmt.Println("json unmarshal error:", err)
+			continue
+		}
+
+		if data.Msg == "ping" {
+			s.ping(ws)
+		}	
 	}
 }
 
-
+func (s *Server) ping(ws *websocket.Conn) {
+	fmt.Println("sending pong to client:", ws.RemoteAddr())
+	ws.Write([]byte(`{"msg":"pong"}`))
+}

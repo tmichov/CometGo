@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 
@@ -27,19 +26,9 @@ func (s *Server) HelloWorldHandler(w http.ResponseWriter, r *http.Request) {
 	resp := make(map[string]string)
 	resp["message"] = "Hello World"
 
-	fmt.Println("test")
 	jsonResp, err := json.Marshal(resp)
 	if err != nil {
 		log.Fatalf("error handling JSON marshal. Err: %v", err)
-	}
-
-	//TODO: remove this code, it was used for testing
-	fmt.Println(s.conns)
-	for conn := range s.conns {
-		_, err := conn.Write(jsonResp)
-		if err != nil {
-			log.Fatalf("error writing to websocket. Err: %v", err)
-		}
 	}
 
 	_, _ = w.Write(jsonResp)
