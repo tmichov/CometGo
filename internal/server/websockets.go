@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"testingGo/internal/database"
 
 	"golang.org/x/net/websocket"
 )
@@ -69,6 +70,10 @@ func (s *Server) readLoop(ws *websocket.Conn) {
 }
 
 func (s *Server) ping(ws *websocket.Conn) {
+	db := database.New()
+
+	health := db.Health()
+	fmt.Println("db health:", health)
 	fmt.Println("sending pong to client:", ws.RemoteAddr())
 	ws.Write([]byte(`{"msg":"pong"}`))
 }

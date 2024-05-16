@@ -46,8 +46,10 @@ indices.reverse().map((i) => {
 });
 
 const customRoutes = routes.map((route, i) => { 
+	const Comp = route.element;
+
 	return (
-		<Route key={`route-${i}`} path={route.path} element={route.element} />
+		<Route key={`route-${i}`} path={route.path} element={typeof Comp == 'object' ? Comp : <Comp />} />
 	)
 });
 

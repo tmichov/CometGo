@@ -8,6 +8,7 @@ import (
 	"time"
 
 	_ "github.com/joho/godotenv/autoload"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -23,7 +24,7 @@ type service struct {
 var (
 	host = os.Getenv("DB_HOST")
 	port = os.Getenv("DB_PORT")
-	//database = os.Getenv("DB_DATABASE")
+	//database = os.Getenv("DB_NAME")
 )
 
 func New() Service {
@@ -31,8 +32,8 @@ func New() Service {
 
 	if err != nil {
 		log.Fatal(err)
-
 	}
+
 	return &service{
 		db: client,
 	}
@@ -46,6 +47,19 @@ func (s *service) Health() map[string]string {
 	if err != nil {
 		log.Fatalf(fmt.Sprintf("db down: %v", err))
 	}
+
+	// get all users from admin db
+	collection := s.db.Database("test").Collection("testing")
+
+	result, err := collection.Find(context.Background(), bson.D{{}})
+
+	if err != nil {
+		log.Fatalf(fmt.Sprintf("db down: %v", err))
+	}
+
+	defer result.Close(ctx)
+
+	fmt.Println("result:", result)
 
 	return map[string]string{
 		"message": "It's healthy",
