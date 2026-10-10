@@ -194,7 +194,11 @@ Resets are used for reconnect resync, identity change and **[later]** slow-consu
 - **[later] `"ik":"<uuid>"` idempotency key.**
   - The framework writes `(ik, userId, result)` to `comet_idempotency` inside the method's own transaction.
   - A retry with the same `ik` returns the stored result instead of executing again.
-- **[later] cancel.** `{"t":"cancel","id":12}` cancels the method's Go `context`. The server still sends exactly one `res`: either `CANCELED`, or the real result if the method had already committed. Cancel does **not** imply rollback.
+- **cancel.** `{"t":"cancel","id":12}` cancels the method's Go `context`. The server still sends exactly one `res`: either `CANCELED`, or the real result if the method had already committed. Cancel does **not** imply rollback of a committed call.
+  - A cancel that arrives while the handler runs rolls back its transaction and gives `CANCELED`, whatever the handler then returns. Queries the handler runs with that `context` are interrupted.
+  - A cancel that arrives after the handler returned is too late: the transaction commits and the real result is sent.
+  - A cancel for an unknown or finished `id` is ignored. A dropped connection does not cancel a call; only `cancel` does.
+  - The client sends `cancel` for a call it has sent and settles the call from the `res`, never locally, because only the server knows the outcome. A call it has not sent yet is dropped locally instead.
 
 ## 6. Consistency guarantees
 
@@ -446,8 +450,9 @@ Every node receives every fence and ignores the tokens it does not own.
 - **Types:** `i4 i8 f8 num bool text enum uuid tstz date json bytes []<code>`.
 - **Backpressure:** hard limit only (4429).
 
-**Implemented since v1-core**, behind `caps`:
-- **Reconnect:** session resume (`seq`/`ack`/replay, §7.2).
+**Implemented since v1-core**:
+- **Reconnect:** session resume (`seq`/`ack`/replay, §7.2), behind `caps`.
+- **Methods:** `cancel` (§5). It needs no cap: a server without it ignores the message, and the call settles from its normal `res`.
 
 **[later]**, all additive and behind `caps`:
 - **Reconnect:** `goaway`; `ik` idempotency.
@@ -458,7 +463,6 @@ Every node receives every fence and ignores the tokens it does not own.
   - Go-side predicate filtering
   - logical replication
 - **Client and features:**
-  - `cancel`
   - `evt` (ephemeral, at-most-once, sub-scoped events)
   - presence
   - hot reload via `build`
