@@ -18,6 +18,7 @@ dist/
 
 # Built example bundles
 examples/*/web/public/app.js
+examples/*/web/public/react.js
 
 # Local Claude Code settings
 .claude/
