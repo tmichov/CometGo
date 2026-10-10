@@ -118,7 +118,7 @@ type socket struct {
 	out      [][]byte
 	outBytes int
 	dead     bool
-	fatal    bool // closed for a reason that also ends the session
+	fatal    bool // closed for a reason that also ends the session (protocol error, deliberate close)
 }
 
 func (a *App) serve(s *socket, cookieIdent *Identity, cookieErr error) {
@@ -153,6 +153,12 @@ func (a *App) serve(s *socket, cookieIdent *Identity, cookieErr error) {
 func (s *socket) read() (*clientMsg, bool) {
 	typ, data, err := s.ws.Read(s.ctx)
 	if err != nil {
+		// A deliberate close (Comet.close, page unload) will not resume.
+		if st := websocket.CloseStatus(err); st == websocket.StatusNormalClosure || st == websocket.StatusGoingAway {
+			s.mu.Lock()
+			s.fatal = true
+			s.mu.Unlock()
+		}
 		return nil, false
 	}
 	var msg clientMsg
@@ -233,6 +239,11 @@ func (c *conn) endLocked() {
 		c.grace = nil
 	}
 	c.replay, c.replayBytes, c.ids = nil, 0, nil
+	if c.sock != nil {
+		// Its client would otherwise sit on a silent socket; closing it
+		// makes the client reconnect and resync.
+		c.sock.fail(closeGoingAway, CodeUnavailable, "session ended")
+	}
 	c.cancel()
 	c.a.engine.enqueue(closeReq{c: c})
 	c.a.dropSession(c)
@@ -712,6 +723,13 @@ func (c *conn) buffer(seq uint64, b []byte) bool {
 		i++
 	}
 	c.replay = slices.Delete(c.replay, 0, i)
+	// A res below floor can no longer be replayed, so its id need not be
+	// remembered either; this bounds ids for a client that never acks.
+	for id, rs := range c.ids {
+		if rs != 0 && rs <= c.floor {
+			delete(c.ids, id)
+		}
+	}
 	return true
 }
 

@@ -103,7 +103,8 @@ type Config struct {
 	ResumeGrace time.Duration
 
 	// ResumeBuffer caps the bytes of unacked messages kept per session for
-	// replay. A detached session that overflows it ends. Default 1 MiB.
+	// replay. A detached session that overflows it ends. Default 1 MiB, at
+	// most 4 MiB.
 	ResumeBuffer int
 
 	Logger *slog.Logger
@@ -153,6 +154,9 @@ func New(cfg Config) *App {
 		cfg.ResumeGrace = 60 * time.Second
 	}
 	defi(&cfg.ResumeBuffer, 1<<20)
+	// A resume pushes the whole replay at once; it must fit the outbound
+	// queue or every resume would close as SLOW_CONSUMER.
+	cfg.ResumeBuffer = min(cfg.ResumeBuffer, maxQueuedBytes/2)
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}

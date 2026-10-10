@@ -103,6 +103,7 @@ export class Comet {
   #canResume = false;
   #seq = 0;
   #acked = 0;
+  #welcomed = false; // the current socket's welcome has arrived
   #unackedBytes = 0;
 
   constructor(opts: ConnectOptions) {
@@ -205,6 +206,7 @@ export class Comet {
       // were sent before the drop wait for it, though: they are re-sent only
       // if the session resumes (§7.2).
       this.#lastRecv = Date.now();
+      this.#welcomed = false;
       const resume = this.#resumable() ? { resume: { session: this.#session, seq: this.#seq, subs: [...this.#subs.keys()] } } : {};
       this.#send({ t: "hello", v: 1, caps: ["resume"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}), ...resume });
       for (const sub of this.#subs.values()) this.#sendSub(sub);
@@ -278,7 +280,8 @@ export class Comet {
 
   #ack(): void {
     this.#unackedBytes = 0;
-    if (!this.#canResume || this.#seq <= this.#acked || !this.#isOpen()) return;
+    // Before welcome, #seq may belong to a session this socket did not resume.
+    if (!this.#canResume || !this.#welcomed || this.#seq <= this.#acked || !this.#isOpen()) return;
     this.#acked = this.#seq;
     this.#send({ t: "ack", seq: this.#seq });
   }
@@ -326,6 +329,7 @@ export class Comet {
         this.user = msg.user ?? null;
         this.serverBuild = msg.build;
         this.#session = msg.session;
+        this.#welcomed = true;
         this.#canResume = Array.isArray(msg.caps) && msg.caps.includes("resume");
         if (msg.resumed) {
           // Missed messages follow as a replay. Unanswered calls and auths

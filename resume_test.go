@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Session resume (PROTOCOL.md §7.2). Needs Postgres, like integration_test.go.
@@ -293,16 +296,20 @@ func TestResumeOverflowWhileAttachedRecoversAfterAck(t *testing.T) {
 	a, w := e.dial(t, resumeHello(nil))
 	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
 	a.next()
+	a.send(map[string]any{"t": "call", "id": 9, "m": "nope", "noFence": true})
+	if r := a.next(); r["t"] != "res" {
+		t.Fatalf("res %v", r)
+	}
 	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) SELECT 'x', repeat('n', 100) FROM generate_series(1, 100)"); err != nil {
 		t.Fatal(err)
 	}
 	tx := a.next() // delivered: the socket is fine, only the buffer overflowed
 	c := e.session(t, w["session"])
 	c.mu.Lock()
-	floor := c.floor
+	floor, ids := c.floor, len(c.ids)
 	c.mu.Unlock()
-	if floor != seqOf(tx) {
-		t.Fatalf("floor %d, want %d", floor, seqOf(tx))
+	if floor != seqOf(tx) || ids != 0 {
+		t.Fatalf("floor %d (want %d), %d ids kept", floor, seqOf(tx), ids)
 	}
 	a.send(map[string]any{"t": "ack", "seq": seqOf(tx)})
 	a.sync()
@@ -400,5 +407,72 @@ func TestResumeAfterGraceFails(t *testing.T) {
 	_, w2 := e.dial(t, resumeHello(map[string]any{"resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
 	if w2["resumed"] != false {
 		t.Fatalf("welcome %v", w2)
+	}
+}
+
+// A sub the server ended during the gap: the client re-sends it before the
+// replayed end reaches it. That re-send must not bind a sub the client will
+// never track again.
+func TestResumeDoesNotRebindSubEndedInGap(t *testing.T) {
+	e := setupWith(t, func(c *Config) { c.MaxRows = 5 })
+	a, w := e.dial(t, resumeHello(nil))
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	snap := a.next()
+	a.kill()
+	time.Sleep(50 * time.Millisecond)
+	ctx := context.Background()
+	if _, err := e.pool.Exec(ctx, "INSERT INTO "+e.table+" (owner, name) SELECT 'x', 'n' FROM generate_series(1, 10)"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // RESULT_TOO_LARGE ends sub 1
+	if _, err := e.pool.Exec(ctx, "DELETE FROM "+e.table); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	b, w2 := e.dial(t, resumeHello(map[string]any{"resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
+	if w2["resumed"] != true {
+		t.Fatalf("welcome %v", w2)
+	}
+	b.send(map[string]any{"t": "sub", "s": 1, "name": "items.all", "have": true})
+	if en := entries(b.next()); en[0]["end"].(map[string]any)["code"] != CodeResultTooLarge {
+		t.Fatalf("expected replayed end, got %v", en)
+	}
+	b.quiet(300 * time.Millisecond) // no snapshot for a re-bound sub 1
+}
+
+// A session ended under a live socket (here: a failed resume naming it)
+// closes that socket, so its client resyncs instead of waiting forever.
+func TestEndedSessionClosesItsSocket(t *testing.T) {
+	e := setup(t)
+	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice"}}))
+	_, wb := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "bob"},
+		"resume": map[string]any{"session": w["session"], "seq": 0, "subs": []int{}}}))
+	if wb["resumed"] != false {
+		t.Fatalf("welcome %v", wb)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := a.ws.Read(ctx); err == nil || ctx.Err() != nil {
+		t.Fatalf("alice's socket stayed open: %v", err)
+	}
+}
+
+// A deliberate close will not resume, so the session ends at once.
+func TestNormalCloseEndsSession(t *testing.T) {
+	e := setup(t)
+	a, w := e.dial(t, resumeHello(nil))
+	a.ws.Close(websocket.StatusNormalClosure, "")
+	for deadline := time.Now().Add(5 * time.Second); e.app.lookupSession(w["session"].(string)) != nil; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("session kept after a normal close")
+		}
+	}
+}
+
+func TestResumeBufferClampedToOutboundQueue(t *testing.T) {
+	a := New(Config{DB: &pgxpool.Pool{}, ResumeBuffer: 64 << 20})
+	if a.cfg.ResumeBuffer != maxQueuedBytes/2 {
+		t.Fatalf("ResumeBuffer %d", a.cfg.ResumeBuffer)
 	}
 }

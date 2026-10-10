@@ -275,6 +275,10 @@ Resume makes a short drop invisible: no snapshot is re-sent, and calls in flight
 - `seq` is not below the last ack or the overflow point, and not above the last `seq` sent,
 - the `hello` authenticates the same principal (same user ID, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
 
+For an anonymous session, the session id is the only credential, as a session cookie would be. It is 72 random bits, is sent only in `welcome`, and must be kept as secret as a token.
+
+A deliberate close (WebSocket close code 1000 or 1001, e.g. `Comet.close()` or a page unload) ends the session at once: that client will not resume.
+
 **The server, on a valid resume:**
 - Answers `welcome{resumed:true}` with the same `session`, then replays the buffered messages with `seq > 1841`, in order, before anything new. The resume `seq` also counts as an ack.
 - If a previous socket of the session is still open (the client saw it die before the server did), closes it.

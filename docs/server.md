@@ -48,7 +48,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `MaxMsg int` | 1 MiB | Largest message the server accepts from a client. A larger message closes the connection. |
 | `MaxRows int` | 10,000 | Row cap per publication result. A larger result ends its subscriptions with `RESULT_TOO_LARGE`. |
 | `ResumeGrace` | 60s | How long a session outlives a lost connection, waiting for the client to resume it ([protocol §7.2](protocol.md#72-session-resume)). Unlike the other durations, a **negative** value disables resume, and clients then resync on every reconnect. See [Session resume](#session-resume). |
-| `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay. A disconnected session that outgrows it ends, and its client resyncs. |
+| `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay, at most 4 MiB (half the outbound queue limit, since a resume sends the whole replay at once). A disconnected session that outgrows it ends, and its client resyncs. |
 | `Logger *slog.Logger` | `slog.Default()` | Where the framework logs, including the details of `INTERNAL` errors. |
 
 `MaxSubs`, `MaxInflight` and `MaxMsg` are also advertised to the client in `welcome.limits`.
@@ -261,7 +261,7 @@ The session is not resumed, and the client falls back to a full resync, when:
 - the buffer overflowed while the client was away,
 - the reconnecting client authenticates as a different user than the session's.
 
-A token refresh for the same user is fine. A protocol error closes the connection and ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable.
+A token refresh for the same user is fine. A protocol error, or a deliberate close by the client (code 1000/1001, e.g. a page unload), ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable. An anonymous session is resumable by whoever holds its session id, which the client keeps in memory only.
 
 **Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node (sticky sessions, e.g. by cookie or client IP). Without sticky routing everything still works, but a reconnect that lands on another node resyncs.
 

@@ -126,3 +126,12 @@ test("a server without resume keeps the v1-core behaviour", async () => {
   ws.drop();
   await assert.rejects(call, { code: "CONNECTION_LOST" });
 });
+
+test("no ack goes out on a new socket before its welcome", async () => {
+  const ws = await connected();
+  const sub = comet.subscribe("items");
+  ws.recv({ t: "tx", seq: 3, subs: [{ s: sub.id, init, ops: [], ready: true }] });
+  const ws2 = await reconnect(ws);
+  await new Promise((r) => setTimeout(r, 1100));
+  assert.deepEqual(ws2.of("ack"), []);
+});
