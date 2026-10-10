@@ -23,8 +23,8 @@ function App() {
   async function run(method: string, args: unknown): Promise<void> {
     setError(null);
     try {
-      // Resolves only after its effects reached our subscription, so the
-      // list already shows the change when this returns.
+      // Normally resolves after its effects reached our subscription, so the
+      // list already shows the change (callWithStatus reports when it lagged).
       await call(method, args);
     } catch (e) {
       setError(e instanceof CometError ? `${e.code}: ${e.message}` : String(e));

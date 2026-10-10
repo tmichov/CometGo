@@ -6,7 +6,7 @@ import { JSDOM } from "jsdom";
 const dom = new JSDOM("<!doctype html><html><body></body></html>");
 Object.assign(globalThis, { window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true });
 
-const { act, createElement: h, StrictMode, useState } = await import("react");
+const { act, Activity, createElement: h, StrictMode, useState } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { connect } = await import("../src/index.ts");
 const { CometProvider, useCall, useConnection, useSubscription } = await import("../src/react.ts");
@@ -186,6 +186,60 @@ test("useConnection follows status and user; useCall is stable", async () => {
   assert.deepEqual(ws.of("call"), [{ t: "call", id: 1, m: "todos.add", args: { title: "x" } }]);
   server({ t: "res", seq: 2, id: 1, ok: true, val: { id: "7" } });
   assert.deepEqual(await p, { id: "7" });
+});
+
+test("a second component on a ready sub renders its rows on the first render", () => {
+  render(h("div", null, h(List, { name: "todos.all" })));
+  server({ t: "tx", seq: 1, subs: [snapshot(1, [["1", "a"]])] });
+  const log: number[] = [];
+  render(h("div", null, h(List, { name: "todos.all" }), h(List, { name: "todos.all", log })));
+  assert.deepEqual(log, [1, ...log.slice(1)], `first render already has the row, got ${log}`);
+  assert.ok(!log.includes(0));
+  assert.equal(ws.of("sub").length, 1);
+});
+
+test("hiding and revealing a component never shows a stopped sub as ended", { skip: (Activity as unknown) === undefined ? "React has no <Activity> before 19.2" : false }, async () => {
+  const el = (mode: "visible" | "hidden") => h(Activity, { mode, children: h(List, { name: "todos.all" }) });
+  render(el("visible"));
+  server({ t: "tx", seq: 1, subs: [snapshot(1, [["1", "a"]])] });
+  render(el("hidden"));
+  await tick();
+  assert.deepEqual(ws.of("unsub"), [{ t: "unsub", s: 1 }]);
+  render(el("visible"));
+  const ul = container.querySelector("ul")!;
+  assert.equal(ul.dataset.status, "loading");
+  assert.deepEqual(ws.of("sub").at(-1), { t: "sub", s: 2, name: "todos.all", args: null });
+  server({ t: "tx", seq: 2, subs: [snapshot(2, [["1", "a"]])] });
+  assert.equal(container.querySelector("ul")!.dataset.status, "ready");
+});
+
+test("swapping the provider's client does not show the old client's stopped sub", async () => {
+  render(h(List, { name: "todos.all" }));
+  server({ t: "tx", seq: 1, subs: [snapshot(1, [["1", "a"]])] });
+  const oldWs = ws;
+  const comet2 = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
+  await Promise.resolve();
+  const ws2 = FakeWS.last;
+  ws2.readyState = 1;
+  ws2.onopen!();
+  try {
+    act(() => root.render(h(CometProvider, { client: comet2 }, h(List, { name: "todos.all" }))));
+    await tick();
+    assert.equal(container.querySelector("ul")!.dataset.status, "loading");
+    assert.deepEqual(oldWs.of("unsub"), [{ t: "unsub", s: 1 }]);
+    assert.equal(ws2.of("sub").length, 1);
+  } finally {
+    act(() => root.render(null));
+    comet2.close();
+  }
+});
+
+test("a sub the server ended is requested again by a newly mounted component", () => {
+  render(h("div", null, h(List, { name: "todos.mine" })));
+  server({ t: "tx", seq: 1, subs: [{ s: 1, end: { code: "FORBIDDEN", msg: "log in" } }] });
+  assert.equal(container.querySelector("ul")!.dataset.status, "ended");
+  render(h("div", null, h(List, { name: "todos.mine" }), h(List, { name: "todos.mine" })));
+  assert.equal(ws.of("sub").length, 2, "the new component re-subscribes");
 });
 
 test("hooks outside a provider throw", () => {

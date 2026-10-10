@@ -7,7 +7,6 @@ import {
   useCallback,
   useContext,
   useEffect,
-  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -21,16 +20,18 @@ interface Entry {
   sub: Subscription<any>;
   refs: number;
   stopTimer?: ReturnType<typeof setTimeout>;
+  stopped?: boolean; // sub.stop() was called; it will never update again
   snap?: SubState<any>;
 }
 
 /** One reference to a shared subscription, held by one hook instance. */
 interface Lease {
+  registry: Registry;
   entry: Entry;
   released: boolean;
 }
 
-// Subscriptions are shared per provider and ref-counted by (name, canonical
+// Subscriptions are shared per Comet and ref-counted by (name, canonical
 // args). The last release stops the sub only after a macrotask, so a
 // StrictMode unmount/remount (or a remount on the same key) re-acquires the
 // same sub instead of sending unsub + sub.
@@ -42,16 +43,24 @@ class Registry {
     this.comet = comet;
   }
 
+  /** The live entry for key, if any, without taking a reference. */
+  peek(key: string): Entry | undefined {
+    const e = this.#entries.get(key);
+    return e && e.sub.status !== "ended" ? e : undefined;
+  }
+
   acquire(key: string, name: string, args: unknown): Lease {
     let e = this.#entries.get(key);
-    if (!e) {
+    // A sub the server ended stays ended for its current holders, but a new
+    // acquire (e.g. after login) asks again.
+    if (!e || e.sub.status === "ended") {
       e = { key, sub: this.comet.subscribe(name, args), refs: 0 };
       this.#entries.set(key, e);
     }
     clearTimeout(e.stopTimer);
     e.stopTimer = undefined;
     e.refs++;
-    return { entry: e, released: false };
+    return { registry: this, entry: e, released: false };
   }
 
   release(lease: Lease): void {
@@ -62,6 +71,7 @@ class Registry {
     e.stopTimer = setTimeout(() => {
       if (e.refs > 0 || this.#entries.get(e.key) !== e) return;
       this.#entries.delete(e.key);
+      e.stopped = true;
       e.sub.stop();
     }, 0);
   }
@@ -80,6 +90,16 @@ function subKey(name: string, args: unknown): string {
 
 const CometContext = createContext<Registry | null>(null);
 
+// One registry per Comet, so subscriptions survive anything that recreates
+// the provider's state, and providers sharing a client share its subs.
+const registries = new WeakMap<Comet, Registry>();
+
+function registryFor(client: Comet): Registry {
+  let r = registries.get(client);
+  if (!r) registries.set(client, (r = new Registry(client)));
+  return r;
+}
+
 export interface CometProviderProps {
   client: Comet;
   children?: ReactNode;
@@ -87,7 +107,7 @@ export interface CometProviderProps {
 
 /** Makes a Comet available to the hooks below. */
 export function CometProvider({ client, children }: CometProviderProps): ReactNode {
-  const registry = useMemo(() => new Registry(client), [client]);
+  const registry = registryFor(client);
   return createElement(CometContext.Provider, { value: registry }, children);
 }
 
@@ -152,9 +172,9 @@ export function useSubscription<T = Record<string, unknown>>(name: string, args?
     };
     const { sub } = lease.entry;
     const settled = () => sub.status === "ready" || sub.status === "ended";
-    // Show at once when there is nothing on screen to keep, when the sub is
-    // already settled, or when it is the very sub on screen (a remount).
-    if (!shown || shown.entry === lease.entry || settled()) {
+    // Show at once when there is nothing on screen worth keeping, when the
+    // sub is already settled, or when it is the very sub on screen (a remount).
+    if (!showable(shown, registry) || shown!.entry === lease.entry || settled()) {
       promote();
       // The shown lease is released by the next promotion or by unmount.
       return;
@@ -181,12 +201,21 @@ export function useSubscription<T = Record<string, unknown>>(name: string, args?
     };
   }, [registry]);
 
-  const entry = shown?.entry;
+  // What is on screen: the shown sub while it is still live, else whatever
+  // this key already has in the registry (another component's ready sub, or
+  // ours during a remount), else loading.
+  const entry = showable(shown, registry) ? shown!.entry : registry.peek(key);
   return useSyncExternalStore(
     entry ? entry.sub.subscribe : noopSubscribe,
     entry ? () => snapshot<T>(entry) : loadingSnapshot,
     entry ? () => snapshot<T>(entry) : loadingSnapshot,
   );
+}
+
+// A shown lease is worth keeping on screen only while its sub is live and it
+// belongs to the current client.
+function showable(l: Lease | null, registry: Registry): boolean {
+  return !!l && l.registry === registry && !l.entry.stopped;
 }
 
 // ---- useConnection / useCall ----
