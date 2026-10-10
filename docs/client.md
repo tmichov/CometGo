@@ -138,7 +138,7 @@ class CometError extends Error {
 
 | Code | Meaning |
 |---|---|
-| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived. The outcome is **unknown**: the method may or may not have committed. The client never re-sends it. Retry only if the method is safe to run twice. |
+| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived, and the session could not be resumed (see [Reconnects](#reconnects)). The outcome is **unknown**: the method may or may not have committed. The client never re-sends it on a new session. Retry only if the method is safe to run twice. |
 | `VALIDATION` | `details.fields` maps field names to messages. |
 | `RATE_LIMITED` | Too many calls in flight; `retryAfterMs` says when to retry. |
 | `INTERNAL` | A server bug. `details.ref` matches a line in the server log. |
@@ -158,10 +158,14 @@ The client reconnects by itself:
 
 - **Backoff.** Exponential with full jitter, starting at 500 ms and capped at 30 s, reset after a successful connection. In a browser it also retries immediately on the `online` event and when the tab becomes visible.
 - **Liveness.** If nothing arrives for the server's heartbeat interval (25 s by default), the client sends a ping. After the heartbeat interval plus 10 s of silence, it closes the connection (code 4408) and reconnects.
-- **Subscriptions** survive. On reconnect each is re-sent; the server sends a fresh snapshot, and the client swaps it in only once it is complete. Unchanged rows keep their objects, so the UI does not flicker. While this happens, `status` is `"resyncing"`.
-- **Calls** that were queued but never sent go out on the new connection. Calls that were sent and had no result yet are rejected with `CONNECTION_LOST`.
+- **Session resume.** When the server supports it, the client first tries to resume its session ([protocol §7.2](protocol.md#72-session-resume)). The server replays whatever the client missed, so subscriptions get no snapshot and calls in flight still get their results. The client acks what it has received about once a second, so the server can drop it from the replay buffer.
+- **Subscriptions** survive. While disconnected, `status` is `"resyncing"`. On a resumed session it goes back to `"ready"` and the missed updates are applied as usual. Otherwise each subscription is re-sent; the server sends a fresh snapshot, and the client swaps it in only once it is complete. Unchanged rows keep their objects, so the UI does not flicker.
+- **Calls** that were queued but never sent go out on the new connection. Calls (and `setToken`) that were sent and had no result yet depend on the reconnect:
+  - **Resumed:** they are re-sent with their original ids. The server runs each call at most once and delivers its result.
+  - **Not resumed** (the server restarted, the reconnect reached another node, the grace window (60 s by default) passed, or the user changed meanwhile): they are rejected with `CONNECTION_LOST`.
+  - **Server without resume:** they are rejected with `CONNECTION_LOST` as soon as the connection drops.
 
-Session resume (replaying missed messages instead of resyncing) is *planned* ([protocol §7.2](protocol.md#72-later-session-resume)).
+  So with resume, a call sent just before a drop stays pending until the client reconnects, however long that takes. `close()` rejects it at once.
 
 ## Type decoding
 

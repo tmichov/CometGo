@@ -30,8 +30,14 @@ type engine struct {
 	wake    chan struct{}
 
 	// Owned by the run goroutine.
-	observers    map[string]*observer
-	conns        map[*conn]map[uint64]*subscription
+	observers map[string]*observer
+	conns     map[*conn]map[uint64]*subscription
+	// ended records, per resumable session, the sub ids whose end was sent.
+	// After a resume the client re-sends its subs before the replayed end
+	// reaches it; re-binding such an id would leave a sub the client never
+	// tracks again. Sub ids are never reused (§4.1), so a sub for one of
+	// these is always that re-send.
+	ended        map[*conn]map[uint64]bool
 	carryFences  []*fence
 	carryOut     map[*conn]*connOut
 	retryBackoff time.Duration
@@ -95,6 +101,14 @@ type unsubReq struct {
 
 type closeReq struct{ c *conn }
 
+// resumeReq unbinds every sub of c not in keep: the client unsubscribed
+// while its unsub was lost in transit (§7.2). The client no longer holds
+// those subs, so no end entry is sent.
+type resumeReq struct {
+	c    *conn
+	keep map[uint64]bool
+}
+
 // rebindReq re-binds every sub of c to ident, and sends after once the
 // resulting tx is enqueued (PROTOCOL.md §3.2).
 type rebindReq struct {
@@ -110,6 +124,7 @@ func newEngine(a *App) *engine {
 		wake:      make(chan struct{}, 1),
 		observers: map[string]*observer{},
 		conns:     map[*conn]map[uint64]*subscription{},
+		ended:     map[*conn]map[uint64]bool{},
 	}
 }
 
@@ -299,6 +314,16 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 func (e *engine) flush(out map[*conn]*connOut) {
 	for c, o := range out {
 		slices.SortStableFunc(o.entries, func(a, b subEntry) int { return cmp.Compare(a.S, b.S) })
+		if c.resume {
+			for _, en := range o.entries {
+				if en.End != nil {
+					if e.ended[c] == nil {
+						e.ended[c] = map[uint64]bool{}
+					}
+					e.ended[c][en.S] = true
+				}
+			}
+		}
 		if len(o.entries) > 0 {
 			c.sendTx(o.entries)
 		}
@@ -340,7 +365,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 	}
 	switch r := r.(type) {
 	case subReq:
-		if r.c.isClosed() {
+		if r.c.isClosed() || e.ended[r.c][r.s] {
 			return
 		}
 		subs := e.conns[r.c]
@@ -381,6 +406,15 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			e.detach(sub)
 		}
 		delete(e.conns, r.c)
+		delete(e.ended, r.c)
+
+	case resumeReq:
+		for s, sub := range e.conns[r.c] {
+			if !r.keep[s] {
+				e.detach(sub)
+				delete(e.conns[r.c], s)
+			}
+		}
 
 	case rebindReq:
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
