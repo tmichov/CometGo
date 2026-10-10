@@ -92,6 +92,10 @@ type Config struct {
 	// QueryTimeout is the hard per-observer query timeout. Default 30s.
 	QueryTimeout time.Duration
 
+	// IdempotencyTTL is how long the result of a call carrying an
+	// idempotency key is kept for retries. Default 24h.
+	IdempotencyTTL time.Duration
+
 	MaxSubs     int // default 500
 	MaxInflight int // default 32
 	MaxMsg      int // default 1 MiB
@@ -146,6 +150,7 @@ func New(cfg Config) *App {
 	def(&cfg.MinTickInterval, 20*time.Millisecond)
 	def(&cfg.FenceTimeout, 5*time.Second)
 	def(&cfg.QueryTimeout, 30*time.Second)
+	def(&cfg.IdempotencyTTL, 24*time.Hour)
 	defi(&cfg.MaxSubs, 500)
 	defi(&cfg.MaxInflight, 32)
 	defi(&cfg.MaxMsg, 1<<20)
@@ -174,7 +179,8 @@ func New(cfg Config) *App {
 	return a
 }
 
-// Start runs the Postgres listener and the tick engine until ctx is done.
+// Start runs the Postgres listener, the tick engine and the idempotency-key
+// cleanup until ctx is done.
 func (a *App) Start(ctx context.Context) {
 	if a.started {
 		panic("cometgo: Start called twice")
@@ -182,6 +188,7 @@ func (a *App) Start(ctx context.Context) {
 	a.started = true
 	go a.engine.listen(ctx)
 	go a.engine.run(ctx)
+	go a.cleanIdempotency(ctx)
 }
 
 // Scope controls which connections share one observer of a publication.

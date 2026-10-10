@@ -207,9 +207,12 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 - **Concurrency.** Calls run concurrently, up to `limits.maxInflight`. A caller that needs ordering awaits. Calls beyond the limit get `RATE_LIMITED` with `retryAfterMs`.
 - **Exactly one `res` per `id`.**
 - **`"noFence":true`** skips the read-your-writes fence (§6.2). Use it for latency-sensitive calls that do not write.
-- **[later] `"ik":"<uuid>"` idempotency key.**
-  - The framework writes `(ik, userId, result)` to `comet_idempotency` inside the method's own transaction.
-  - A retry with the same `ik` returns the stored result instead of executing again.
+- **`"ik":"<uuid>"` idempotency key.** Negotiated with the `ik` cap: the client offers `"caps":["ik"]` in `hello`, and a server that supports keys includes `"ik"` in `welcome.caps`.
+  - The framework writes `(ik, userId, method, result)` to `comet_idempotency` inside the method's own transaction, so the record commits atomically with the method's effects.
+  - A retry with the same `ik` from the same user returns the stored result instead of executing again. Its `res` is fenced like any call's.
+  - A duplicate that arrives while the first is still running waits for its outcome; the handler runs once.
+  - A failed call stores nothing. The same `ik` for a different method is `BAD_REQUEST`. `ik` must be a non-empty string of at most 128 bytes.
+  - Stored results expire after a server-configured TTL (default 24 h).
 - **cancel.** `{"t":"cancel","id":12}` cancels the method's Go `context`. The server still sends exactly one `res`: either `CANCELED`, or the real result if the method had already committed. Cancel does **not** imply rollback of a committed call.
   - A cancel that arrives while the handler runs rolls back its transaction and gives `CANCELED`, whatever the handler then returns. Queries the handler runs with that `context` are interrupted.
   - A cancel that arrives after the handler returned is too late: the transaction commits and the real result is sent.
@@ -267,7 +270,7 @@ A lost connection leads to a resync when session resume (§7.2) is not available
 1. The client reconnects with exponential backoff and full jitter (base 500 ms, cap 30 s). It reconnects immediately on the `online` and `visibilitychange` events.
 2. It sends `hello`, then re-sends `sub` for every active subscription with the **same `s`** and `"have":true`.
 3. The server answers with `reset:true` entries. The client diffs and swaps at `ready` (§4.4), with no flicker.
-4. Calls in flight without a `res` are rejected locally with `CONNECTION_LOST`, meaning "outcome unknown". They are **never** re-executed blindly. **[later]** Calls carrying `ik` are resent safely.
+4. Calls in flight without a `res` are rejected locally with `CONNECTION_LOST`, meaning "outcome unknown". They are **never** re-executed blindly. Calls carrying `ik` are resent on the new connection, with the same `ik`, after its `welcome`, if that `welcome` advertises the `ik` cap (§5) and names the same user the call ran as.
 
 ### 7.2 Session resume
 
@@ -470,9 +473,10 @@ Every node receives every fence and ignores the tokens it does not own.
 - **Reconnect:** session resume (`seq`/`ack`/replay, §7.2), behind `caps`.
 - **Events:** `evt` (ephemeral, at-most-once, sub-scoped, §4.5), behind `caps`.
 - **Methods:** `cancel` (§5). It needs no cap: a server without it ignores the message, and the call settles from its normal `res`.
+- **Methods:** `ik` idempotency keys (§5), behind `caps`.
 
 **[later]**, all additive and behind `caps`:
-- **Reconnect:** `goaway`; `ik` idempotency.
+- **Reconnect:** `goaway`.
 - **Engine and transport:**
   - coalesce→reset backpressure
   - slow-observer detachment and parallel ticks with an exported snapshot

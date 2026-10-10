@@ -356,7 +356,9 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 
 func (a *App) welcome(c *conn, ident *Identity, resumed bool) *welcomeMsg {
 	cfg := a.cfg
-	caps := []string{capEvt}
+	// The server honours ik whether or not it was negotiated; the cap tells
+	// the client it may re-send ik calls on a new session.
+	caps := []string{capEvt, capIK}
 	if cfg.ResumeGrace > 0 {
 		caps = append(caps, capResume)
 	}
@@ -655,6 +657,10 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	if m == nil {
 		return nil, false, NewError(CodeNotFound, "unknown method "+msg.M)
 	}
+	ik := msg.IK
+	if ik != nil && (*ik == "" || len(*ik) > maxIKLen) {
+		return nil, false, NewError(CodeBadRequest, "ik must be a non-empty string of at most 128 bytes")
+	}
 	ctx := context.WithoutCancel(hctx)
 	if hctx.Err() != nil {
 		return nil, false, NewError(CodeCanceled, "call canceled") // before it started
@@ -665,29 +671,50 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	}
 	defer tx.Rollback(context.Background())
 
-	result, err := func() (r any, err error) {
-		defer func() {
-			if p := recover(); p != nil {
-				err = fmt.Errorf("panic: %v", p)
-			}
+	// With ik, a stored result from an earlier call by the same user is
+	// returned without running the handler. The claim row commits atomically
+	// with the handler's writes, or rolls back with them on error.
+	var stored json.RawMessage
+	if ik != nil {
+		if stored, err = claimIK(ctx, tx, *ik, ident.userID(), msg.M); err != nil {
+			return nil, false, err
+		}
+	}
+	if stored != nil {
+		val = stored
+	} else {
+		result, err := func() (r any, err error) {
+			defer func() {
+				if p := recover(); p != nil {
+					err = fmt.Errorf("panic: %v", p)
+				}
+			}()
+			return m.run(&Call{Context: hctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
 		}()
-		return m.run(&Call{Context: hctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
-	}()
-	// A cancel that arrived before this point rolls back, whatever the
-	// handler returned: its queries may have been interrupted, and the
-	// client asked for it before anything committed. A cancel after this
-	// point is too late; the real result is sent (§5). A query the handler
-	// ran with hctx was stopped in Postgres too: pgx answers a cancelled
-	// context by closing the connection and sending a cancel request.
-	if hctx.Err() != nil {
-		return nil, false, NewError(CodeCanceled, "call canceled")
+		// A cancel that arrived before this point rolls back, whatever the
+		// handler returned: its queries may have been interrupted, and the
+		// client asked for it before anything committed. A cancel after this
+		// point is too late; the real result is sent (§5). A query the
+		// handler ran with hctx was stopped in Postgres too: pgx answers a
+		// cancelled context by closing the connection and sending a cancel
+		// request.
+		if hctx.Err() != nil {
+			return nil, false, NewError(CodeCanceled, "call canceled")
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if val, err = json.Marshal(result); err != nil {
+			return nil, false, err
+		}
+		if ik != nil {
+			if err := storeIK(ctx, tx, *ik, ident.userID(), val); err != nil {
+				return nil, false, err
+			}
+		}
 	}
-	if err != nil {
-		return nil, false, err
-	}
-	if val, err = json.Marshal(result); err != nil {
-		return nil, false, err
-	}
+	// A replayed result goes through the same commit and fence as a first
+	// run (unless noFence), like any call.
 
 	if msg.NoFence {
 		return val, false, tx.Commit(ctx)

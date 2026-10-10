@@ -24,7 +24,7 @@ Register every publication and method before `Start` and before serving requests
 | Identifier | Description |
 |---|---|
 | `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil. |
-| `(*App) Start(ctx)` | Starts the Postgres listener and the tick engine in background goroutines; they run until `ctx` is done. Panics if called twice. |
+| `(*App) Start(ctx)` | Starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done. Panics if called twice. |
 | `(*App) ServeHTTP(w, r)` | `App` is an `http.Handler`. It upgrades the request to a CometGo WebSocket. Mount it at `/_comet`, the client's default URL. |
 | `Subprotocol` | The WebSocket subprotocol, `"cometgo.1.json"`. A request that does not offer it gets HTTP 426 with `{"supported":["cometgo.1.json"]}`. |
 
@@ -42,6 +42,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `Heartbeat` | 25s | The server pings every interval and closes the connection with 4408 if a ping gets no pong within twice the interval. Also sent to the client, which uses it for its own liveness check. |
 | `MinTickInterval` | 20ms | Minimum time between engine ticks. Bursts of changes inside the interval are coalesced into one re-run. |
 | `FenceTimeout` | 5s | How long a method result waits for its writes to reach the caller's subscriptions. After that the result is sent with `lag: true`. |
+| `IdempotencyTTL` | 24h | How long the result of a call carrying an [idempotency key](#idempotency-keys) is kept. A retry after that runs the method again. Keep it above an hour: the TypeScript client retries a call for up to an hour after first sending it. |
 | `QueryTimeout` | 30s | Hard `statement_timeout` for publication queries. A query that exceeds it ends its subscriptions with `TIMEOUT`. |
 | `MaxSubs int` | 500 | Subscriptions per connection. A subscription over the limit is ended with `RATE_LIMITED`. |
 | `MaxInflight int` | 32 | Concurrent method calls per connection. A call over the limit gets `RATE_LIMITED` with `retryAfterMs: 100`. |
@@ -165,6 +166,22 @@ Other details:
 - `c.Context` **is** cancelled when the client cancels the call (`signal` in the TypeScript client), and only then: it stays valid after the call returns, so work a handler starts with it is not cut off. Pass it to every query so a long one stops promptly. A cancel that arrives while the handler is running always rolls the transaction back and the client gets `CANCELED`, even if the handler ignores the context and returns normally. A cancel that arrives once the handler has returned is too late: the call commits and the client gets the real result.
 - A client can send a call with `noFence`, which commits without the fence and returns as soon as the transaction commits. Use it for calls that do not write.
 - An unknown method name returns `NOT_FOUND`.
+- A client can send a call with an idempotency key, so it can retry safely after a disconnect. See [Idempotency keys](#idempotency-keys).
+
+### Idempotency keys
+
+A call whose connection dropped before its result arrived has an unknown outcome. A client that marks a call idempotent (`call(m, args, { idempotent: true })`) attaches a key, `ik`, and re-sends the call after reconnecting. The server runs the method at most once per key and user:
+
+- The first call with a key inserts a row into `comet_idempotency` inside the method's own transaction, runs the handler, and stores the encoded result in that row. The row commits together with the handler's writes.
+- A later call with the same key and the same `Identity.UserID` gets the stored result back, without running the handler. It still commits with a fence (unless sent with `noFence`), like any call.
+- A duplicate that arrives while the first is still running waits for it: if the first commits, the duplicate returns its result; if it fails, the duplicate runs the handler itself.
+- A failed call (an error, a panic, a rolled-back transaction) stores nothing, so a retry runs again.
+- The same key used for a different method returns `BAD_REQUEST`. The args are not compared.
+- Keys are scoped per user. A different user, or an anonymous connection, sending the same key is independent. All anonymous connections share one scope: an anonymous caller who knows another's key gets that caller's stored result. Keys must therefore be unguessable, such as the random UUIDs the client generates; never derive one from an id or other predictable value.
+- A key must be a non-empty string of at most 128 bytes, or the call gets `BAD_REQUEST`.
+- Stored results are deleted after `Config.IdempotencyTTL` (24h by default) by a cleanup that `Start` runs every hour (every TTL if that is shorter, but at most once a minute).
+
+The table must exist: call [`InstallIdempotency`](#installidempotency) at startup. Without it, a call carrying a key fails with `INTERNAL`.
 
 ## Events
 
@@ -286,6 +303,21 @@ Called with the upgrade request, so it can read session cookies. Its result is u
 ### Expiry: `Identity.ExpiresAt`
 
 If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The client should call `setToken` with a fresh token before then. Proactive refresh by the client library and the HTTP refresh endpoint are *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
+
+## InstallIdempotency
+
+```go
+func InstallIdempotency(ctx context.Context, db *pgxpool.Pool) error
+```
+
+Creates the `comet_idempotency` table (and an index on `created_at`) that stores results for [idempotency keys](#idempotency-keys), in the `public` schema or whatever the connection's `search_path` resolves first. It is idempotent; run it at startup or from a migration. An app whose clients never send keys does not need it.
+
+```sql
+comet_idempotency(ik text, user_id text, method text, result json, created_at timestamptz,
+                  PRIMARY KEY (ik, user_id))
+```
+
+`result` is `json` rather than `jsonb` so that a retry returns the same bytes as the first call.
 
 ## Session resume
 

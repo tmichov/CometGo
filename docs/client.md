@@ -123,6 +123,8 @@ const { value, lag } = await comet.callWithStatus("todos.add", { title: "Ship v1
   const p = comet.call("reports.build", { id }, { signal: ac.signal });
   cancelButton.onclick = () => ac.abort();
   ```
+- **`{ idempotent: true }`** attaches a generated idempotency key, so the call survives a disconnect even when the session cannot be resumed: instead of failing with `CONNECTION_LOST`, it is re-sent on the new session, and the server runs the method at most once (see [Server: Idempotency keys](server.md#idempotency-keys)). Use it for writes that must not happen twice. **`{ ik: "..." }`** passes a key of your own instead, e.g. a random UUID stored with a form so a retry after a page reload is also deduplicated. It must be unguessable (generate it with `crypto.randomUUID()` or similar, never from an id), because anonymous callers share one key scope.
+- **Retries of idempotent calls** on a new session are held until its `welcome`, and re-sent only if the server supports idempotency keys, the user is the same one the call ran as, and the call was first sent less than an hour ago. Otherwise the call is rejected with `CONNECTION_LOST`. A call cut off before its connection's `welcome` arrived is rejected too, unless the session resumes, since the user it ran as is unknown. The hour stays inside the server's default 24h `IdempotencyTTL`; do not set that below an hour.
 - **Errors.** A failed call rejects with a `CometError` carrying the server's code (see below).
 - **Before the connection is open,** calls are queued and sent when it opens.
 
@@ -157,7 +159,7 @@ class CometError extends Error {
 
 | Code | Meaning |
 |---|---|
-| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived, and the session could not be resumed (see [Reconnects](#reconnects)). The outcome is **unknown**: the method may or may not have committed. The client never re-sends it on a new session. Retry only if the method is safe to run twice. |
+| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived, and the session could not be resumed (see [Reconnects](#reconnects)). The outcome is **unknown**: the method may or may not have committed. The client never re-sends it on a new session. Retry only if the method is safe to run twice. A call made with `idempotent` or `ik` gets this only when it cannot be retried safely (see [Calls](#calls)) or after `close()`. |
 | `VALIDATION` | `details.fields` maps field names to messages. |
 | `RATE_LIMITED` | Too many calls in flight; `retryAfterMs` says when to retry. |
 | `INTERNAL` | A server bug. `details.ref` matches a line in the server log. |
@@ -181,8 +183,8 @@ The client reconnects by itself:
 - **Subscriptions** survive. While disconnected, `status` is `"resyncing"`. On a resumed session it goes back to `"ready"` and the missed updates are applied as usual. Otherwise each subscription is re-sent; the server sends a fresh snapshot, and the client swaps it in only once it is complete. Unchanged rows keep their objects, so the UI does not flicker.
 - **Calls** that were queued but never sent go out on the new connection. Calls (and `setToken`) that were sent and had no result yet depend on the reconnect:
   - **Resumed:** they are re-sent with their original ids. The server runs each call at most once and delivers its result.
-  - **Not resumed** (the server restarted, the reconnect reached another node, the grace window (60 s by default) passed, or the user changed meanwhile): they are rejected with `CONNECTION_LOST`.
-  - **Server without resume:** they are rejected with `CONNECTION_LOST` as soon as the connection drops.
+  - **Not resumed** (the server restarted, the reconnect reached another node, the grace window (60 s by default) passed, or the user changed meanwhile): they are rejected with `CONNECTION_LOST`, except calls made with `idempotent` or `ik`, which are re-sent with the same key under the conditions in [Calls](#calls).
+  - **Server without resume:** the same as not resumed, decided once the new connection's `welcome` arrives for calls with a key, and as soon as the connection drops for the rest.
 
   So with resume, a call sent just before a drop stays pending until the client reconnects, however long that takes. `close()` rejects it at once.
 

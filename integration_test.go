@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,8 @@ type testEnv struct {
 	srv   *httptest.Server
 	pool  *pgxpool.Pool
 	table string
+	// slowRuns counts executions of the "slowAdd" method.
+	slowRuns atomic.Int32
 }
 
 func setup(t *testing.T) *testEnv {
@@ -52,6 +55,10 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 	if err := InstallTriggers(ctx, pool, table); err != nil {
 		t.Fatal(err)
 	}
+	if err := InstallIdempotency(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	env := &testEnv{pool: pool, table: table}
 
 	cfg := Config{
 		DB:              pool,
@@ -95,6 +102,19 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 	Method(app, "bump", func(c *Call, a struct{ ID string }) (struct{}, error) {
 		_, err := c.Tx.Exec(c.Context, "UPDATE "+table+" SET n = n + 1 WHERE id = $1::int8", a.ID)
 		return struct{}{}, err
+	})
+	// slowAdd holds its transaction open long enough for a concurrent
+	// duplicate to arrive while it runs.
+	Method(app, "slowAdd", func(c *Call, a addArgs) (string, error) {
+		env.slowRuns.Add(1)
+		if a.Name == "" {
+			time.Sleep(300 * time.Millisecond)
+			return "", ValidationError(map[string]string{"name": "required"})
+		}
+		var id string
+		err := c.Tx.QueryRow(c.Context, "INSERT INTO "+table+" (owner, name) VALUES ($1, $2) RETURNING id::text", a.Owner, a.Name).Scan(&id)
+		time.Sleep(300 * time.Millisecond)
+		return id, err
 	})
 	// addAndEmit inserts a row and announces it to items.all subscribers;
 	// with Name "" it emits and then fails, so the emit must roll back.
@@ -150,7 +170,8 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 	}
 	srv := httptest.NewServer(app)
 	t.Cleanup(srv.Close)
-	return &testEnv{app: app, srv: srv, pool: pool, table: table}
+	env.app, env.srv = app, srv
+	return env
 }
 
 type client struct {

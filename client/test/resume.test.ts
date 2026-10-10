@@ -64,7 +64,7 @@ async function reconnect(ws: FakeWS): Promise<FakeWS> {
 
 test("hello offers resume with the last fully received seq and held subs", async () => {
   const ws = await connected();
-  assert.deepEqual(ws.of("hello")[0].caps, ["resume", "evt"]);
+  assert.ok(ws.of("hello")[0].caps.includes("resume"));
   const sub = comet.subscribe("items");
   ws.recv({ t: "tx", seq: 1, subs: [{ s: sub.id, init, ops: [["i", "1", ["1", "a"], 0]], ready: true }] });
   ws.recv({ t: "tx", seq: 2, more: true, subs: [{ s: sub.id, ops: [["i", "2", ["2", "b"], 1]] }] }); // partial
