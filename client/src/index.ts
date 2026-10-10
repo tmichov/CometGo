@@ -236,7 +236,7 @@ export class Comet {
       this.#lastRecv = Date.now();
       this.#welcomed = false;
       const resume = this.#resumable() ? { resume: { session: this.#session, seq: this.#seq, subs: [...this.#subs.keys()] } } : {};
-      this.#send({ t: "hello", v: 1, caps: ["resume"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}), ...resume });
+      this.#send({ t: "hello", v: 1, caps: ["resume", "evt"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}), ...resume });
       for (const sub of this.#subs.values()) this.#sendSub(sub);
       for (const c of this.#calls.values()) if (!c.sent) this.#sendCall(c);
     };
@@ -417,6 +417,13 @@ export class Comet {
         else c.reject(new CometError(msg.err));
         return;
       }
+      case "evt": {
+        this.#seq = msg.seq;
+        // Events for unknown (unsubscribed, rekeyed) or ended subs are dropped.
+        const sub = this.#subs.get(msg.s);
+        if (sub && sub.status !== "ended") sub._event(msg.topic, msg.data);
+        return;
+      }
       case "authRes": {
         this.#seq = msg.seq;
         if (msg.ok || msg.id === undefined) this.user = msg.ok ? (msg.user ?? null) : null;
@@ -481,6 +488,9 @@ export class Subscription<T> {
   #decode?: (cells: unknown[]) => T;
   #dirty = false;
   #listeners = new Set<() => void>();
+  // One entry per onEvent call, so the same function registered twice is
+  // removed only by its own unsubscribe.
+  #eventListeners = new Map<string, Set<{ fn: (data: any) => void }>>();
   #resolveReady!: () => void;
   #rejectReady!: (e: CometError) => void;
 
@@ -510,6 +520,33 @@ export class Subscription<T> {
   };
 
   getSnapshot = (): readonly T[] => this.rows;
+
+  /**
+   * Listen for the server's ephemeral events on this subscription with the
+   * given topic. Events are at-most-once: one sent while the client is
+   * disconnected and resyncing is never delivered. Returns an unsubscribe
+   * function.
+   */
+  onEvent<D = unknown>(topic: string, fn: (data: D) => void): () => void {
+    let set = this.#eventListeners.get(topic);
+    if (!set) this.#eventListeners.set(topic, (set = new Set()));
+    const entry = { fn: fn as (data: any) => void };
+    set.add(entry);
+    return () => {
+      set.delete(entry);
+      if (set.size === 0 && this.#eventListeners.get(topic) === set) this.#eventListeners.delete(topic);
+    };
+  }
+
+  _event(topic: string, data: unknown): void {
+    for (const { fn } of [...(this.#eventListeners.get(topic) ?? [])]) {
+      try {
+        fn(data);
+      } catch (err) {
+        console.error("cometgo: event listener threw", this.name, topic, err);
+      }
+    }
+  }
 
   stop(): void {
     this.#comet._unsubscribe(this);

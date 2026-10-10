@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ type engine struct {
 	// these is always that re-send.
 	ended        map[*conn]map[uint64]bool
 	carryFences  []*fence
+	carryEvts    []*evtNote
 	carryOut     map[*conn]*connOut
 	retryBackoff time.Duration
 }
@@ -48,6 +50,7 @@ type notification struct {
 	all   bool   // listener (re)connected or unparseable: everything is dirty
 	table string // r/t notifications
 	token string // fence
+	evt   *evtNote
 }
 
 type fence struct {
@@ -204,9 +207,12 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	e.mu.Lock()
 	notes, reqs := e.pending, e.reqs
 	e.pending, e.reqs = nil, nil
-	fences := e.carryFences
-	e.carryFences = nil
+	fences, evts := e.carryFences, e.carryEvts
+	e.carryFences, e.carryEvts = nil, nil
 	for _, n := range notes {
+		if n.evt != nil {
+			evts = append(evts, n.evt)
+		}
 		if n.token != "" {
 			if f := e.fences[n.token]; f != nil {
 				delete(e.fences, n.token)
@@ -267,6 +273,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			// Observers stay dirty; fences wait for a tick that actually
 			// reflects their writes. Requests already applied stay applied.
 			e.carryFences = fences
+			e.carryEvts = evts
 			e.carryOut = out
 			return true
 		}
@@ -301,6 +308,11 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		obs.ops = nil
 	}
 	e.flush(out)
+
+	// Events drained this tick follow the tx reflecting every change
+	// notified before them, and precede the res of the call that emitted
+	// them (its fence is notified after its events).
+	e.deliverEvents(evts)
 
 	// 5. Release fences satisfied by this tick: their writes were drained
 	// before the snapshot, every dirty observer ran, and the resulting tx is
@@ -436,11 +448,7 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	if pub == nil {
 		return NewError(CodeNotFound, "unknown publication "+sub.name)
 	}
-	scope := ""
-	if pub.opts.Scope == ScopeUser {
-		scope = "u:" + ident.userID()
-	}
-	key := sub.name + "\x00" + sub.argsKey + "\x00" + scope
+	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
 	obs := e.observers[key]
 	if obs == nil {
 		q, err := pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
@@ -535,6 +543,16 @@ func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
 		obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
 	}
 	return nil
+}
+
+// sortedSubs returns obs's subs ordered by connection and sub id, so
+// per-observer output has a stable order.
+func (obs *observer) sortedSubs() []*subscription {
+	subs := slices.Collect(maps.Keys(obs.subs))
+	slices.SortFunc(subs, func(a, b *subscription) int {
+		return cmp.Or(strings.Compare(a.c.session, b.c.session), cmp.Compare(a.s, b.s))
+	})
+	return subs
 }
 
 func (obs *observer) awaitsInit() bool {
@@ -637,8 +655,10 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close(context.Background())
-	if _, err := conn.Exec(ctx, "LISTEN comet"); err != nil {
-		return err
+	for _, ch := range []string{"comet", evtChannel} {
+		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
+			return err
+		}
 	}
 	// Notifications sent while we were not listening are lost.
 	e.notify(notification{all: true})
@@ -646,6 +666,12 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			return err
+		}
+		if n.Channel == evtChannel {
+			if evt, ok := parseEvt(n.Payload); ok {
+				e.notify(notification{evt: evt})
+			}
+			continue
 		}
 		e.notify(parseNotification(n.Payload))
 	}

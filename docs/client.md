@@ -74,6 +74,7 @@ const sub = comet.subscribe<Task>("tasks.byProject", { projectId: "9" });
 | `subscribe(fn): () => void` | Calls `fn` after every change to `rows` or `status`. Returns an unsubscribe function. |
 | `getSnapshot(): readonly T[]` | Returns `rows`. |
 | `stop(): void` | Unsubscribes and sets `status` to `"ended"`. It does not notify listeners. |
+| `onEvent<D>(topic, fn: (data: D) => void): () => void` | Calls `fn` for each [event](#events) the server sends to this subscription with this topic. Returns an unsubscribe function. |
 | `name`, `args` | What was subscribed to. |
 | `id: number` | The subscription's wire id. It can change if the client has to re-request a fresh snapshot. |
 
@@ -93,6 +94,17 @@ type SubStatus = "loading" | "ready" | "resyncing" | "ended";
 - **`ended`**: the subscription is over. Either you called `stop()`, which leaves `rows` as it was, or the server ended it, which empties `rows` and sets `error` when it was a failure (e.g. `FORBIDDEN`, `NOT_FOUND`, `RESULT_TOO_LARGE`, `TIMEOUT`).
 
 Every update from the server is applied as one transaction: all subscriptions it touches change together, and each notifies its listeners once.
+
+### Events
+
+A publication with events enabled on the server can send ephemeral messages to its subscribers, such as progress updates:
+
+```ts
+const jobs = comet.subscribe("jobs.mine");
+const off = jobs.onEvent<{ id: string }>("finished", ({ id }) => toast(`Job ${id} finished`));
+```
+
+Events are at-most-once. Events sent while the client is disconnected are lost, even when the session is resumed, and events for a subscription that has ended or been stopped are dropped. An event the server emits from a method (`EmitAfterCommit`) arrives after the method's writes are in `rows` and before the call's promise resolves. A listener that throws is logged and does not affect the others.
 
 ## Calls
 

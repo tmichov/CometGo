@@ -179,6 +179,22 @@ Rows that did not change keep their object identity, so the UI does not re-rende
 
 Resets are used for reconnect resync, identity change and **[later]** slow-consumer recovery.
 
+### 4.5 Events (`evt`)
+
+Ephemeral server→client messages for things that do not belong in a table: progress updates, typing indicators, "job finished" pings.
+
+```json
+← {"t":"evt","seq":1852,"s":7,"topic":"progress","data":{"pct":40}}
+```
+
+- **Negotiation.** The client offers `"evt"` in `hello.caps`; the server advertises `"evt"` in `welcome.caps`. The server sends `evt` only to clients that offered the cap.
+- **Scope.** An event is addressed to one observer, `(pub, args, scope)`, and delivered once to every sub bound to it, each with its own `s`. The publication must enable events on the server.
+- **At-most-once.** An event reaches the subs bound when the server processes it, on sessions with an open socket. It is not stored: events sent while a client is away are never delivered, whether it resyncs (§7.1) or resumes (§7.2). An `evt` that was already sent when the socket dropped is in the replay buffer like any stateful message, so a resume can deliver it, once. A session whose `evt` cap differs from the resuming `hello`'s cannot be resumed.
+- **Ordering.** `evt` is stateful and carries `seq`. An event follows the `tx` reflecting every change committed before it was emitted. An event emitted inside a method's transaction is sent only if it commits, after the `tx` with the method's writes and before the method's `res` (unless the call used `noFence`).
+- **Size.** The encoded event is limited to 7,500 bytes; the server API rejects a larger one.
+- **Multi-node.** Events travel through `pg_notify` on the channel `comet_evt`, so an emit on any node reaches subscribers on every node.
+- The client drops events for subs it does not know or that have ended.
+
 ## 5. Methods
 
 ```json
@@ -452,6 +468,7 @@ Every node receives every fence and ignores the tokens it does not own.
 
 **Implemented since v1-core**:
 - **Reconnect:** session resume (`seq`/`ack`/replay, §7.2), behind `caps`.
+- **Events:** `evt` (ephemeral, at-most-once, sub-scoped, §4.5), behind `caps`.
 - **Methods:** `cancel` (§5). It needs no cap: a server without it ignores the message, and the call settles from its normal `res`.
 
 **[later]**, all additive and behind `caps`:
@@ -463,7 +480,6 @@ Every node receives every fence and ignores the tokens it does not own.
   - Go-side predicate filtering
   - logical replication
 - **Client and features:**
-  - `evt` (ephemeral, at-most-once, sub-scoped events)
   - presence
   - hot reload via `build`
   - `src` interning (safe only between subs last updated in the same `tx`)
