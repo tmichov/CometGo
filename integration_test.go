@@ -30,6 +30,12 @@ type testEnv struct {
 
 func setup(t *testing.T) *testEnv {
 	t.Helper()
+	return setupWith(t, nil)
+}
+
+// setupWith is setup with Config overrides applied before New.
+func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
+	t.Helper()
 	dsn := os.Getenv("COMETGO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("COMETGO_TEST_DATABASE_URL not set")
@@ -54,21 +60,28 @@ func setup(t *testing.T) *testEnv {
 	}
 	env := &testEnv{pool: pool, table: table}
 
-	app := New(Config{
+	cfg := Config{
 		DB:              pool,
 		MinTickInterval: 5 * time.Millisecond,
 		Authenticate: func(ctx context.Context, token string) (*Identity, error) {
-			if token == "alice" || token == "bob" {
+			switch token {
+			case "alice", "bob":
 				return &Identity{UserID: token}, nil
+			case "alice-short":
+				return &Identity{UserID: "alice", ExpiresAt: time.Now().Add(300 * time.Millisecond)}, nil
 			}
 			return nil, NewError(CodeUnauthenticated, "bad token")
 		},
-	})
-	Publish(app, "items.all", PubOptions{Tables: []string{table}, Scope: ScopeShared},
+	}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	app := New(cfg)
+	Publish(app, "items.all", PubOptions{Tables: []string{table}, Scope: ScopeShared, Events: true},
 		func(c *SubCtx, _ struct{}) (Query, error) {
 			return Query{SQL: "SELECT id, owner, name, n FROM " + table + " ORDER BY id"}, nil
 		})
-	Publish(app, "items.mine", PubOptions{Tables: []string{table}},
+	Publish(app, "items.mine", PubOptions{Tables: []string{table}, Events: true},
 		func(c *SubCtx, _ struct{}) (Query, error) {
 			if c.Identity == nil {
 				return Query{}, ErrForbidden
@@ -103,40 +116,62 @@ func setup(t *testing.T) *testEnv {
 		time.Sleep(300 * time.Millisecond)
 		return id, err
 	})
-	var started time.Time
-	if err := pool.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&started); err != nil {
-		t.Fatal(err)
-	}
-	app.Start(ctx)
-	waitListening(t, pool, started)
-	srv := httptest.NewServer(app)
-	t.Cleanup(srv.Close)
-	env.app, env.srv = app, srv
-	return env
-}
-
-// waitListening waits for the app's LISTEN connection, opened after started.
-// A fence notified before it is up is lost, and the call would wait out
-// FenceTimeout (CMTG-13).
-func waitListening(t *testing.T, pool *pgxpool.Pool, started time.Time) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var n int
-		err := pool.QueryRow(context.Background(), `
-			SELECT count(*) FROM pg_stat_activity
-			WHERE query = 'LISTEN comet' AND backend_start >= $1`, started).Scan(&n)
-		if err != nil {
-			t.Fatal(err)
+	// addAndEmit inserts a row and announces it to items.all subscribers;
+	// with Name "" it emits and then fails, so the emit must roll back.
+	Method(app, "addAndEmit", func(c *Call, a addArgs) (string, error) {
+		var id string
+		if err := c.Tx.QueryRow(c.Context, "INSERT INTO "+table+" (owner, name) VALUES ($1, $2) RETURNING id::text", a.Owner, a.Name).Scan(&id); err != nil {
+			return "", err
 		}
-		if n > 0 {
-			return
+		if err := c.EmitAfterCommit("items.all", nil, "", "added", map[string]string{"id": id}); err != nil {
+			return "", err
+		}
+		if a.Name == "" {
+			return "", ValidationError(map[string]string{"name": "required"})
+		}
+		return id, nil
+	})
+	// emitTwice sends two identical events from one transaction.
+	Method(app, "emitTwice", func(c *Call, _ struct{}) (struct{}, error) {
+		for range 2 {
+			if err := c.EmitAfterCommit("items.all", nil, "", "same", 1); err != nil {
+				return struct{}{}, err
+			}
+		}
+		return struct{}{}, nil
+	})
+	// sleepAdd inserts a row, then sleeps SleepMs in Postgres through
+	// c.Context, so a cancel can interrupt it.
+	Method(app, "sleepAdd", func(c *Call, a struct {
+		Name    string
+		SleepMs int
+	}) (string, error) {
+		var id string
+		if err := c.Tx.QueryRow(c.Context, "INSERT INTO "+table+" (owner, name) VALUES ('c', $1) RETURNING id::text", a.Name).Scan(&id); err != nil {
+			return "", err
+		}
+		_, err := c.Tx.Exec(c.Context, "SELECT pg_sleep($1::float8 / 1000)", a.SleepMs)
+		return id, err
+	})
+	app.Start(ctx)
+	// LISTEN comes up asynchronously; a fence notified before it would be
+	// lost and its call would wait FenceTimeout. The listener signals
+	// readiness with its first notification.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		app.engine.mu.Lock()
+		up := app.engine.nextN > 0
+		app.engine.mu.Unlock()
+		if up {
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("listener did not start")
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
+	srv := httptest.NewServer(app)
+	t.Cleanup(srv.Close)
+	env.app, env.srv = app, srv
+	return env
 }
 
 type client struct {

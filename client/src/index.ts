@@ -33,29 +33,6 @@ export interface ConnectOptions {
   WebSocket?: typeof WebSocket;
 }
 
-export interface CallOptions {
-  /** Skip the read-your-writes fence (§6.2); for calls that do not write. */
-  noFence?: boolean;
-  /**
-   * Attach a generated idempotency key (§5), so the call is re-sent after a
-   * disconnect instead of failing with CONNECTION_LOST. The server runs the
-   * method at most once per key and user, and returns the stored result to
-   * a retry. Use it for calls that must not run twice.
-   */
-  idempotent?: boolean;
-  /** An idempotency key of your own (implies idempotent), for retries across page loads. */
-  ik?: string;
-}
-
-/**
- * How long after its first send an ik call may still be retried. Must stay
- * well under the server's IdempotencyTTL (24h by default): past the TTL the
- * stored result is gone and a retry would run the method again.
- */
-const IK_RETRY_WINDOW_MS = 60 * 60 * 1000;
-
-const lost = () => new CometError({ code: "CONNECTION_LOST", msg: "connection lost; outcome unknown" });
-
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 export type SubStatus = "loading" | "ready" | "resyncing" | "ended";
 
@@ -68,6 +45,52 @@ interface WireEntry {
   end?: { code: string; msg?: string; details?: unknown };
 }
 
+interface PendingAuth {
+  token: string | null;
+  // Sent on a socket that dropped; awaiting the resume outcome.
+  held?: boolean;
+  resolve: (u: unknown) => void;
+  reject: (e: CometError) => void;
+}
+
+// Ack the last seq received at least this often (§7.2): every liveness
+// check (1 s) or after this many bytes.
+const ACK_BYTES = 64 << 10;
+
+export interface CallOptions {
+  /** Skip the read-your-writes fence (§6.2); for calls that do not write. */
+  noFence?: boolean;
+  /**
+   * Cancels the call when aborted (§5). A call not yet sent is rejected at
+   * once with CANCELED. A sent one is asked to stop, and the promise settles
+   * from the server's answer: CANCELED if the method had not committed yet,
+   * otherwise its real result.
+   */
+  signal?: AbortSignal;
+  /**
+   * Attach a generated idempotency key (§5), so the call can be re-sent
+   * after a disconnect even when the session cannot be resumed, instead of
+   * failing with CONNECTION_LOST. The server runs the method at most once
+   * per key and user, and returns the stored result to a retry. Use it for
+   * calls that must not run twice.
+   */
+  idempotent?: boolean;
+  /**
+   * An idempotency key of your own (implies idempotent), for retries across
+   * page loads. It must be unguessable, e.g. crypto.randomUUID(): anonymous
+   * callers share one key scope.
+   */
+  ik?: string;
+}
+
+/**
+ * How long after its first send an ik call may still be retried on a new
+ * session. Must stay well under the server's IdempotencyTTL (24h by
+ * default): past the TTL the stored result is gone and a retry would run
+ * the method again.
+ */
+const IK_RETRY_WINDOW_MS = 60 * 60 * 1000;
+
 interface PendingCall {
   id: number;
   m: string;
@@ -77,12 +100,15 @@ interface PendingCall {
   sent: boolean;
   /** When the call was first sent; bounds how long an ik call is retried. */
   firstSent?: number;
-  /**
-   * Set when an ik call lost its connection after being sent. It is held
-   * until the next welcome, which decides whether it is re-sent: the server
-   * must advertise the ik cap and the user must be the one it ran as.
-   */
-  retry?: { user: string };
+  // Sent on a socket that dropped; awaiting the next welcome, which re-sends
+  // it if the session resumed (§7.2) or, for an ik call, if it can be
+  // retried safely on the new session (§7.1).
+  held?: boolean;
+  // For a held ik call: the user it ran as, if the dropped socket's welcome
+  // had arrived. Without it the call cannot be retried on a new session.
+  heldUser?: string;
+  // The caller aborted: send cancel after the call whenever it is sent.
+  cancel?: boolean;
   resolve: (r: { value: unknown; lag: boolean }) => void;
   reject: (e: CometError) => void;
 }
@@ -102,7 +128,7 @@ export class Comet {
   #ws?: WebSocket;
   #subs = new Map<number, Subscription<any>>();
   #calls = new Map<number, PendingCall>();
-  #auths = new Map<number, { resolve: (u: unknown) => void; reject: (e: CometError) => void }>();
+  #auths = new Map<number, PendingAuth>();
   #nextId = 1;
   #nextSub = 1;
   #txParts: WireEntry[] = [];
@@ -111,11 +137,18 @@ export class Comet {
   #lastRecv = 0;
   #pinged = false;
   #closed = false;
-  /** Whether the current connection has received its welcome. */
-  #welcomed = false;
   #reconnectTimer?: ReturnType<typeof setTimeout>;
   #hbTimer?: ReturnType<typeof setInterval>;
   #statusListeners = new Set<() => void>();
+  // Session resume (§7.2): the session to resume, whether the server offers
+  // resume, the last seq fully received, the last seq acked, and bytes
+  // received since.
+  #session?: string;
+  #canResume = false;
+  #seq = 0;
+  #acked = 0;
+  #welcomed = false; // the current socket's welcome has arrived
+  #unackedBytes = 0;
 
   constructor(opts: ConnectOptions) {
     this.#opts = opts;
@@ -150,6 +183,13 @@ export class Comet {
   /** Like call, but also reports lag: true when the fence timed out. */
   callWithStatus<R = unknown>(m: string, args?: unknown, opts: CallOptions = {}): Promise<{ value: R; lag: boolean }> {
     return new Promise((resolve, reject) => {
+      const { signal } = opts;
+      if (signal?.aborted) {
+        reject(canceled());
+        return;
+      }
+      const onAbort = () => this.#abort(c);
+      const settled = () => signal?.removeEventListener("abort", onAbort);
       const c: PendingCall = {
         id: this.#nextId++,
         m,
@@ -157,9 +197,16 @@ export class Comet {
         noFence: !!opts.noFence,
         ik: opts.ik ?? (opts.idempotent ? uuid() : undefined),
         sent: false,
-        resolve: resolve as PendingCall["resolve"],
-        reject,
+        resolve: (r) => {
+          settled();
+          resolve(r as { value: R; lag: boolean });
+        },
+        reject: (e) => {
+          settled();
+          reject(e);
+        },
       };
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.#calls.set(c.id, c);
       // Unsent calls wait for the next connection; they never ran, so
       // sending them later is safe.
@@ -175,7 +222,7 @@ export class Comet {
       const t = await resolveToken(token);
       const id = this.#nextId++;
       return new Promise((resolve, reject) => {
-        this.#auths.set(id, { resolve, reject });
+        this.#auths.set(id, { token: t, resolve, reject });
         this.#send({ t: "auth", id, token: t });
       });
     })();
@@ -183,16 +230,10 @@ export class Comet {
 
   close(): void {
     this.#closed = true;
-    // Calls held for a retry would otherwise never settle.
-    for (const c of [...this.#calls.values()]) {
-      if (c.retry) {
-        this.#calls.delete(c.id);
-        c.reject(lost());
-      }
-    }
     clearTimeout(this.#reconnectTimer);
     clearInterval(this.#hbTimer);
     this.#ws?.close(1000);
+    this.#rejectSent(); // calls kept for a resume that will not happen
   }
 
   // ---- internals used by Subscription ----
@@ -220,12 +261,15 @@ export class Comet {
     const ws = new WS(this.#opts.url ?? defaultUrl(), [SUBPROTOCOL]);
     this.#ws = ws;
     ws.onopen = () => {
-      // Pipelined handshake (§3.1): no need to wait for welcome.
+      // Pipelined handshake (§3.1): no need to wait for welcome. Calls that
+      // were sent before the drop wait for it, though: they are re-sent only
+      // if the session resumes (§7.2).
       this.#lastRecv = Date.now();
-      this.#send({ t: "hello", v: 1, caps: ["ik"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}) });
+      this.#welcomed = false;
+      const resume = this.#resumable() ? { resume: { session: this.#session, seq: this.#seq, subs: [...this.#subs.keys()] } } : {};
+      this.#send({ t: "hello", v: 1, caps: ["resume", "evt", "ik"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}), ...resume });
       for (const sub of this.#subs.values()) this.#sendSub(sub);
-      // Held ik retries wait for welcome (see PendingCall.retry).
-      for (const c of this.#calls.values()) if (!c.sent && !c.retry) this.#sendCall(c);
+      for (const c of this.#calls.values()) if (!c.sent) this.#sendCall(c);
     };
     ws.onmessage = (ev) => {
       this.#lastRecv = Date.now();
@@ -236,7 +280,9 @@ export class Comet {
       } catch {
         return;
       }
+      if (msg.seq !== undefined) this.#unackedBytes += (ev.data as string).length;
       this.#handle(msg);
+      if (this.#unackedBytes >= ACK_BYTES) this.#ack();
     };
     ws.onclose = (ev) => {
       if (this.#ws !== ws) return;
@@ -246,27 +292,32 @@ export class Comet {
 
   #onDisconnect(code: number, reason: string): void {
     this.#ws = undefined;
-    this.#txParts = [];
-    // Calls that reached the server have an unknown outcome: never replay them
-    // (§7.1), unless they carry an idempotency key. Those are re-sent on the
-    // next connection, and the server answers with the stored result if the
-    // first attempt committed. Without this connection's welcome we do not
-    // know which user the call ran as, so it cannot be retried safely. After
-    // close() there is no next connection.
-    const welcomed = this.#welcomed;
-    this.#welcomed = false;
+    this.#txParts = []; // a partial tx is replayed whole: #seq never counted it
+    // With a resumable session, sent calls are held until the reconnect:
+    // resumed, they are re-sent; otherwise they are rejected then (§7.2).
+    // Calls with an idempotency key are held either way, and may be retried
+    // on a new session (§5).
+    const user = this.#welcomed ? JSON.stringify(this.user) : undefined;
+    const resumable = !this.#closed && this.#resumable();
     for (const c of [...this.#calls.values()]) {
       if (!c.sent) continue;
-      c.sent = false;
-      if (c.ik !== undefined && welcomed && !this.#closed) {
-        c.retry = { user: JSON.stringify(this.user) };
+      // Held from an earlier drop and not re-sent since: keep its user.
+      if (c.held && c.ik !== undefined && !this.#closed) continue;
+      if (resumable || (c.ik !== undefined && !this.#closed && user !== undefined)) {
+        c.held = true;
+        if (c.ik !== undefined) c.heldUser = user;
       } else {
         this.#calls.delete(c.id);
         c.reject(lost());
       }
     }
-    for (const a of this.#auths.values()) a.reject(new CometError({ code: "CONNECTION_LOST" }));
-    this.#auths.clear();
+    for (const [id, a] of [...this.#auths]) {
+      if (resumable) a.held = true;
+      else {
+        this.#auths.delete(id);
+        a.reject(new CometError({ code: "CONNECTION_LOST" }));
+      }
+    }
     for (const sub of this.#subs.values()) sub._disconnected();
     this.#setStatus("disconnected");
     if (code >= 4400 && code < 4500 && reason) console.warn("cometgo: closed", code, reason);
@@ -282,8 +333,55 @@ export class Comet {
     void this.#open();
   }
 
+  #resumable(): boolean {
+    return this.#canResume && this.#session !== undefined;
+  }
+
+  // Calls (and auths) that reached the server have an unknown outcome:
+  // never replay them on a new session (§7.1). heldOnly limits this to those
+  // sent before the last drop, sparing any sent on the current socket.
+  #rejectSent(heldOnly = false): void {
+    for (const c of [...this.#calls.values()]) {
+      if (c.sent && (c.held || !heldOnly)) {
+        this.#calls.delete(c.id);
+        c.reject(lost());
+      }
+    }
+    for (const [id, a] of [...this.#auths]) {
+      if (a.held || !heldOnly) {
+        this.#auths.delete(id);
+        a.reject(new CometError({ code: "CONNECTION_LOST" }));
+      }
+    }
+  }
+
+  // On a new session, re-sends held ik calls that can be retried safely: a
+  // server without the ik cap ignores the key and would run the call again,
+  // as would a different user's key scope or an expired stored result.
+  // The rest stay held, and #rejectSent rejects them.
+  #retryIK(serverHasIK: boolean): void {
+    const user = JSON.stringify(this.user);
+    for (const c of this.#calls.values()) {
+      if (!c.held || c.ik === undefined) continue;
+      if (serverHasIK && c.heldUser === user && Date.now() - c.firstSent! < IK_RETRY_WINDOW_MS) {
+        c.held = false;
+        c.heldUser = undefined;
+        this.#sendCall(c);
+      }
+    }
+  }
+
+  #ack(): void {
+    this.#unackedBytes = 0;
+    // Before welcome, #seq may belong to a session this socket did not resume.
+    if (!this.#canResume || !this.#welcomed || this.#seq <= this.#acked || !this.#isOpen()) return;
+    this.#acked = this.#seq;
+    this.#send({ t: "ack", seq: this.#seq });
+  }
+
   #checkLiveness(): void {
     if (!this.#isOpen()) return;
+    this.#ack();
     const idle = Date.now() - this.#lastRecv;
     if (idle > this.#hb + 10_000) {
       this.#ws!.close(4408); // dead connection; onclose reconnects
@@ -305,23 +403,22 @@ export class Comet {
     c.sent = true;
     c.firstSent ??= Date.now();
     this.#send({ t: "call", id: c.id, m: c.m, args: c.args ?? null, ...(c.noFence ? { noFence: true } : {}), ...(c.ik !== undefined ? { ik: c.ik } : {}) });
+    // An aborted call held for a resume is re-sent (its outcome is still
+    // unknown) and cancelled right after.
+    if (c.cancel) this.#send({ t: "cancel", id: c.id });
   }
 
-  // Re-sends ik calls held since a disconnect, or rejects those it cannot
-  // retry safely: a server without the ik cap ignores the key and would run
-  // the call again, as would a different user's scope or an expired result.
-  #retryHeld(serverHasIK: boolean): void {
-    const user = JSON.stringify(this.user);
-    for (const c of [...this.#calls.values()]) {
-      if (!c.retry) continue;
-      if (serverHasIK && c.retry.user === user && Date.now() - c.firstSent! < IK_RETRY_WINDOW_MS) {
-        c.retry = undefined;
-        this.#sendCall(c);
-      } else {
-        this.#calls.delete(c.id);
-        c.reject(lost());
-      }
+  // An unsent call never ran, so it settles here. A sent one may already
+  // have committed: ask the server to cancel and wait for its res.
+  #abort(c: PendingCall): void {
+    if (this.#calls.get(c.id) !== c) return; // already settled
+    if (!c.sent) {
+      this.#calls.delete(c.id);
+      c.reject(canceled());
+      return;
     }
+    c.cancel = true;
+    if (!c.held && this.#isOpen()) this.#send({ t: "cancel", id: c.id });
   }
 
   #setStatus(s: ConnectionStatus): void {
@@ -341,20 +438,45 @@ export class Comet {
         this.#hb = msg.hb ?? this.#hb;
         this.user = msg.user ?? null;
         this.serverBuild = msg.build;
+        this.#session = msg.session;
         this.#welcomed = true;
-        this.#retryHeld(Array.isArray(msg.caps) && msg.caps.includes("ik"));
+        this.#canResume = Array.isArray(msg.caps) && msg.caps.includes("resume");
+        if (msg.resumed) {
+          // Missed messages follow as a replay. Unanswered calls and auths
+          // go out again with their original ids; the server runs each
+          // only once (§7.2).
+          for (const c of this.#calls.values()) {
+            if (c.held) {
+              c.held = false;
+              this.#sendCall(c);
+            }
+          }
+          for (const [id, a] of this.#auths) {
+            if (a.held) {
+              a.held = false;
+              this.#send({ t: "auth", id, token: a.token });
+            }
+          }
+          for (const sub of this.#subs.values()) sub._resumed();
+        } else {
+          this.#retryIK(Array.isArray(msg.caps) && msg.caps.includes("ik"));
+          this.#rejectSent(true);
+          this.#seq = this.#acked = this.#unackedBytes = 0; // a new session counts from 1
+        }
         this.status = "connected";
         this.#emit();
         return;
       case "tx": {
         this.#txParts.push(...(msg.subs as WireEntry[]));
         if (msg.more) return; // wait for the final part (§4.3)
+        this.#seq = msg.seq;
         const entries = this.#txParts;
         this.#txParts = [];
         this.#applyTx(entries);
         return;
       }
       case "res": {
+        this.#seq = msg.seq;
         const c = this.#calls.get(msg.id);
         if (!c) return;
         this.#calls.delete(msg.id);
@@ -362,7 +484,15 @@ export class Comet {
         else c.reject(new CometError(msg.err));
         return;
       }
+      case "evt": {
+        this.#seq = msg.seq;
+        // Events for unknown (unsubscribed, rekeyed) or ended subs are dropped.
+        const sub = this.#subs.get(msg.s);
+        if (sub && sub.status !== "ended") sub._event(msg.topic, msg.data);
+        return;
+      }
       case "authRes": {
+        this.#seq = msg.seq;
         if (msg.ok || msg.id === undefined) this.user = msg.ok ? (msg.user ?? null) : null;
         if (msg.id !== undefined) {
           const a = this.#auths.get(msg.id);
@@ -425,6 +555,9 @@ export class Subscription<T> {
   #decode?: (cells: unknown[]) => T;
   #dirty = false;
   #listeners = new Set<() => void>();
+  // One entry per onEvent call, so the same function registered twice is
+  // removed only by its own unsubscribe.
+  #eventListeners = new Map<string, Set<{ fn: (data: any) => void }>>();
   #resolveReady!: () => void;
   #rejectReady!: (e: CometError) => void;
 
@@ -455,6 +588,33 @@ export class Subscription<T> {
 
   getSnapshot = (): readonly T[] => this.rows;
 
+  /**
+   * Listen for the server's ephemeral events on this subscription with the
+   * given topic. Events are at-most-once: one sent while the client is
+   * disconnected and resyncing is never delivered. Returns an unsubscribe
+   * function.
+   */
+  onEvent<D = unknown>(topic: string, fn: (data: D) => void): () => void {
+    let set = this.#eventListeners.get(topic);
+    if (!set) this.#eventListeners.set(topic, (set = new Set()));
+    const entry = { fn: fn as (data: any) => void };
+    set.add(entry);
+    return () => {
+      set.delete(entry);
+      if (set.size === 0 && this.#eventListeners.get(topic) === set) this.#eventListeners.delete(topic);
+    };
+  }
+
+  _event(topic: string, data: unknown): void {
+    for (const { fn } of [...(this.#eventListeners.get(topic) ?? [])]) {
+      try {
+        fn(data);
+      } catch (err) {
+        console.error("cometgo: event listener threw", this.name, topic, err);
+      }
+    }
+  }
+
   stop(): void {
     this.#comet._unsubscribe(this);
     this.status = "ended";
@@ -462,6 +622,15 @@ export class Subscription<T> {
 
   _hasData(): boolean {
     return this.#init !== undefined;
+  }
+
+  _resumed(): void {
+    // The session survived: data held is current, and the replay brings the rest.
+    if (this.status === "resyncing") {
+      this.status = "ready";
+      this.#dirty = true;
+      this._flush();
+    }
   }
 
   _rekey(id: number): void {
@@ -524,6 +693,10 @@ async function resolveToken(t: TokenSource | undefined): Promise<string | null> 
   return t ?? null;
 }
 
+function lost(): CometError {
+  return new CometError({ code: "CONNECTION_LOST", msg: "connection lost; outcome unknown" });
+}
+
 // A random (v4) UUID. crypto.randomUUID needs a secure context; getRandomValues does not.
 function uuid(): string {
   const b = crypto.getRandomValues(new Uint8Array(16));
@@ -531,6 +704,10 @@ function uuid(): string {
   b[8] = (b[8]! & 0x3f) | 0x80;
   const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+function canceled(): CometError {
+  return new CometError({ code: "CANCELED", msg: "call canceled" });
 }
 
 function defaultUrl(): string {

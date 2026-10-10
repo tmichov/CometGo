@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,9 +31,16 @@ type engine struct {
 	wake    chan struct{}
 
 	// Owned by the run goroutine.
-	observers    map[string]*observer
-	conns        map[*conn]map[uint64]*subscription
+	observers map[string]*observer
+	conns     map[*conn]map[uint64]*subscription
+	// ended records, per resumable session, the sub ids whose end was sent.
+	// After a resume the client re-sends its subs before the replayed end
+	// reaches it; re-binding such an id would leave a sub the client never
+	// tracks again. Sub ids are never reused (§4.1), so a sub for one of
+	// these is always that re-send.
+	ended        map[*conn]map[uint64]bool
 	carryFences  []*fence
+	carryEvts    []*evtNote
 	carryOut     map[*conn]*connOut
 	retryBackoff time.Duration
 }
@@ -42,6 +50,7 @@ type notification struct {
 	all   bool   // listener (re)connected or unparseable: everything is dirty
 	table string // r/t notifications
 	token string // fence
+	evt   *evtNote
 }
 
 type fence struct {
@@ -95,6 +104,14 @@ type unsubReq struct {
 
 type closeReq struct{ c *conn }
 
+// resumeReq unbinds every sub of c not in keep: the client unsubscribed
+// while its unsub was lost in transit (§7.2). The client no longer holds
+// those subs, so no end entry is sent.
+type resumeReq struct {
+	c    *conn
+	keep map[uint64]bool
+}
+
 // rebindReq re-binds every sub of c to ident, and sends after once the
 // resulting tx is enqueued (PROTOCOL.md §3.2).
 type rebindReq struct {
@@ -110,6 +127,7 @@ func newEngine(a *App) *engine {
 		wake:      make(chan struct{}, 1),
 		observers: map[string]*observer{},
 		conns:     map[*conn]map[uint64]*subscription{},
+		ended:     map[*conn]map[uint64]bool{},
 	}
 }
 
@@ -189,9 +207,12 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	e.mu.Lock()
 	notes, reqs := e.pending, e.reqs
 	e.pending, e.reqs = nil, nil
-	fences := e.carryFences
-	e.carryFences = nil
+	fences, evts := e.carryFences, e.carryEvts
+	e.carryFences, e.carryEvts = nil, nil
 	for _, n := range notes {
+		if n.evt != nil {
+			evts = append(evts, n.evt)
+		}
 		if n.token != "" {
 			if f := e.fences[n.token]; f != nil {
 				delete(e.fences, n.token)
@@ -252,6 +273,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			// Observers stay dirty; fences wait for a tick that actually
 			// reflects their writes. Requests already applied stay applied.
 			e.carryFences = fences
+			e.carryEvts = evts
 			e.carryOut = out
 			return true
 		}
@@ -287,6 +309,11 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	}
 	e.flush(out)
 
+	// Events drained this tick follow the tx reflecting every change
+	// notified before them, and precede the res of the call that emitted
+	// them (its fence is notified after its events).
+	e.deliverEvents(evts)
+
 	// 5. Release fences satisfied by this tick: their writes were drained
 	// before the snapshot, every dirty observer ran, and the resulting tx is
 	// already enqueued ahead of the method's res.
@@ -299,6 +326,16 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 func (e *engine) flush(out map[*conn]*connOut) {
 	for c, o := range out {
 		slices.SortStableFunc(o.entries, func(a, b subEntry) int { return cmp.Compare(a.S, b.S) })
+		if c.resume {
+			for _, en := range o.entries {
+				if en.End != nil {
+					if e.ended[c] == nil {
+						e.ended[c] = map[uint64]bool{}
+					}
+					e.ended[c][en.S] = true
+				}
+			}
+		}
 		if len(o.entries) > 0 {
 			c.sendTx(o.entries)
 		}
@@ -340,7 +377,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 	}
 	switch r := r.(type) {
 	case subReq:
-		if r.c.isClosed() {
+		if r.c.isClosed() || e.ended[r.c][r.s] {
 			return
 		}
 		subs := e.conns[r.c]
@@ -381,6 +418,15 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			e.detach(sub)
 		}
 		delete(e.conns, r.c)
+		delete(e.ended, r.c)
+
+	case resumeReq:
+		for s, sub := range e.conns[r.c] {
+			if !r.keep[s] {
+				e.detach(sub)
+				delete(e.conns[r.c], s)
+			}
+		}
 
 	case rebindReq:
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
@@ -402,11 +448,7 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	if pub == nil {
 		return NewError(CodeNotFound, "unknown publication "+sub.name)
 	}
-	scope := ""
-	if pub.opts.Scope == ScopeUser {
-		scope = "u:" + ident.userID()
-	}
-	key := sub.name + "\x00" + sub.argsKey + "\x00" + scope
+	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
 	obs := e.observers[key]
 	if obs == nil {
 		q, err := pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
@@ -501,6 +543,16 @@ func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
 		obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
 	}
 	return nil
+}
+
+// sortedSubs returns obs's subs ordered by connection and sub id, so
+// per-observer output has a stable order.
+func (obs *observer) sortedSubs() []*subscription {
+	subs := slices.Collect(maps.Keys(obs.subs))
+	slices.SortFunc(subs, func(a, b *subscription) int {
+		return cmp.Or(strings.Compare(a.c.session, b.c.session), cmp.Compare(a.s, b.s))
+	})
+	return subs
 }
 
 func (obs *observer) awaitsInit() bool {
@@ -603,8 +655,10 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close(context.Background())
-	if _, err := conn.Exec(ctx, "LISTEN comet"); err != nil {
-		return err
+	for _, ch := range []string{"comet", evtChannel} {
+		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
+			return err
+		}
 	}
 	// Notifications sent while we were not listening are lost.
 	e.notify(notification{all: true})
@@ -612,6 +666,12 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			return err
+		}
+		if n.Channel == evtChannel {
+			if evt, ok := parseEvt(n.Payload); ok {
+				e.notify(notification{evt: evt})
+			}
+			continue
 		}
 		e.notify(parseNotification(n.Payload))
 	}

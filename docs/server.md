@@ -48,6 +48,8 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `MaxInflight int` | 32 | Concurrent method calls per connection. A call over the limit gets `RATE_LIMITED` with `retryAfterMs: 100`. |
 | `MaxMsg int` | 1 MiB | Largest message the server accepts from a client. A larger message closes the connection. |
 | `MaxRows int` | 10,000 | Row cap per publication result. A larger result ends its subscriptions with `RESULT_TOO_LARGE`. |
+| `ResumeGrace` | 60s | How long a session outlives a lost connection, waiting for the client to resume it ([protocol §7.2](protocol.md#72-session-resume)). Unlike the other durations, a **negative** value disables resume, and clients then resync on every reconnect. See [Session resume](#session-resume). |
+| `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay, at most 4 MiB (half the outbound queue limit, since a resume sends the whole replay at once). A disconnected session that outgrows it ends, and its client resyncs. |
 | `Logger *slog.Logger` | `slog.Default()` | Where the framework logs, including the details of `INTERNAL` errors. |
 
 `MaxSubs`, `MaxInflight` and `MaxMsg` are also advertised to the client in `welcome.limits`.
@@ -100,6 +102,7 @@ All observers that need re-running in one tick run inside one `REPEATABLE READ R
 | `Key []string` | `["id"]` | The result columns that uniquely identify a row. They must be present in the `SELECT` list and must not be null. A missing key column fails the query with `INTERNAL`. |
 | `Unordered bool` | false | Declares that row order carries no meaning. The server then sends no positions, and the client's row order is arbitrary. Leave it false and use `ORDER BY` when order matters. |
 | `Scope Scope` | `ScopeUser` | Which connections may share one observer. See below. |
+| `Events bool` | false | Allows [events](#events) to be sent to this publication's subscriptions. |
 
 ### Scope
 
@@ -159,7 +162,8 @@ Writes through another connection (the pool passed as `Config.DB`, or any other 
 Other details:
 
 - Calls on one connection run concurrently, up to `Config.MaxInflight`. A client that needs two calls in order should await the first.
-- `c.Context` is **not** cancelled when the client disconnects. A call that has started runs to completion and commits or rolls back on its own; the client reports `CONNECTION_LOST` because it cannot know which.
+- `c.Context` is **not** cancelled when the client disconnects. A call that has started runs to completion and commits or rolls back on its own. If the client resumes its session, it gets the result; otherwise it reports `CONNECTION_LOST`, because it cannot know which happened.
+- `c.Context` **is** cancelled when the client cancels the call (`signal` in the TypeScript client), and only then: it stays valid after the call returns, so work a handler starts with it is not cut off. Pass it to every query so a long one stops promptly. A cancel that arrives while the handler is running always rolls the transaction back and the client gets `CANCELED`, even if the handler ignores the context and returns normally. A cancel that arrives once the handler has returned is too late: the call commits and the client gets the real result.
 - A client can send a call with `noFence`, which commits without the fence and returns as soon as the transaction commits. Use it for calls that do not write.
 - An unknown method name returns `NOT_FOUND`.
 - A client can send a call with an idempotency key, so it can retry safely after a disconnect. See [Idempotency keys](#idempotency-keys).
@@ -178,6 +182,41 @@ A call whose connection dropped before its result arrived has an unknown outcome
 - Stored results are deleted after `Config.IdempotencyTTL` (24h by default) by a cleanup that `Start` runs every hour (every TTL if that is shorter, but at most once a minute).
 
 The table must exist: call [`InstallIdempotency`](#installidempotency) at startup. Without it, a call carrying a key fails with `INTERNAL`.
+
+## Events
+
+Events are ephemeral messages to a publication's subscribers, for things that do not belong in a table: progress, typing indicators, "job finished". The publication must set `PubOptions.Events`.
+
+```go
+func (a *App) Emit(ctx context.Context, pubName string, args any, scope, topic string, data any) error
+func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, data any) error
+```
+
+An event is addressed to one observer: the publication, its args and its scope. It is delivered to every subscription bound to that observer, and the client receives it through `sub.onEvent(topic, fn)`.
+
+- `args` must encode to the same JSON value the client sent when subscribing (key order and whitespace do not matter). The comparison is on JSON, not on the decoded args: a Go struct without `json` tags encodes `ProjectID`, which does not match a client's `projectId`, and fields the client omitted must be omitted too. Tag your args types and use the same type for the publication and `Emit`. `nil` matches a subscription made without args. An event that matches no subscription is dropped without an error.
+- `scope` is the user ID for a `ScopeUser` publication, and must not be empty: anonymous subscribers cannot be targeted. It is ignored for `ScopeShared`.
+- `data` is JSON-encoded.
+
+`Emit` sends the event at once. `EmitAfterCommit` sends it from inside a method's transaction: the event is sent only if the method commits, and the client receives it after the update carrying the method's writes and before the method's result. Use it whenever the event refers to data the method writes.
+
+```go
+cometgo.Method(app, "jobs.finish", func(c *cometgo.Call, a FinishArgs) (struct{}, error) {
+	if _, err := c.Tx.Exec(c.Context, "UPDATE jobs SET done = true WHERE id = $1", a.ID); err != nil {
+		return struct{}{}, err
+	}
+	return struct{}{}, c.EmitAfterCommit("jobs.mine", nil, c.Identity.UserID, "finished", map[string]any{"id": a.ID})
+})
+```
+
+Delivery is **at-most-once**:
+
+- An event reaches the subscriptions bound when the server processes it, on connections that are open. Nobody subscribed means it is dropped.
+- Events are not stored. A client does not receive events sent while it was disconnected, even if it resumes its session (see [Session resume](#session-resume)); only an event already sent when the connection dropped can arrive with the resume replay. So a burst of events never fills the replay buffer of a disconnected session.
+- Several identical events emitted in one transaction are all delivered.
+- Only clients that negotiated the `evt` capability receive events; the TypeScript client always does.
+
+Events travel through `pg_notify` on the channel `comet_evt`, so in a multi-node deployment an emit on any node reaches subscribers on every node. A notification is limited in size: an event whose encoding exceeds 7,500 bytes is rejected with `ErrEventTooLarge`, and nothing is sent. Emitting to an unknown publication, or one without `Events`, also returns an error.
 
 ## Errors
 
@@ -212,7 +251,7 @@ Return a `*cometgo.Error` from a method, a publication or `Authenticate` to cont
 | `CodeConflict` | `CONFLICT` | never |
 | `CodeRateLimited` | `RATE_LIMITED` | over `MaxSubs` or `MaxInflight` |
 | `CodeTimeout` | `TIMEOUT` | a publication query exceeds `QueryTimeout` |
-| `CodeCanceled` | `CANCELED` | never in v1-core (call cancellation is planned) |
+| `CodeCanceled` | `CANCELED` | The client cancelled the call before it committed; nothing was written. |
 | `CodeResultTooLarge` | `RESULT_TOO_LARGE` | a publication result exceeds `MaxRows` |
 | `CodeUnavailable` | `UNAVAILABLE` | never |
 | `CodeInternal` | `INTERNAL` | any error that is not a `*cometgo.Error` |
@@ -279,6 +318,23 @@ comet_idempotency(ik text, user_id text, method text, result json, created_at ti
 ```
 
 `result` is `json` rather than `jsonb` so that a retry returns the same bytes as the first call.
+
+## Session resume
+
+A client that loses its connection briefly (a network blip, a laptop waking up) resumes its session instead of starting over. The server keeps the session for `Config.ResumeGrace` after the socket drops: subscriptions stay bound, running calls finish, and everything that would have been sent is kept in a replay buffer of up to `Config.ResumeBuffer` bytes. When the client reconnects in time, it gets exactly the messages it missed: no snapshots are re-sent, and no call result is lost.
+
+The session is not resumed, and the client falls back to a full resync, when:
+
+- the server restarted,
+- the grace window passed,
+- the buffer overflowed while the client was away,
+- the reconnecting client authenticates as a different user than the session's.
+
+A token refresh for the same user is fine. A protocol error, or a deliberate close by the client (code 1000/1001, e.g. a page unload), ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable. An anonymous session is resumable by whoever holds its session id, which the client keeps in memory only.
+
+**Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node (sticky sessions, e.g. by cookie or client IP). Without sticky routing everything still works, but a reconnect that lands on another node resyncs.
+
+Memory cost: each disconnected session holds its subscriptions plus at most `ResumeBuffer` bytes for up to `ResumeGrace`. Connected sessions hold the unacknowledged tail, usually about one second of output. Set `ResumeGrace` negative to turn resume off.
 
 ## InstallTriggers
 

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -100,6 +101,16 @@ type Config struct {
 	MaxMsg      int // default 1 MiB
 	MaxRows     int // per-observer row cap, default 10,000
 
+	// ResumeGrace is how long a session outlives a lost socket, waiting for
+	// the client to resume it (§7.2). Default 60s; negative disables resume.
+	// Resume needs sticky routing when several nodes serve one endpoint.
+	ResumeGrace time.Duration
+
+	// ResumeBuffer caps the bytes of unacked messages kept per session for
+	// replay. A detached session that overflows it ends. Default 1 MiB, at
+	// most 4 MiB.
+	ResumeBuffer int
+
 	Logger *slog.Logger
 }
 
@@ -115,6 +126,9 @@ type App struct {
 	methods map[string]*method
 	engine  *engine
 	started bool
+
+	sessMu   sync.Mutex
+	sessions map[string]*conn // resumable sessions, by id
 }
 
 // New creates an App. Register publications and methods, then call Start.
@@ -141,17 +155,25 @@ func New(cfg Config) *App {
 	defi(&cfg.MaxInflight, 32)
 	defi(&cfg.MaxMsg, 1<<20)
 	defi(&cfg.MaxRows, 10_000)
+	if cfg.ResumeGrace == 0 {
+		cfg.ResumeGrace = 60 * time.Second
+	}
+	defi(&cfg.ResumeBuffer, 1<<20)
+	// A resume pushes the whole replay at once; it must fit the outbound
+	// queue or every resume would close as SLOW_CONSUMER.
+	cfg.ResumeBuffer = min(cfg.ResumeBuffer, maxQueuedBytes/2)
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	a := &App{
-		cfg:     cfg,
-		db:      cfg.DB,
-		log:     cfg.Logger.With("component", "cometgo"),
-		epoch:   "b_" + newID(8),
-		nodeID:  newID(6),
-		pubs:    map[string]*publication{},
-		methods: map[string]*method{},
+		cfg:      cfg,
+		db:       cfg.DB,
+		log:      cfg.Logger.With("component", "cometgo"),
+		epoch:    "b_" + newID(8),
+		nodeID:   newID(6),
+		pubs:     map[string]*publication{},
+		methods:  map[string]*method{},
+		sessions: map[string]*conn{},
 	}
 	a.engine = newEngine(a)
 	return a
@@ -193,6 +215,9 @@ type PubOptions struct {
 	// then receives no positions.
 	Unordered bool
 	Scope     Scope
+	// Events lets the server send ephemeral events to this publication's
+	// subscriptions with App.Emit and Call.EmitAfterCommit.
+	Events bool
 }
 
 // Query is the SQL a publication runs. It is re-run whenever a table it
@@ -249,6 +274,8 @@ type Call struct {
 	// Tx is the method's transaction. Writes made through it are fenced:
 	// the client's call resolves only after their effects reach its subs.
 	Tx pgx.Tx
+
+	app *App
 }
 
 type method struct {

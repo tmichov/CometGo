@@ -74,6 +74,7 @@ const sub = comet.subscribe<Task>("tasks.byProject", { projectId: "9" });
 | `subscribe(fn): () => void` | Calls `fn` after every change to `rows` or `status`. Returns an unsubscribe function. |
 | `getSnapshot(): readonly T[]` | Returns `rows`. |
 | `stop(): void` | Unsubscribes and sets `status` to `"ended"`. It does not notify listeners. |
+| `onEvent<D>(topic, fn: (data: D) => void): () => void` | Calls `fn` for each [event](#events) the server sends to this subscription with this topic. Returns an unsubscribe function. |
 | `name`, `args` | What was subscribed to. |
 | `id: number` | The subscription's wire id. It can change if the client has to re-request a fresh snapshot. |
 
@@ -94,6 +95,17 @@ type SubStatus = "loading" | "ready" | "resyncing" | "ended";
 
 Every update from the server is applied as one transaction: all subscriptions it touches change together, and each notifies its listeners once.
 
+### Events
+
+A publication with events enabled on the server can send ephemeral messages to its subscribers, such as progress updates:
+
+```ts
+const jobs = comet.subscribe("jobs.mine");
+const off = jobs.onEvent<{ id: string }>("finished", ({ id }) => toast(`Job ${id} finished`));
+```
+
+Events are at-most-once. Events sent while the client is disconnected are lost, even when the session is resumed, and events for a subscription that has ended or been stopped are dropped. An event the server emits from a method (`EmitAfterCommit`) arrives after the method's writes are in `rows` and before the call's promise resolves. A listener that throws is logged and does not affect the others.
+
 ## Calls
 
 ```ts
@@ -104,8 +116,15 @@ const { value, lag } = await comet.callWithStatus("todos.add", { title: "Ship v1
 - **Read-your-writes.** The promise resolves only after the method's writes are reflected in this client's subscriptions, so the UI is already up to date when `await` returns.
 - **`lag`.** If the writes did not arrive within the server's `FenceTimeout` (5 s by default), the call still resolves, with `lag: true` from `callWithStatus`. `call` resolves the same way but does not report it.
 - **`{ noFence: true }`** skips that wait. Use it for calls that do not write.
-- **`{ idempotent: true }`** attaches a generated idempotency key, so the call survives a disconnect: instead of failing with `CONNECTION_LOST`, it is re-sent on the next connection, and the server runs the method at most once (see [Server: Idempotency keys](server.md#idempotency-keys)). Use it for writes that must not happen twice. **`{ ik: "..." }`** passes a key of your own instead, e.g. a random UUID stored with a form so a retry after a page reload is also deduplicated. It must be unguessable (generate it with `crypto.randomUUID()` or similar, never from an id), because anonymous callers share one key scope.
-- **Retries of idempotent calls** are held until the new connection's `welcome`, and re-sent only if the server supports idempotency keys, the user is the same one the call ran as, and the call was first sent less than an hour ago. Otherwise the call is rejected with `CONNECTION_LOST`. A call cut off before its connection's `welcome` arrived is also rejected, since the user it ran as is unknown. The hour stays inside the server's default 24h `IdempotencyTTL`; do not set that below an hour.
+- **`{ signal }`** takes an `AbortSignal` to cancel the call. If the call has not been sent yet, it is rejected at once with `CANCELED` and never sent. Otherwise the client asks the server to cancel, and the promise settles from the server's answer: `CANCELED` if the method had not committed (nothing was written), or its real result if the cancel came too late. Aborting does not settle the promise by itself, because only the server knows whether the method committed.
+
+  ```ts
+  const ac = new AbortController();
+  const p = comet.call("reports.build", { id }, { signal: ac.signal });
+  cancelButton.onclick = () => ac.abort();
+  ```
+- **`{ idempotent: true }`** attaches a generated idempotency key, so the call survives a disconnect even when the session cannot be resumed: instead of failing with `CONNECTION_LOST`, it is re-sent on the new session, and the server runs the method at most once (see [Server: Idempotency keys](server.md#idempotency-keys)). Use it for writes that must not happen twice. **`{ ik: "..." }`** passes a key of your own instead, e.g. a random UUID stored with a form so a retry after a page reload is also deduplicated. It must be unguessable (generate it with `crypto.randomUUID()` or similar, never from an id), because anonymous callers share one key scope.
+- **Retries of idempotent calls** on a new session are held until its `welcome`, and re-sent only if the server supports idempotency keys, the user is the same one the call ran as, and the call was first sent less than an hour ago. Otherwise the call is rejected with `CONNECTION_LOST`. A call cut off before its connection's `welcome` arrived is rejected too, unless the session resumes, since the user it ran as is unknown. The hour stays inside the server's default 24h `IdempotencyTTL`; do not set that below an hour.
 - **Errors.** A failed call rejects with a `CometError` carrying the server's code (see below).
 - **Before the connection is open,** calls are queued and sent when it opens.
 
@@ -140,7 +159,7 @@ class CometError extends Error {
 
 | Code | Meaning |
 |---|---|
-| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived. The outcome is **unknown**: the method may or may not have committed. The client never re-sends it. Retry only if the method is safe to run twice. A call made with `idempotent` or `ik` gets this only when it cannot be retried safely (see [Calls](#calls)) or after `close()`. |
+| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived, and the session could not be resumed (see [Reconnects](#reconnects)). The outcome is **unknown**: the method may or may not have committed. The client never re-sends it on a new session. Retry only if the method is safe to run twice. A call made with `idempotent` or `ik` gets this only when it cannot be retried safely (see [Calls](#calls)) or after `close()`. |
 | `VALIDATION` | `details.fields` maps field names to messages. |
 | `RATE_LIMITED` | Too many calls in flight; `retryAfterMs` says when to retry. |
 | `INTERNAL` | A server bug. `details.ref` matches a line in the server log. |
@@ -160,10 +179,14 @@ The client reconnects by itself:
 
 - **Backoff.** Exponential with full jitter, starting at 500 ms and capped at 30 s, reset after a successful connection. In a browser it also retries immediately on the `online` event and when the tab becomes visible.
 - **Liveness.** If nothing arrives for the server's heartbeat interval (25 s by default), the client sends a ping. After the heartbeat interval plus 10 s of silence, it closes the connection (code 4408) and reconnects.
-- **Subscriptions** survive. On reconnect each is re-sent; the server sends a fresh snapshot, and the client swaps it in only once it is complete. Unchanged rows keep their objects, so the UI does not flicker. While this happens, `status` is `"resyncing"`.
-- **Calls** that were queued but never sent go out on the new connection. Calls that were sent and had no result yet are rejected with `CONNECTION_LOST`, except calls made with `idempotent` or `ik`: once the new connection's `welcome` arrives, those are re-sent with the same key and resolve normally, under the conditions in [Calls](#calls).
+- **Session resume.** When the server supports it, the client first tries to resume its session ([protocol §7.2](protocol.md#72-session-resume)). The server replays whatever the client missed, so subscriptions get no snapshot and calls in flight still get their results. The client acks what it has received about once a second, so the server can drop it from the replay buffer.
+- **Subscriptions** survive. While disconnected, `status` is `"resyncing"`. On a resumed session it goes back to `"ready"` and the missed updates are applied as usual. Otherwise each subscription is re-sent; the server sends a fresh snapshot, and the client swaps it in only once it is complete. Unchanged rows keep their objects, so the UI does not flicker.
+- **Calls** that were queued but never sent go out on the new connection. Calls (and `setToken`) that were sent and had no result yet depend on the reconnect:
+  - **Resumed:** they are re-sent with their original ids. The server runs each call at most once and delivers its result.
+  - **Not resumed** (the server restarted, the reconnect reached another node, the grace window (60 s by default) passed, or the user changed meanwhile): they are rejected with `CONNECTION_LOST`, except calls made with `idempotent` or `ik`, which are re-sent with the same key under the conditions in [Calls](#calls).
+  - **Server without resume:** the same as not resumed, decided once the new connection's `welcome` arrives for calls with a key, and as soon as the connection drops for the rest.
 
-Session resume (replaying missed messages instead of resyncing) is *planned* ([protocol §7.2](protocol.md#72-later-session-resume)).
+  So with resume, a call sent just before a drop stays pending until the client reconnects, however long that takes. `close()` rejects it at once.
 
 ## Type decoding
 

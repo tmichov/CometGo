@@ -29,6 +29,9 @@ const (
 	writeTimeout   = 10 * time.Second
 )
 
+// capResume is the welcome/hello cap for session resume (§7.2).
+const capResume = "resume"
+
 // ServeHTTP upgrades the request to a CometGo WebSocket connection.
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !offersSubprotocol(r) {
@@ -49,16 +52,9 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Accept already wrote the HTTP error (e.g. bad Origin)
 	}
-	c := &conn{
-		a:           a,
-		ws:          ws,
-		session:     "s_" + newID(9),
-		outSig:      make(chan struct{}, 1),
-		cookieIdent: cookieIdent,
-		cookieErr:   cookieErr,
-	}
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.serve()
+	s := &socket{ws: ws, outSig: make(chan struct{}, 1)}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	a.serve(s, cookieIdent, cookieErr)
 }
 
 func offersSubprotocol(r *http.Request) bool {
@@ -72,93 +68,200 @@ func offersSubprotocol(r *http.Request) bool {
 	return false
 }
 
+// conn is a session: subscriptions, identity, seq and the replay buffer.
+// It is attached to at most one socket at a time and, when resume is on,
+// outlives a lost socket for Config.ResumeGrace (§7.2).
 type conn struct {
 	a       *App
-	ws      *websocket.Conn
 	session string
+	resume  bool // client and server both have the resume cap
+	evt     bool // the client offered the evt cap: send it evt messages
 	ctx     context.Context
 	cancel  context.CancelFunc
 
 	mu       sync.Mutex // guards the fields below
-	out      [][]byte
-	outBytes int
+	sock     *socket    // nil while detached
 	seq      uint64
-	closed   bool
+	closed   bool // session ended; nothing is sent any more
 	ident    *Identity
 	expTimer *time.Timer
+	grace    *time.Timer
 
-	outSig      chan struct{}
-	authMu      sync.Mutex // serializes identity changes
-	inflight    atomic.Int32
-	cookieIdent *Identity
-	cookieErr   error
+	// Replay buffer (resume only): stateful messages after acked. floor is
+	// the highest seq dropped by overflow while attached; resuming from
+	// below it is impossible.
+	replay      []replayMsg
+	replayBytes int
+	acked       uint64
+	floor       uint64
+	// ids maps call/auth ids seen to the seq of their res (0 while running),
+	// to deduplicate re-sent calls after resume. Pruned by ack.
+	ids map[uint64]uint64
+	// running maps the ids of calls still running to their cancel, for the
+	// client's cancel message (§5). An entry stays until the res is sent, but
+	// a cancel takes effect only before the handler returns.
+	running map[uint64]*runningCall
+
+	authMu   sync.Mutex // serializes identity changes
+	inflight atomic.Int32
 }
 
-func (c *conn) serve() {
-	defer c.shutdown()
-	c.ws.SetReadLimit(int64(c.a.cfg.MaxMsg))
-	go c.writer()
-	go c.heartbeat()
+type runningCall struct {
+	cancel context.CancelFunc
+}
 
-	first, ok := c.read()
+type replayMsg struct {
+	seq uint64
+	b   []byte
+}
+
+// socket is one WebSocket. Its writer drains out; a lost socket leaves the
+// session behind.
+type socket struct {
+	ws     *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	outSig chan struct{}
+
+	mu       sync.Mutex // guards the fields below
+	out      [][]byte
+	outBytes int
+	dead     bool
+	fatal    bool // closed for a reason that also ends the session (protocol error, deliberate close)
+}
+
+func (a *App) serve(s *socket, cookieIdent *Identity, cookieErr error) {
+	defer s.ws.CloseNow()
+	defer s.cancel()
+	s.ws.SetReadLimit(int64(a.cfg.MaxMsg))
+	go s.writer()
+	go s.heartbeat(a.cfg.Heartbeat)
+
+	first, ok := s.read()
 	if !ok {
 		return
 	}
 	if first.T != "hello" {
-		c.fail(closeProtocol, "PROTOCOL", "first message must be hello")
+		s.fail(closeProtocol, "PROTOCOL", "first message must be hello")
 		return
 	}
-	if !c.hello(first) {
+	c := a.hello(s, first, cookieIdent, cookieErr)
+	if c == nil {
 		return
 	}
+	defer c.socketLost(s)
 	for {
-		msg, ok := c.read()
+		msg, ok := s.read()
 		if !ok {
 			return
 		}
-		c.dispatch(msg)
+		c.dispatch(s, msg)
 	}
 }
 
-func (c *conn) read() (*clientMsg, bool) {
-	typ, data, err := c.ws.Read(c.ctx)
+func (s *socket) read() (*clientMsg, bool) {
+	typ, data, err := s.ws.Read(s.ctx)
 	if err != nil {
+		// A deliberate close (Comet.close, page unload) will not resume.
+		if st := websocket.CloseStatus(err); st == websocket.StatusNormalClosure || st == websocket.StatusGoingAway {
+			s.mu.Lock()
+			s.fatal = true
+			s.mu.Unlock()
+		}
 		return nil, false
 	}
 	var msg clientMsg
 	if typ != websocket.MessageText || json.Unmarshal(data, &msg) != nil || msg.T == "" {
-		c.fail(closeProtocol, "PROTOCOL", "malformed message")
+		s.fail(closeProtocol, "PROTOCOL", "malformed message")
 		return nil, false
 	}
 	return &msg, true
 }
 
-func (c *conn) shutdown() {
-	c.mu.Lock()
-	c.closed = true
-	if c.expTimer != nil {
-		c.expTimer.Stop()
+// fail closes the socket with a protocol close code and JSON reason.
+// PROTOCOL and UNAUTHENTICATED also end the session; the others (heartbeat,
+// slow consumer, going away) leave it resumable. It never blocks the caller.
+func (s *socket) fail(code websocket.StatusCode, name, msg string) {
+	s.mu.Lock()
+	s.dead = true
+	s.out, s.outBytes = nil, 0
+	if code == closeProtocol || code == closeUnauth {
+		s.fatal = true
 	}
-	c.mu.Unlock()
-	c.cancel()
-	c.a.engine.enqueue(closeReq{c: c})
-	_ = c.ws.CloseNow()
-}
-
-// fail closes the connection with a protocol close code and JSON reason.
-// It never blocks the caller.
-func (c *conn) fail(code websocket.StatusCode, name, msg string) {
-	c.mu.Lock()
-	c.closed = true
-	c.mu.Unlock()
+	s.mu.Unlock()
 	reason, _ := json.Marshal(map[string]string{"code": name, "msg": msg})
 	if len(reason) > 123 {
 		reason, _ = json.Marshal(map[string]string{"code": name})
 	}
 	go func() {
-		_ = c.ws.Close(code, string(reason))
-		c.cancel()
+		_ = s.ws.Close(code, string(reason))
+		s.cancel()
 	}()
+}
+
+func (s *socket) isFatal() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fatal
+}
+
+// socketLost detaches s. Without resume the session ends now; with it, the
+// session waits ResumeGrace for a hello.resume.
+func (c *conn) socketLost(s *socket) {
+	fatal := s.isFatal()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sock != s {
+		return // already replaced by a resumed socket
+	}
+	c.sock = nil
+	if c.closed {
+		return
+	}
+	if !c.resume || fatal {
+		c.endLocked()
+		return
+	}
+	var t *time.Timer
+	t = time.AfterFunc(c.a.cfg.ResumeGrace, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.grace == t && c.sock == nil && !c.closed {
+			c.endLocked()
+		}
+	})
+	c.grace = t
+}
+
+// endLocked ends the session: its subs are unbound and it can no longer be
+// resumed. Caller holds c.mu.
+func (c *conn) endLocked() {
+	if c.closed {
+		return
+	}
+	c.closed = true
+	if c.expTimer != nil {
+		c.expTimer.Stop()
+	}
+	if c.grace != nil {
+		c.grace.Stop()
+		c.grace = nil
+	}
+	c.replay, c.replayBytes, c.ids = nil, 0, nil
+	if c.sock != nil {
+		// Its client would otherwise sit on a silent socket; closing it
+		// makes the client reconnect and resync.
+		c.sock.fail(closeGoingAway, CodeUnavailable, "session ended")
+	}
+	c.cancel()
+	c.a.engine.enqueue(closeReq{c: c})
+	c.a.dropSession(c)
+}
+
+func (c *conn) end() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.endLocked()
 }
 
 func (c *conn) isClosed() bool {
@@ -188,6 +291,7 @@ func (c *conn) setIdentity(ident *Identity) {
 }
 
 // expire downgrades to anonymous when a token lapses without refresh (§3.2).
+// It also runs while the session is detached; the result lands in replay.
 func (c *conn) expire(ident *Identity) {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
@@ -200,42 +304,156 @@ func (c *conn) expire(ident *Identity) {
 	}})
 }
 
-func (c *conn) hello(msg *clientMsg) bool {
+// samePrincipal reports whether a and b are the same user (or both anonymous).
+func samePrincipal(a, b *Identity) bool {
+	return (a == nil) == (b == nil) && a.userID() == b.userID()
+}
+
+// hello authenticates the socket and attaches it to a resumed or new
+// session. It returns nil if the socket was closed.
+func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr error) *conn {
 	if msg.V != 1 {
-		c.fail(closeProtocol, "PROTOCOL", fmt.Sprintf("unsupported version %d", msg.V))
-		return false
+		s.fail(closeProtocol, "PROTOCOL", fmt.Sprintf("unsupported version %d", msg.V))
+		return nil
 	}
-	c.authMu.Lock()
-	defer c.authMu.Unlock()
 	var ident *Identity
 	var authErr *Error
 	switch {
 	case msg.Auth != nil:
-		ident, authErr = c.a.authenticate(c.ctx, msg.Auth.Token)
-	case c.cookieErr != nil:
-		c.fail(closeUnauth, CodeUnauthenticated, "invalid session")
-		return false
+		ident, authErr = a.authenticate(s.ctx, msg.Auth.Token)
+	case cookieErr != nil:
+		s.fail(closeUnauth, CodeUnauthenticated, "invalid session")
+		return nil
 	default:
-		ident = c.cookieIdent
+		ident = cookieIdent
 	}
+	resume := a.cfg.ResumeGrace > 0 && slices.Contains(msg.Caps, capResume)
+	evt := slices.Contains(msg.Caps, capEvt)
+	if resume && msg.Resume != nil {
+		if c := a.resumeSession(s, msg.Resume, ident, authErr, evt); c != nil {
+			return c
+		}
+	}
+
+	c := &conn{a: a, session: "s_" + newID(9), resume: resume, evt: evt}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	if resume {
+		c.ids = map[uint64]uint64{}
+		a.addSession(c)
+	}
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
 	c.setIdentity(ident)
-	cfg := c.a.cfg
-	// The server honours ik whether or not it was negotiated; the cap tells
-	// the client it may re-send ik calls after a disconnect.
-	caps := []string{}
-	if slices.Contains(msg.Caps, capIK) {
-		caps = append(caps, capIK)
-	}
-	c.send(&welcomeMsg{
-		T: "welcome", Session: c.session, Epoch: c.a.epoch,
-		HB: cfg.Heartbeat.Milliseconds(), User: ident.wireUser(), AuthExp: ident.authExp(),
-		Limits: limitsMsg{MaxSubs: cfg.MaxSubs, MaxInflight: cfg.MaxInflight, MaxMsg: cfg.MaxMsg},
-		Build:  cfg.Build, Caps: caps,
-	})
+	c.mu.Lock()
+	c.sock = s
+	c.mu.Unlock()
+	c.send(a.welcome(c, ident, false))
 	if authErr != nil {
 		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
 	}
-	return true
+	return c
+}
+
+func (a *App) welcome(c *conn, ident *Identity, resumed bool) *welcomeMsg {
+	cfg := a.cfg
+	// The server honours ik whether or not it was negotiated; the cap tells
+	// the client it may re-send ik calls on a new session.
+	caps := []string{capEvt, capIK}
+	if cfg.ResumeGrace > 0 {
+		caps = append(caps, capResume)
+	}
+	return &welcomeMsg{
+		T: "welcome", Session: c.session, Epoch: a.epoch, Resumed: resumed,
+		HB: cfg.Heartbeat.Milliseconds(), User: ident.wireUser(), AuthExp: ident.authExp(),
+		Limits: limitsMsg{MaxSubs: cfg.MaxSubs, MaxInflight: cfg.MaxInflight, MaxMsg: cfg.MaxMsg},
+		Build:  cfg.Build, Caps: caps,
+	}
+}
+
+// resumeSession attaches s to the session r names, replaying what the client
+// missed (§7.2). It returns nil when resume is impossible; the caller then
+// starts a new session and the client resyncs (§7.1). A failed resume ends
+// the old session: its owner has given up on it.
+func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr *Error, evt bool) *conn {
+	c := a.lookupSession(r.Session)
+	if c == nil {
+		return nil
+	}
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	// A different principal (login, logout or expiry during the gap) cannot
+	// take over the session's subscriptions; it resyncs under its own identity.
+	if !samePrincipal(c.identity(), ident) {
+		c.end()
+		return nil
+	}
+	// The replay may hold evt messages: a client whose evt cap differs from
+	// the session's (e.g. a different build) resyncs instead.
+	if c.evt != evt {
+		c.end()
+		return nil
+	}
+	welcome, err := json.Marshal(a.welcome(c, ident, true))
+	if err != nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	if c.closed || r.Seq > c.seq || r.Seq < c.acked || r.Seq < c.floor {
+		c.endLocked()
+		c.mu.Unlock()
+		return nil
+	}
+	if old := c.sock; old != nil {
+		// The client saw the old socket die before the server did.
+		old.fail(closeGoingAway, CodeUnavailable, "session resumed on another connection")
+	}
+	if c.grace != nil {
+		c.grace.Stop()
+		c.grace = nil
+	}
+	c.sock = s
+	// welcome, then the replay, then anything new: all under c.mu, so
+	// nothing interleaves.
+	s.push(welcome)
+	for _, m := range c.replay {
+		if m.seq > r.Seq {
+			s.push(m.b)
+		}
+	}
+	c.ackLocked(r.Seq)
+	c.mu.Unlock()
+
+	c.setIdentity(ident) // same principal; picks up a refreshed expiry
+	keep := make(map[uint64]bool, len(r.Subs))
+	for _, sid := range r.Subs {
+		keep[sid] = true
+	}
+	a.engine.enqueue(resumeReq{c: c, keep: keep})
+	if authErr != nil {
+		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
+	}
+	return c
+}
+
+func (a *App) addSession(c *conn) {
+	a.sessMu.Lock()
+	a.sessions[c.session] = c
+	a.sessMu.Unlock()
+}
+
+func (a *App) lookupSession(id string) *conn {
+	a.sessMu.Lock()
+	defer a.sessMu.Unlock()
+	return a.sessions[id]
+}
+
+func (a *App) dropSession(c *conn) {
+	a.sessMu.Lock()
+	if a.sessions[c.session] == c {
+		delete(a.sessions, c.session)
+	}
+	a.sessMu.Unlock()
 }
 
 func (a *App) authenticate(ctx context.Context, token string) (*Identity, *Error) {
@@ -252,11 +470,17 @@ func (a *App) authenticate(ctx context.Context, token string) (*Identity, *Error
 	return ident, nil
 }
 
-func (c *conn) dispatch(msg *clientMsg) {
+func (c *conn) dispatch(s *socket, msg *clientMsg) {
+	c.mu.Lock()
+	current := c.sock == s
+	c.mu.Unlock()
+	if !current {
+		return // a socket replaced by resume; its client has moved on
+	}
 	switch msg.T {
 	case "sub":
 		if msg.S == nil || msg.Name == "" {
-			c.fail(closeProtocol, "PROTOCOL", "sub requires s and name")
+			s.fail(closeProtocol, "PROTOCOL", "sub requires s and name")
 			return
 		}
 		if len(msg.Args) > 64<<10 {
@@ -266,35 +490,118 @@ func (c *conn) dispatch(msg *clientMsg) {
 		c.a.engine.enqueue(subReq{c: c, s: *msg.S, name: msg.Name, args: msg.Args, have: msg.Have, ident: c.identity()})
 	case "unsub":
 		if msg.S == nil {
-			c.fail(closeProtocol, "PROTOCOL", "unsub requires s")
+			s.fail(closeProtocol, "PROTOCOL", "unsub requires s")
 			return
 		}
 		c.a.engine.enqueue(unsubReq{c: c, s: *msg.S})
 	case "call":
 		if msg.ID == nil || msg.M == "" {
-			c.fail(closeProtocol, "PROTOCOL", "call requires id and m")
+			s.fail(closeProtocol, "PROTOCOL", "call requires id and m")
 			return
 		}
 		if int(c.inflight.Add(1)) > c.a.cfg.MaxInflight {
 			c.inflight.Add(-1)
-			c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
+			if c.firstSeen(*msg.ID) {
+				c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
+			}
 			return
 		}
-		go c.call(msg, c.identity())
+		// The method outlives a dropped connection: its outcome is decided
+		// server-side either way. Only the client's cancel stops it.
+		hctx, cancel := context.WithCancel(context.WithoutCancel(c.ctx))
+		r := &runningCall{cancel: cancel}
+		// Dedupe and registration happen together: after a resume, the
+		// re-sent copy of a call is dropped only once the original is
+		// registered, so a cancel right behind it always finds it.
+		c.mu.Lock()
+		first := c.firstSeenLocked(*msg.ID)
+		if first {
+			if c.running == nil {
+				c.running = map[uint64]*runningCall{}
+			}
+			c.running[*msg.ID] = r
+		}
+		c.mu.Unlock()
+		if !first {
+			c.inflight.Add(-1)
+			return
+		}
+		go c.call(msg, c.identity(), hctx, r)
+	case "cancel":
+		// Unknown or finished ids are ignored: the res is sent or on its way.
+		if msg.ID != nil {
+			c.mu.Lock()
+			r := c.running[*msg.ID]
+			c.mu.Unlock()
+			if r != nil {
+				r.cancel()
+			}
+		}
 	case "auth":
 		if msg.ID == nil {
-			c.fail(closeProtocol, "PROTOCOL", "auth requires id")
+			s.fail(closeProtocol, "PROTOCOL", "auth requires id")
+			return
+		}
+		if !c.firstSeen(*msg.ID) {
 			return
 		}
 		go c.reauth(*msg.ID, msg.Token)
+	case "ack":
+		if msg.Seq != nil {
+			c.mu.Lock()
+			c.ackLocked(*msg.Seq)
+			c.mu.Unlock()
+		}
 	case "ping":
 		c.send(&pongMsg{T: "pong", N: msg.N})
-	case "pong", "ack":
-		// Liveness only; ack is reserved for session resume.
+	case "pong":
+		// Liveness only.
 	case "hello":
-		c.fail(closeProtocol, "PROTOCOL", "duplicate hello")
+		s.fail(closeProtocol, "PROTOCOL", "duplicate hello")
 	default:
 		// Unknown types are ignored for forward compatibility.
+	}
+}
+
+// firstSeen records a call/auth id and reports whether it is new. After a
+// resume the client re-sends unanswered calls with their original ids: one
+// still running is ignored, and a finished one's res is already in the
+// replay (§7.2). Without resume every id is new.
+func (c *conn) firstSeen(id uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.firstSeenLocked(id)
+}
+
+// firstSeenLocked is firstSeen with c.mu held.
+func (c *conn) firstSeenLocked(id uint64) bool {
+	if c.ids == nil {
+		return true
+	}
+	if _, seen := c.ids[id]; seen {
+		return false
+	}
+	c.ids[id] = 0
+	return true
+}
+
+// ackLocked drops replayed messages and finished ids up to seq. Acks for
+// seqs never sent are ignored. Caller holds c.mu.
+func (c *conn) ackLocked(seq uint64) {
+	if !c.resume || seq <= c.acked || seq > c.seq {
+		return
+	}
+	c.acked = seq
+	i := 0
+	for i < len(c.replay) && c.replay[i].seq <= seq {
+		c.replayBytes -= len(c.replay[i].b)
+		i++
+	}
+	c.replay = slices.Delete(c.replay, 0, i)
+	for id, rs := range c.ids {
+		if rs != 0 && rs <= seq {
+			delete(c.ids, id)
+		}
 	}
 }
 
@@ -314,7 +621,7 @@ func (c *conn) reauth(id uint64, rawToken json.RawMessage) {
 	res := &authResMsg{T: "authRes", ID: &id, OK: authErr == nil, User: ident.wireUser(), AuthExp: ident.authExp(), Err: authErr}
 	old := c.identity()
 	c.setIdentity(ident)
-	if (old == nil) == (ident == nil) && old.userID() == ident.userID() {
+	if samePrincipal(old, ident) {
 		// Same principal (e.g. token refresh): nothing to rebind.
 		c.send(res)
 		return
@@ -322,10 +629,20 @@ func (c *conn) reauth(id uint64, rawToken json.RawMessage) {
 	c.a.engine.enqueue(rebindReq{c: c, ident: ident, after: res})
 }
 
-func (c *conn) call(msg *clientMsg, ident *Identity) {
+func (c *conn) call(msg *clientMsg, ident *Identity, hctx context.Context, r *runningCall) {
 	defer c.inflight.Add(-1)
 	id := *msg.ID
-	val, lag, err := c.runCall(msg, ident)
+	defer func() {
+		c.mu.Lock()
+		if c.running[id] == r {
+			delete(c.running, id)
+		}
+		c.mu.Unlock()
+		// r.cancel is not called: c.Context is cancelled only by the
+		// client's cancel, so work a handler started with it survives the
+		// call (hctx's parent never cancels, so nothing leaks).
+	}()
+	val, lag, err := c.runCall(msg, ident, hctx)
 	res := &resMsg{T: "res", ID: id, OK: err == nil, Val: val, Lag: lag}
 	if err != nil {
 		res.Err = c.a.toWireError(err, "method "+msg.M)
@@ -333,7 +650,9 @@ func (c *conn) call(msg *clientMsg, ident *Identity) {
 	c.send(res)
 }
 
-func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, lag bool, err error) {
+// runCall runs the handler with hctx, which the client's cancel cancels, and
+// everything after it (commit, fence) with a context cancel cannot reach.
+func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (val json.RawMessage, lag bool, err error) {
 	m := c.a.methods[msg.M]
 	if m == nil {
 		return nil, false, NewError(CodeNotFound, "unknown method "+msg.M)
@@ -342,10 +661,10 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 	if ik != nil && (*ik == "" || len(*ik) > maxIKLen) {
 		return nil, false, NewError(CodeBadRequest, "ik must be a non-empty string of at most 128 bytes")
 	}
-	// The method outlives a dropped connection: its outcome is decided
-	// server-side either way, and the client reports CONNECTION_LOST
-	// (or, for a call with ik, re-sends it and gets the stored result).
-	ctx := context.WithoutCancel(c.ctx)
+	ctx := context.WithoutCancel(hctx)
+	if hctx.Err() != nil {
+		return nil, false, NewError(CodeCanceled, "call canceled") // before it started
+	}
 	tx, err := c.a.db.Begin(ctx)
 	if err != nil {
 		return nil, false, err
@@ -370,8 +689,18 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 					err = fmt.Errorf("panic: %v", p)
 				}
 			}()
-			return m.run(&Call{Context: ctx, Identity: ident, Tx: tx}, msg.Args)
+			return m.run(&Call{Context: hctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
 		}()
+		// A cancel that arrived before this point rolls back, whatever the
+		// handler returned: its queries may have been interrupted, and the
+		// client asked for it before anything committed. A cancel after this
+		// point is too late; the real result is sent (§5). A query the
+		// handler ran with hctx was stopped in Postgres too: pgx answers a
+		// cancelled context by closing the connection and sending a cancel
+		// request.
+		if hctx.Err() != nil {
+			return nil, false, NewError(CodeCanceled, "call canceled")
+		}
 		if err != nil {
 			return nil, false, err
 		}
@@ -385,8 +714,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 		}
 	}
 	// A replayed result goes through the same commit and fence as a first
-	// run, so it too resolves only once this connection's subscriptions
-	// reflect the original writes.
+	// run (unless noFence), like any call.
 
 	if msg.NoFence {
 		return val, false, tx.Commit(ctx)
@@ -416,19 +744,52 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 func (c *conn) send(m any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.sendLocked(m)
+}
+
+// sendEvent sends an evt only while a socket is attached. Events are
+// at-most-once, so a detached session drops them rather than filling its
+// replay buffer with them, which could end the session (§4.5, §7.2).
+func (c *conn) sendEvent(m *evtMsg) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sock != nil {
+		c.sendLocked(m)
+	}
+}
+
+// sendLocked is send with c.mu held.
+func (c *conn) sendLocked(m any) {
 	if c.closed {
 		return
 	}
+	var seq uint64
 	if s, ok := m.(sequenced); ok {
 		c.seq++
-		s.setSeq(c.seq)
+		seq = c.seq
+		s.setSeq(seq)
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		c.a.log.Error("marshal outbound message", "err", err)
 		return
 	}
-	c.push(b)
+	if seq != 0 && c.resume {
+		switch m := m.(type) {
+		case *resMsg:
+			c.ids[m.ID] = seq
+		case *authResMsg:
+			if m.ID != nil {
+				c.ids[*m.ID] = seq
+			}
+		}
+		if !c.buffer(seq, b) {
+			return
+		}
+	}
+	if c.sock != nil {
+		c.sock.push(b)
+	}
 }
 
 // sendTx enqueues one tx, split into contiguous parts sharing one seq (§4.3).
@@ -441,56 +802,94 @@ func (c *conn) sendTx(entries []subEntry) {
 	}
 	c.seq++
 	for i, p := range parts {
-		if c.closed {
-			return
-		}
 		b, err := json.Marshal(&txMsg{T: "tx", Seq: c.seq, Subs: p, More: i < len(parts)-1})
 		if err != nil {
 			c.a.log.Error("marshal tx", "err", err)
 			return
 		}
-		c.push(b)
+		if c.resume && !c.buffer(c.seq, b) {
+			return
+		}
+		if c.sock != nil {
+			c.sock.push(b)
+		}
 	}
 }
 
-// push appends to the outbound queue. Caller holds c.mu.
-func (c *conn) push(b []byte) {
-	c.out = append(c.out, b)
-	c.outBytes += len(b)
-	if c.outBytes > maxQueuedBytes {
-		c.out, c.outBytes = nil, 0
-		c.mu.Unlock()
-		c.fail(closeSlow, "SLOW_CONSUMER", "client is not keeping up")
-		c.mu.Lock()
+// buffer appends a stateful message to the replay buffer. Over
+// ResumeBuffer, a detached session ends (it can no longer be resumed and
+// would only grow); an attached one drops its oldest messages and raises
+// floor, so resume works again once the client acks past them. It reports
+// false if the session ended. Caller holds c.mu.
+func (c *conn) buffer(seq uint64, b []byte) bool {
+	c.replay = append(c.replay, replayMsg{seq: seq, b: b})
+	c.replayBytes += len(b)
+	if c.replayBytes <= c.a.cfg.ResumeBuffer {
+		return true
+	}
+	if c.sock == nil {
+		c.endLocked()
+		return false
+	}
+	i := 0
+	for i < len(c.replay) && c.replayBytes > c.a.cfg.ResumeBuffer {
+		c.replayBytes -= len(c.replay[i].b)
+		c.floor = max(c.floor, c.replay[i].seq)
+		i++
+	}
+	c.replay = slices.Delete(c.replay, 0, i)
+	// A res below floor can no longer be replayed, so its id need not be
+	// remembered either; this bounds ids for a client that never acks.
+	for id, rs := range c.ids {
+		if rs != 0 && rs <= c.floor {
+			delete(c.ids, id)
+		}
+	}
+	return true
+}
+
+// push appends to the socket's outbound queue.
+func (s *socket) push(b []byte) {
+	s.mu.Lock()
+	if s.dead {
+		s.mu.Unlock()
+		return
+	}
+	s.out = append(s.out, b)
+	s.outBytes += len(b)
+	over := s.outBytes > maxQueuedBytes
+	s.mu.Unlock()
+	if over {
+		s.fail(closeSlow, "SLOW_CONSUMER", "client is not keeping up")
 		return
 	}
 	select {
-	case c.outSig <- struct{}{}:
+	case s.outSig <- struct{}{}:
 	default:
 	}
 }
 
-func (c *conn) writer() {
+func (s *socket) writer() {
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-s.ctx.Done():
 			return
-		case <-c.outSig:
+		case <-s.outSig:
 		}
-		c.mu.Lock()
-		batch := c.out
-		c.out = nil
-		c.mu.Unlock()
+		s.mu.Lock()
+		batch := s.out
+		s.out = nil
+		s.mu.Unlock()
 		for _, b := range batch {
-			ctx, cancel := context.WithTimeout(c.ctx, writeTimeout)
-			err := c.ws.Write(ctx, websocket.MessageText, b)
+			ctx, cancel := context.WithTimeout(s.ctx, writeTimeout)
+			err := s.ws.Write(ctx, websocket.MessageText, b)
 			cancel()
-			c.mu.Lock()
-			c.outBytes -= len(b)
-			c.mu.Unlock()
+			s.mu.Lock()
+			s.outBytes -= len(b)
+			s.mu.Unlock()
 			if err != nil {
-				if c.ctx.Err() == nil {
-					c.fail(closeSlow, "SLOW_CONSUMER", "write timed out")
+				if s.ctx.Err() == nil {
+					s.fail(closeSlow, "SLOW_CONSUMER", "write timed out")
 				}
 				return
 			}
@@ -498,22 +897,21 @@ func (c *conn) writer() {
 	}
 }
 
-func (c *conn) heartbeat() {
-	hb := c.a.cfg.Heartbeat
+func (s *socket) heartbeat(hb time.Duration) {
 	t := time.NewTicker(hb)
 	defer t.Stop()
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-s.ctx.Done():
 			return
 		case <-t.C:
 		}
-		ctx, cancel := context.WithTimeout(c.ctx, 2*hb)
-		err := c.ws.Ping(ctx)
+		ctx, cancel := context.WithTimeout(s.ctx, 2*hb)
+		err := s.ws.Ping(ctx)
 		cancel()
 		if err != nil {
-			if c.ctx.Err() == nil {
-				c.fail(closeHeartbeat, "HEARTBEAT_TIMEOUT", "no pong")
+			if s.ctx.Err() == nil {
+				s.fail(closeHeartbeat, "HEARTBEAT_TIMEOUT", "no pong")
 			}
 			return
 		}

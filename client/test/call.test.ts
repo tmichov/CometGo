@@ -69,9 +69,9 @@ async function lostConnection(p: Promise<unknown>): Promise<void> {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 test("idempotent calls carry a generated UUID ik; plain calls carry none", () => {
-  void comet.call("a", {}, { idempotent: true });
-  void comet.call("b", {}, { idempotent: true });
-  void comet.call("c", {});
+  comet.call("a", {}, { idempotent: true }).catch(() => {}); // rejected by close() in afterEach
+  comet.call("b", {}, { idempotent: true }).catch(() => {}); // rejected by close() in afterEach
+  comet.call("c", {}).catch(() => {}); // rejected by close() in afterEach
   const [a, b, c] = FakeWS.last.of("call");
   assert.match(a.ik, UUID);
   assert.match(b.ik, UUID);
@@ -80,11 +80,11 @@ test("idempotent calls carry a generated UUID ik; plain calls carry none", () =>
 });
 
 test("hello offers the ik cap", () => {
-  assert.deepEqual(FakeWS.last.of("hello")[0].caps, ["ik"]);
+  assert.ok(FakeWS.last.of("hello")[0].caps.includes("ik"));
 });
 
 test("an explicit ik is sent as given", () => {
-  void comet.call("a", {}, { ik: "order-42" });
+  comet.call("a", {}, { ik: "order-42" }).catch(() => {}); // rejected by close() in afterEach
   assert.equal(FakeWS.last.of("call")[0].ik, "order-42");
 });
 
@@ -186,6 +186,63 @@ test("a retry more than an hour after the first send is rejected", async () => {
   } finally {
     Date.now = now;
   }
+  await lostConnection(p);
+  assert.equal(second.of("call").length, 0);
+});
+
+// With session resume (§7.2) as well: a resumed session re-sends held calls
+// by id; a session that cannot be resumed falls back to the ik retry.
+async function resumableStart(): Promise<FakeWS> {
+  comet.close();
+  comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
+  await Promise.resolve();
+  const ws = FakeWS.last;
+  ws.connect();
+  ws.recv({ t: "welcome", session: "s_1", hb: 25000, user: null, caps: ["resume", "ik"] });
+  return ws;
+}
+
+test("a held ik call on a resumed session is re-sent with its id and key", async () => {
+  const first = await resumableStart();
+  const p = comet.call("pay", {}, { idempotent: true });
+  const sent = first.of("call")[0];
+  first.drop();
+  const second = await nextSocket(first);
+  second.connect();
+  assert.equal(second.of("hello")[0].resume.session, "s_1");
+  second.recv({ t: "welcome", session: "s_1", resumed: true, hb: 25000, user: null, caps: ["resume", "ik"] });
+  const resent = second.of("call");
+  assert.equal(resent.length, 1);
+  assert.equal(resent[0].id, sent.id);
+  assert.equal(resent[0].ik, sent.ik);
+  second.recv({ t: "res", seq: 1, id: sent.id, ok: true, val: 7 });
+  assert.equal(await p, 7);
+});
+
+test("when the resume fails, a held ik call is retried on the new session", async () => {
+  const first = await resumableStart();
+  const p = comet.call("pay", {}, { idempotent: true });
+  const plain = comet.call("other", {});
+  const sent = first.of("call")[0];
+  first.drop();
+  const second = await nextSocket(first);
+  second.connect();
+  second.recv({ t: "welcome", session: "s_2", resumed: false, hb: 25000, user: null, caps: ["resume", "ik"] });
+  await lostConnection(plain);
+  const resent = second.of("call");
+  assert.equal(resent.length, 1);
+  assert.equal(resent[0].ik, sent.ik);
+  second.recv({ t: "res", seq: 1, id: resent[0].id, ok: true, val: "stored" });
+  assert.equal(await p, "stored");
+});
+
+test("when the resume fails and the server lacks ik, a held ik call gets CONNECTION_LOST", async () => {
+  const first = await resumableStart();
+  const p = comet.call("pay", {}, { idempotent: true });
+  first.drop();
+  const second = await nextSocket(first);
+  second.connect();
+  second.recv({ t: "welcome", session: "s_2", resumed: false, hb: 25000, user: null, caps: ["resume"] });
   await lostConnection(p);
   assert.equal(second.of("call").length, 0);
 });

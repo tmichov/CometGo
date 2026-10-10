@@ -11,10 +11,11 @@ type clientMsg struct {
 	T string `json:"t"`
 
 	// hello
-	V     int        `json:"v"`
-	Caps  []string   `json:"caps"`
-	Auth  *helloAuth `json:"auth"`
-	Build string     `json:"build"`
+	V      int          `json:"v"`
+	Caps   []string     `json:"caps"`
+	Auth   *helloAuth   `json:"auth"`
+	Build  string       `json:"build"`
+	Resume *helloResume `json:"resume"`
 
 	// auth, call
 	ID *uint64 `json:"id"`
@@ -34,10 +35,21 @@ type clientMsg struct {
 
 	// ping
 	N json.RawMessage `json:"n"`
+
+	// ack
+	Seq *uint64 `json:"seq"`
 }
 
 type helloAuth struct {
 	Token string `json:"token"`
+}
+
+// helloResume asks to resume a session after seq (§7.2). Subs lists the
+// sub ids the client still holds.
+type helloResume struct {
+	Session string   `json:"session"`
+	Seq     uint64   `json:"seq"`
+	Subs    []uint64 `json:"subs"`
 }
 
 type limitsMsg struct {
