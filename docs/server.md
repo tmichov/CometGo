@@ -109,7 +109,7 @@ const (
 )
 ```
 
-- **`ScopeUser`** (the default) shares an observer only between connections whose `Identity.UserID` is the same. Anonymous connections share with each other. This is the safe choice: a query that depends on who is asking can never be served to someone else.
+- **`ScopeUser`** (the default) shares an observer only between connections whose `Identity.UserID` is the same. Anonymous connections share with each other. This is the safe choice for any query that depends on who is asking, **as long as `UserID` alone determines the query**. The scope key is `UserID` and nothing else: an identity with an empty `UserID` shares with anonymous connections, and two identities with the same `UserID` but different `Data` (say, a different tenant or role) share one observer. If the query depends on anything in `Identity` besides `UserID`, make `UserID` unique per distinct query (for example `tenant + ":" + user`) or pass that value in the subscription args and check it in `fn`.
 - **`ScopeShared`** shares one observer between every connection. Only use it when the query does not depend on the caller's identity at all, such as a public feed. Because `fn` runs once per observer, a `ScopeShared` publication that reads `c.Identity` serves the **first** subscriber's result to everyone else.
 
 ### Query and SubCtx
@@ -153,7 +153,7 @@ Every call runs in its own Postgres transaction, `c.Tx`:
 
 **Always write through `c.Tx`.** Writes made through it are *fenced*: the framework adds a marker notification as the last statement before commit, and holds the result until the engine has processed every change up to that marker and sent the resulting update to the caller. That is what makes the client's `await call(...)` resolve with the write already visible. If that takes longer than `Config.FenceTimeout`, the result is sent anyway with `lag: true`.
 
-Writes through another connection (`a.DB`, a separate pool) still update subscriptions, because the triggers see them, but they carry no fence: the call can resolve before its effects reach the client.
+Writes through another connection (the pool passed as `Config.DB`, or any other connection) still update subscriptions, because the triggers see them, but they carry no fence: the call can resolve before its effects reach the client.
 
 Other details:
 
@@ -246,7 +246,7 @@ Called with the upgrade request, so it can read session cookies. Its result is u
 
 ### Expiry: `Identity.ExpiresAt`
 
-If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the client receives `AUTH_EXPIRED`. The client should call `setToken` with a fresh token before then. Proactive refresh by the client library and the HTTP refresh endpoint are *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
+If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The client should call `setToken` with a fresh token before then. Proactive refresh by the client library and the HTTP refresh endpoint are *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
 
 ## InstallTriggers
 
@@ -260,7 +260,7 @@ Requirements:
 
 - Each table must already exist and must have a primary key.
 - Tables are named `"table"` (meaning `public.table`) or `"schema.table"`.
-- Postgres 10 or newer (statement-level triggers with transition tables).
+- Postgres 11 or newer (the triggers use `EXECUTE FUNCTION`; the protocol spec's "PG 10+" is the minimum for transition tables, not for this code).
 
 Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. In v1-core any notification for a table re-runs every observer that reads it.
 

@@ -9,7 +9,7 @@ A realtime web framework for Go, inspired by MeteorJS.
 
 ## Quick start
 
-Requires Go 1.26+, Node 22+ and Docker.
+Requires Go 1.26+, Node 22.18+ and Docker.
 
 ```sh
 make db      # Postgres on localhost:54329

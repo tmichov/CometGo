@@ -1,6 +1,14 @@
 # Client
 
-The TypeScript client lives in [`client/`](../client) as the package `@cometgo/client`. It has no runtime dependencies and ships as TypeScript source (`client/src/index.ts`), so bundle it with your app (the todo example uses esbuild).
+The TypeScript client lives in [`client/`](../client) as the package `@cometgo/client`. It has no runtime dependencies and ships as TypeScript source (`client/src/index.ts`), so bundle it with your app.
+
+The package is not published to npm, and nothing in this repository makes the name `@cometgo/client` resolvable. Either import it by path, as the todo example does with esbuild:
+
+```ts
+import { connect } from "../../../../client/src/index.ts";
+```
+
+or add it to your app as a local dependency (`"@cometgo/client": "file:path/to/cometgo/client"`) so the import below resolves. Your bundler must accept `.ts` sources from that package; with `tsc` alone you also need `allowImportingTsExtensions`, since the client imports `./store.ts`.
 
 ```ts
 import { connect, CometError } from "@cometgo/client";
@@ -112,7 +120,7 @@ await comet.setToken(null);        // log out
 
 When the user changes, the server resets every subscription to the new user's data in one update; subscriptions the new user may not read end with an error.
 
-**Cookie sessions.** Omit `token`. The server reads the session cookie when the WebSocket opens (`AuthenticateRequest`). If the server refuses the session it closes the connection with 4401.
+**Cookie sessions.** Omit `token`. The server reads the session cookie when the WebSocket opens (`AuthenticateRequest`). If the server refuses the session it closes the connection with 4401. The client treats that like any other drop and keeps reconnecting with backoff, and each attempt is refused again: queued calls stay pending and subscriptions stay `loading` or `resyncing`. There is no dedicated signal for it in v1-core, so if a cookie session can expire, check it over HTTP (or watch `comet.status` stay `"disconnected"`) and send the user to log in.
 
 **Expiry.** If the server's identity has an expiry and no new token arrives in time, the connection becomes anonymous: `comet.user` becomes `null`, `onChange` fires, and subscriptions are reset as for a logout. In v1-core the client does not refresh tokens on its own: call `setToken` before the token expires. Automatic refresh is *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
 
