@@ -84,6 +84,6 @@ The connection status (`"connecting" | "connected" | "disconnected"`) and the au
 function useCall(): Comet["call"]
 ```
 
-Returns a stable function with the same signature as [`comet.call`](client.md#calls): `call(method, args?, { noFence? })`. Its identity does not change between renders, so it can go in dependency arrays.
+Returns a stable function with the same signature as [`comet.call`](client.md#calls): `call(method, args?, { noFence?, signal? })`. Its identity does not change between renders, so it can go in dependency arrays.
 
 As with `comet.call`, the promise normally resolves after the method's writes are already in this client's subscriptions. If they did not arrive within the server's fence timeout, it resolves anyway, and `call` does not tell you. Use `useComet().callWithStatus(...)` when you need the `lag` flag.
