@@ -1,0 +1,14 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild examples/todo/web/src/main.ts --bundle --format=esm --target=es2022 --outfile=examples/todo/web/public/app.js",
+    "typecheck": "tsc -p client",
+    "test": "node --test \"client/test/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
+  }
+}

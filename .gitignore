@@ -14,3 +14,10 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+.taskai
+
+# Built example bundles
+examples/*/web/public/app.js
+
+# Local Claude Code settings
+.claude/

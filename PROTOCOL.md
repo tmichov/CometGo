@@ -366,7 +366,7 @@ Types are described once per sub in `init.cols`, and values are plain JSON. Ther
 | numeric | `num` | exact decimal string (`"NaN"` allowed) | string (pluggable Decimal) |
 | bool | `bool` | bool | boolean |
 | text, varchar, citext | `text` | string | string |
-| enum | `enum` | string | string (TS union via codegen) |
+| enum | `enum` | string | string (TS union via codegen). Enums not registered with pgx are reported as `text`. |
 | uuid | `uuid` | lowercase canonical string | string |
 | timestamptz | `tstz` | RFC 3339 UTC, microsecond precision, `Z`; `"infinity"`/`"-infinity"` | `Date` (opt-in: `Temporal.Instant` or raw string; `Date` drops µs) |
 | date | `date` | `"YYYY-MM-DD"` | string |
@@ -403,7 +403,7 @@ All notifications use channel `comet`. Payload fields are separated by `|`, and 
 **Observer invalidation:**
 - Observers declare the tables they read. Any notification for one of those tables marks the observer dirty.
 - In v1 a dirty observer re-runs its full query. **[later]** simple single-table observers test changed PKs in Go.
-- A minimum re-run interval (default 50 ms) coalesces bursts.
+- A minimum interval between ticks (default 20 ms, `Config.MinTickInterval`) coalesces bursts.
 
 **Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty.
 

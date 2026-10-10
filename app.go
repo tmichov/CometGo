@@ -1,0 +1,304 @@
+// Package cometgo is a realtime web framework: publish Postgres queries as
+// live subscriptions and expose server-authoritative methods over a WebSocket
+// wire protocol (see PROTOCOL.md).
+package cometgo
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Identity is an authenticated principal.
+type Identity struct {
+	// UserID identifies the user. Publications with ScopeUser are shared only
+	// between connections with the same UserID.
+	UserID string
+	// User is sent to the client in welcome/authRes. Defaults to {"id": UserID}.
+	User any
+	// ExpiresAt, if set, downgrades the connection to anonymous when reached
+	// unless the client refreshes its token first.
+	ExpiresAt time.Time
+	// Data is free-form server-side data available to methods and publications.
+	Data any
+}
+
+func (id *Identity) userID() string {
+	if id == nil {
+		return ""
+	}
+	return id.UserID
+}
+
+func (id *Identity) wireUser() any {
+	switch {
+	case id == nil:
+		return nil
+	case id.User != nil:
+		return id.User
+	default:
+		return map[string]string{"id": id.UserID}
+	}
+}
+
+func (id *Identity) authExp() int64 {
+	if id == nil || id.ExpiresAt.IsZero() {
+		return 0
+	}
+	return id.ExpiresAt.Unix()
+}
+
+// Config configures an App.
+type Config struct {
+	// DB is the Postgres pool used for publications, methods and LISTEN.
+	DB *pgxpool.Pool
+
+	// Authenticate validates a bearer token sent in hello or auth. Return an
+	// *Error (e.g. UNAUTHENTICATED) to reject it. If nil, tokens are rejected.
+	Authenticate func(ctx context.Context, token string) (*Identity, error)
+
+	// AuthenticateRequest resolves cookie-session identity at WebSocket
+	// upgrade, used when hello carries no token. Return (nil, nil) for
+	// anonymous; an error closes the connection with 4401.
+	AuthenticateRequest func(r *http.Request) (*Identity, error)
+
+	// Build identifies the current client build; sent in welcome (§3.1).
+	Build string
+
+	// OriginPatterns lists extra allowed WebSocket origins (host patterns).
+	// Same-origin is always allowed.
+	OriginPatterns []string
+
+	// Heartbeat is the liveness interval. Default 25s.
+	Heartbeat time.Duration
+
+	// MinTickInterval is the minimum time between ticks, coalescing bursts
+	// of changes. Default 20ms.
+	MinTickInterval time.Duration
+
+	// FenceTimeout bounds how long a method result waits for its writes to
+	// reach the client before being sent with lag:true. Default 5s.
+	FenceTimeout time.Duration
+
+	// QueryTimeout is the hard per-observer query timeout. Default 30s.
+	QueryTimeout time.Duration
+
+	MaxSubs     int // default 500
+	MaxInflight int // default 32
+	MaxMsg      int // default 1 MiB
+	MaxRows     int // per-observer row cap, default 10,000
+
+	Logger *slog.Logger
+}
+
+// App is a CometGo server. It implements http.Handler for the WebSocket
+// endpoint; mount it at /_comet.
+type App struct {
+	cfg     Config
+	db      *pgxpool.Pool
+	log     *slog.Logger
+	epoch   string
+	nodeID  string
+	pubs    map[string]*publication
+	methods map[string]*method
+	engine  *engine
+	started bool
+}
+
+// New creates an App. Register publications and methods, then call Start.
+func New(cfg Config) *App {
+	if cfg.DB == nil {
+		panic("cometgo: Config.DB is required")
+	}
+	def := func(d *time.Duration, v time.Duration) {
+		if *d <= 0 {
+			*d = v
+		}
+	}
+	defi := func(d *int, v int) {
+		if *d <= 0 {
+			*d = v
+		}
+	}
+	def(&cfg.Heartbeat, 25*time.Second)
+	def(&cfg.MinTickInterval, 20*time.Millisecond)
+	def(&cfg.FenceTimeout, 5*time.Second)
+	def(&cfg.QueryTimeout, 30*time.Second)
+	defi(&cfg.MaxSubs, 500)
+	defi(&cfg.MaxInflight, 32)
+	defi(&cfg.MaxMsg, 1<<20)
+	defi(&cfg.MaxRows, 10_000)
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	a := &App{
+		cfg:     cfg,
+		db:      cfg.DB,
+		log:     cfg.Logger.With("component", "cometgo"),
+		epoch:   "b_" + newID(8),
+		nodeID:  newID(6),
+		pubs:    map[string]*publication{},
+		methods: map[string]*method{},
+	}
+	a.engine = newEngine(a)
+	return a
+}
+
+// Start runs the Postgres listener and the tick engine until ctx is done.
+func (a *App) Start(ctx context.Context) {
+	if a.started {
+		panic("cometgo: Start called twice")
+	}
+	a.started = true
+	go a.engine.listen(ctx)
+	go a.engine.run(ctx)
+}
+
+// Scope controls which connections share one observer of a publication.
+type Scope int
+
+const (
+	// ScopeUser shares an observer only between connections of the same user.
+	// This is the safe default for any query that depends on identity.
+	ScopeUser Scope = iota
+	// ScopeShared shares one observer between all connections. Only use it
+	// when the query does not depend on the caller's identity.
+	ScopeShared
+)
+
+// PubOptions configures a publication.
+type PubOptions struct {
+	// Tables the query reads ("todos" or "schema.todos"). Changes to these
+	// tables re-run the query. Each must have triggers installed with
+	// InstallTriggers.
+	Tables []string
+	// Key lists the primary-key columns of the result. Default ["id"].
+	Key []string
+	// Unordered marks results whose row order carries no meaning; the client
+	// then receives no positions.
+	Unordered bool
+	Scope     Scope
+}
+
+// Query is the SQL a publication runs. It is re-run whenever a table it
+// reads changes, so it must be deterministic for a given snapshot; use
+// ORDER BY for ordered publications.
+type Query struct {
+	SQL  string
+	Args []any
+}
+
+// SubCtx is passed to publication query builders.
+type SubCtx struct {
+	Context  context.Context
+	Identity *Identity // nil when anonymous
+}
+
+type publication struct {
+	name   string
+	opts   PubOptions
+	tables []string
+	build  func(c *SubCtx, args json.RawMessage) (Query, error)
+}
+
+// Publish registers a publication. Args are decoded from the client's sub
+// args into A; a decode failure ends the sub with BAD_REQUEST.
+func Publish[A any](a *App, name string, opts PubOptions, fn func(c *SubCtx, args A) (Query, error)) {
+	if _, dup := a.pubs[name]; dup {
+		panic("cometgo: duplicate publication " + name)
+	}
+	if len(opts.Tables) == 0 {
+		panic("cometgo: publication " + name + " declares no Tables")
+	}
+	if len(opts.Key) == 0 {
+		opts.Key = []string{"id"}
+	}
+	p := &publication{name: name, opts: opts}
+	for _, t := range opts.Tables {
+		p.tables = append(p.tables, qualifyTable(t))
+	}
+	p.build = func(c *SubCtx, raw json.RawMessage) (Query, error) {
+		var args A
+		if err := decodeArgs(raw, &args); err != nil {
+			return Query{}, err
+		}
+		return fn(c, args)
+	}
+	a.pubs[name] = p
+}
+
+// Call is passed to method handlers.
+type Call struct {
+	Context  context.Context
+	Identity *Identity // nil when anonymous
+	// Tx is the method's transaction. Writes made through it are fenced:
+	// the client's call resolves only after their effects reach its subs.
+	Tx pgx.Tx
+}
+
+type method struct {
+	name string
+	run  func(c *Call, args json.RawMessage) (any, error)
+}
+
+// Method registers a server method. Args are decoded into A; the handler's
+// result R is JSON-encoded into res.val. Returning an error rolls back Tx.
+func Method[A, R any](a *App, name string, fn func(c *Call, args A) (R, error)) {
+	if _, dup := a.methods[name]; dup {
+		panic("cometgo: duplicate method " + name)
+	}
+	a.methods[name] = &method{name: name, run: func(c *Call, raw json.RawMessage) (any, error) {
+		var args A
+		if err := decodeArgs(raw, &args); err != nil {
+			return nil, err
+		}
+		return fn(c, args)
+	}}
+}
+
+func decodeArgs(raw json.RawMessage, dst any) error {
+	if len(raw) == 0 {
+		raw = json.RawMessage("null")
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		var ute *json.UnmarshalTypeError
+		if errors.As(err, &ute) || strings.HasPrefix(err.Error(), "json: unknown field") {
+			return &Error{Code: CodeBadRequest, Msg: "invalid args: " + err.Error()}
+		}
+		return &Error{Code: CodeBadRequest, Msg: "invalid args"}
+	}
+	return nil
+}
+
+func qualifyTable(t string) string {
+	if strings.Contains(t, ".") {
+		return t
+	}
+	return "public." + t
+}
+
+// canonicalJSON re-encodes raw so equal values have equal bytes (object keys
+// sorted, whitespace removed).
+func canonicalJSON(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "null", nil
+	}
+	var v any
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return "", fmt.Errorf("args: %w", err)
+	}
+	b, err := json.Marshal(v)
+	return string(b), err
+}
