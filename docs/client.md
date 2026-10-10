@@ -104,7 +104,7 @@ const jobs = comet.subscribe("jobs.mine");
 const off = jobs.onEvent<{ id: string }>("finished", ({ id }) => toast(`Job ${id} finished`));
 ```
 
-Events are at-most-once. Events sent while the client is disconnected are lost unless the session is resumed, and events for a subscription that has ended or been stopped are dropped. An event the server emits from a method (`EmitAfterCommit`) arrives after the method's writes are in `rows` and before the call's promise resolves. A listener that throws is logged and does not affect the others.
+Events are at-most-once. Events sent while the client is disconnected are lost, even when the session is resumed, and events for a subscription that has ended or been stopped are dropped. An event the server emits from a method (`EmitAfterCommit`) arrives after the method's writes are in `rows` and before the call's promise resolves. A listener that throws is logged and does not affect the others.
 
 ## Calls
 

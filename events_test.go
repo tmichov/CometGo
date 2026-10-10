@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 var evtCaps = map[string]any{"caps": []string{"evt"}}
@@ -178,7 +179,41 @@ func TestEmitErrors(t *testing.T) {
 	}
 }
 
-func TestResumeReplaysMissedEventOnce(t *testing.T) {
+func TestIdenticalEventsInOneTransactionAreAllDelivered(t *testing.T) {
+	e := setup(t)
+	a, _ := e.dial(t, evtCaps)
+	subscribe(t, a, 1, "items.all")
+	a.send(map[string]any{"t": "call", "id": 1, "m": "emitTwice"})
+	expectEvt(t, a.next(), 1, "same")
+	expectEvt(t, a.next(), 1, "same")
+	if r := a.next(); r["t"] != "res" {
+		t.Fatalf("expected res, got %v", r)
+	}
+}
+
+func TestEmitToUserScopeNeedsUserID(t *testing.T) {
+	e := setup(t)
+	if err := e.app.Emit(context.Background(), "items.mine", nil, "", "t", nil); err == nil || !strings.Contains(err.Error(), "ScopeUser") {
+		t.Fatalf("err %v, want ScopeUser error", err)
+	}
+	if err := (&Call{Context: context.Background()}).EmitAfterCommit("items.all", nil, "", "t", nil); err == nil {
+		t.Fatal("EmitAfterCommit on a hand-made Call did not fail")
+	}
+}
+
+func TestResumeWithDifferentEvtCapResyncs(t *testing.T) {
+	e := setup(t)
+	a, w := e.dial(t, map[string]any{"caps": []string{capResume, capEvt}})
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	snap := a.next()
+	a.kill()
+	resume := map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}
+	if _, w2 := e.dial(t, map[string]any{"caps": []string{capResume}, "resume": resume}); w2["resumed"] != false {
+		t.Fatalf("resumed with a different evt cap: %v", w2)
+	}
+}
+
+func TestEventsWhileDetachedAreDroppedNotReplayed(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
 	caps := map[string]any{"caps": []string{capResume, capEvt}}
@@ -188,7 +223,21 @@ func TestResumeReplaysMissedEventOnce(t *testing.T) {
 	snap := a.next()
 	subscribe(t, watcher, 9, "items.all")
 	a.kill()
+	sess := e.session(t, w["session"])
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		sess.mu.Lock()
+		detached := sess.sock == nil
+		sess.mu.Unlock()
+		if detached {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session did not detach")
+		}
+	}
 
+	// Emitted while the session is detached: dropped, so a flood of events
+	// cannot overflow the replay buffer and end the session.
 	if err := e.app.Emit(ctx, "items.all", nil, "", "gap", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -199,9 +248,8 @@ func TestResumeReplaysMissedEventOnce(t *testing.T) {
 	if w2["resumed"] != true {
 		t.Fatalf("welcome %v", w2)
 	}
-	expectEvt(t, b.next(), 1, "gap")
 	if err := e.app.Emit(ctx, "items.all", nil, "", "after", nil); err != nil {
 		t.Fatal(err)
 	}
-	expectEvt(t, b.next(), 1, "after")
+	expectEvt(t, b.next(), 1, "after") // not gap
 }

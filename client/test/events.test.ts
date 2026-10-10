@@ -117,3 +117,15 @@ test("an evt advances the seq a resume asks for", async () => {
   next.onopen!();
   assert.equal(next.of("hello")[0].resume.seq, 2);
 });
+
+test("the same function registered twice is removed only by its own unsubscribe", async () => {
+  const ws = await connected();
+  const sub = comet.subscribe("items");
+  let n = 0;
+  const fn = () => n++;
+  const offA = sub.onEvent("t", fn);
+  sub.onEvent("t", fn);
+  offA();
+  ws.recv({ t: "evt", seq: 1, s: sub.id, topic: "t", data: null });
+  assert.equal(n, 1);
+});

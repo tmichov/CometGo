@@ -176,8 +176,8 @@ func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, da
 
 An event is addressed to one observer: the publication, its args and its scope. It is delivered to every subscription bound to that observer, and the client receives it through `sub.onEvent(topic, fn)`.
 
-- `args` must encode to the same JSON value the client subscribed with (key order and whitespace do not matter). `nil` matches a subscription made without args.
-- `scope` is the user ID for a `ScopeUser` publication. It is ignored for `ScopeShared`.
+- `args` must encode to the same JSON value the client sent when subscribing (key order and whitespace do not matter). The comparison is on JSON, not on the decoded args: a Go struct without `json` tags encodes `ProjectID`, which does not match a client's `projectId`, and fields the client omitted must be omitted too. Tag your args types and use the same type for the publication and `Emit`. `nil` matches a subscription made without args. An event that matches no subscription is dropped without an error.
+- `scope` is the user ID for a `ScopeUser` publication, and must not be empty: anonymous subscribers cannot be targeted. It is ignored for `ScopeShared`.
 - `data` is JSON-encoded.
 
 `Emit` sends the event at once. `EmitAfterCommit` sends it from inside a method's transaction: the event is sent only if the method commits, and the client receives it after the update carrying the method's writes and before the method's result. Use it whenever the event refers to data the method writes.
@@ -193,8 +193,9 @@ cometgo.Method(app, "jobs.finish", func(c *cometgo.Call, a FinishArgs) (struct{}
 
 Delivery is **at-most-once**:
 
-- An event reaches the subscriptions bound when the server processes it. Nobody subscribed means it is dropped.
-- Events are not stored. A client that reconnects and resyncs does not receive events sent while it was away. A client that resumes its session (see [Session resume](#session-resume)) receives the ones in its replay buffer.
+- An event reaches the subscriptions bound when the server processes it, on connections that are open. Nobody subscribed means it is dropped.
+- Events are not stored. A client does not receive events sent while it was disconnected, even if it resumes its session (see [Session resume](#session-resume)); only an event already sent when the connection dropped can arrive with the resume replay. So a burst of events never fills the replay buffer of a disconnected session.
+- Several identical events emitted in one transaction are all delivered.
 - Only clients that negotiated the `evt` capability receive events; the TypeScript client always does.
 
 Events travel through `pg_notify` on the channel `comet_evt`, so in a multi-node deployment an emit on any node reaches subscribers on every node. A notification is limited in size: an event whose encoding exceeds 7,500 bytes is rejected with `ErrEventTooLarge`, and nothing is sent. Emitting to an unknown publication, or one without `Events`, also returns an error.

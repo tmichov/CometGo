@@ -444,7 +444,9 @@ export class Subscription<T> {
   #decode?: (cells: unknown[]) => T;
   #dirty = false;
   #listeners = new Set<() => void>();
-  #eventListeners = new Map<string, Set<(data: any) => void>>();
+  // One entry per onEvent call, so the same function registered twice is
+  // removed only by its own unsubscribe.
+  #eventListeners = new Map<string, Set<{ fn: (data: any) => void }>>();
   #resolveReady!: () => void;
   #rejectReady!: (e: CometError) => void;
 
@@ -484,15 +486,16 @@ export class Subscription<T> {
   onEvent<D = unknown>(topic: string, fn: (data: D) => void): () => void {
     let set = this.#eventListeners.get(topic);
     if (!set) this.#eventListeners.set(topic, (set = new Set()));
-    set.add(fn);
+    const entry = { fn: fn as (data: any) => void };
+    set.add(entry);
     return () => {
-      set.delete(fn);
+      set.delete(entry);
       if (set.size === 0 && this.#eventListeners.get(topic) === set) this.#eventListeners.delete(topic);
     };
   }
 
   _event(topic: string, data: unknown): void {
-    for (const fn of [...(this.#eventListeners.get(topic) ?? [])]) {
+    for (const { fn } of [...(this.#eventListeners.get(topic) ?? [])]) {
       try {
         fn(data);
       } catch (err) {

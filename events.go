@@ -34,8 +34,10 @@ type evtMsg struct {
 func (m *evtMsg) setSeq(s uint64) { m.Seq = s }
 
 // evtNote is an event as it travels through pg_notify: the observer key's
-// parts, topic and data.
+// parts, topic and data. ID makes every payload unique: Postgres delivers
+// only one of several identical notifications sent in one transaction.
 type evtNote struct {
+	ID    string          `json:"i"`
 	Pub   string          `json:"p"`
 	Args  string          `json:"a"`
 	Scope string          `json:"s"`
@@ -43,8 +45,10 @@ type evtNote struct {
 	Data  json.RawMessage `json:"d"`
 }
 
-func (n *evtNote) observerKey() string {
-	return n.Pub + "\x00" + n.Args + "\x00" + n.Scope
+// observerKey identifies the observer for (publication, canonical args,
+// scope key). engine.bind and event delivery both use it.
+func observerKey(pub, argsKey, scope string) string {
+	return pub + "\x00" + argsKey + "\x00" + scope
 }
 
 // Emit sends an ephemeral event to every subscription of the publication
@@ -72,6 +76,9 @@ func (a *App) Emit(ctx context.Context, pubName string, args any, scope, topic s
 // carrying the method's writes and before the method's res (unless the call
 // was sent with noFence, whose res does not wait).
 func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, data any) error {
+	if c.app == nil {
+		return errors.New("cometgo: EmitAfterCommit needs a Call made by the framework")
+	}
 	payload, err := c.app.evtPayload(pubName, args, scope, topic, data)
 	if err != nil {
 		return err
@@ -88,6 +95,10 @@ func (a *App) evtPayload(pubName string, args any, scope, topic string, data any
 	if !pub.opts.Events {
 		return "", fmt.Errorf("cometgo: emit: publication %q does not have Events enabled", pubName)
 	}
+	if pub.opts.Scope == ScopeUser && scope == "" {
+		// "" is the anonymous scope; a missing user ID must not reach it.
+		return "", fmt.Errorf("cometgo: emit: publication %q is ScopeUser and needs a user ID as scope", pubName)
+	}
 	rawArgs, err := json.Marshal(args)
 	if err != nil {
 		return "", fmt.Errorf("cometgo: emit: args: %w", err)
@@ -100,7 +111,7 @@ func (a *App) evtPayload(pubName string, args any, scope, topic string, data any
 	if err != nil {
 		return "", fmt.Errorf("cometgo: emit: data: %w", err)
 	}
-	n := evtNote{Pub: pubName, Args: argsKey, Scope: scopeKey(pub, scope), Topic: topic, Data: rawData}
+	n := evtNote{ID: newID(6), Pub: pubName, Args: argsKey, Scope: scopeKey(pub, scope), Topic: topic, Data: rawData}
 	b, err := json.Marshal(&n)
 	if err != nil {
 		return "", err
@@ -133,13 +144,13 @@ func parseEvt(payload string) (*evtNote, bool) {
 // and precedes the res of the call that emitted it.
 func (e *engine) deliverEvents(evts []*evtNote) {
 	for _, n := range evts {
-		obs := e.observers[n.observerKey()]
+		obs := e.observers[observerKey(n.Pub, n.Args, n.Scope)]
 		if obs == nil || !obs.pub.opts.Events {
 			continue // nobody subscribed: at-most-once means dropped
 		}
 		for _, sub := range obs.sortedSubs() {
 			if sub.c.evt {
-				sub.c.send(&evtMsg{T: "evt", S: sub.s, Topic: n.Topic, Data: n.Data})
+				sub.c.sendEvent(&evtMsg{T: "evt", S: sub.s, Topic: n.Topic, Data: n.Data})
 			}
 		}
 	}

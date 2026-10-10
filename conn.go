@@ -320,13 +320,14 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 		ident = cookieIdent
 	}
 	resume := a.cfg.ResumeGrace > 0 && slices.Contains(msg.Caps, capResume)
+	evt := slices.Contains(msg.Caps, capEvt)
 	if resume && msg.Resume != nil {
-		if c := a.resumeSession(s, msg.Resume, ident, authErr); c != nil {
+		if c := a.resumeSession(s, msg.Resume, ident, authErr, evt); c != nil {
 			return c
 		}
 	}
 
-	c := &conn{a: a, session: "s_" + newID(9), resume: resume, evt: slices.Contains(msg.Caps, capEvt)}
+	c := &conn{a: a, session: "s_" + newID(9), resume: resume, evt: evt}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	if resume {
 		c.ids = map[uint64]uint64{}
@@ -363,7 +364,7 @@ func (a *App) welcome(c *conn, ident *Identity, resumed bool) *welcomeMsg {
 // missed (§7.2). It returns nil when resume is impossible; the caller then
 // starts a new session and the client resyncs (§7.1). A failed resume ends
 // the old session: its owner has given up on it.
-func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr *Error) *conn {
+func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr *Error, evt bool) *conn {
 	c := a.lookupSession(r.Session)
 	if c == nil {
 		return nil
@@ -373,6 +374,12 @@ func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr 
 	// A different principal (login, logout or expiry during the gap) cannot
 	// take over the session's subscriptions; it resyncs under its own identity.
 	if !samePrincipal(c.identity(), ident) {
+		c.end()
+		return nil
+	}
+	// The replay may hold evt messages: a client whose evt cap differs from
+	// the session's (e.g. a different build) resyncs instead.
+	if c.evt != evt {
 		c.end()
 		return nil
 	}
@@ -646,6 +653,22 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 func (c *conn) send(m any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.sendLocked(m)
+}
+
+// sendEvent sends an evt only while a socket is attached. Events are
+// at-most-once, so a detached session drops them rather than filling its
+// replay buffer with them, which could end the session (§4.5, §7.2).
+func (c *conn) sendEvent(m *evtMsg) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sock != nil {
+		c.sendLocked(m)
+	}
+}
+
+// sendLocked is send with c.mu held.
+func (c *conn) sendLocked(m any) {
 	if c.closed {
 		return
 	}

@@ -111,6 +111,15 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 		}
 		return id, nil
 	})
+	// emitTwice sends two identical events from one transaction.
+	Method(app, "emitTwice", func(c *Call, _ struct{}) (struct{}, error) {
+		for range 2 {
+			if err := c.EmitAfterCommit("items.all", nil, "", "same", 1); err != nil {
+				return struct{}{}, err
+			}
+		}
+		return struct{}{}, nil
+	})
 	app.Start(ctx)
 	// LISTEN comes up asynchronously; a fence notified before it would be
 	// lost and its call would wait FenceTimeout. The listener signals
