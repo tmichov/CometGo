@@ -57,6 +57,18 @@ interface PendingAuth {
 // check (1 s) or after this many bytes.
 const ACK_BYTES = 64 << 10;
 
+export interface CallOptions {
+  /** Skip the read-your-writes fence (§6.2); for calls that do not write. */
+  noFence?: boolean;
+  /**
+   * Cancels the call when aborted (§5). A call not yet sent is rejected at
+   * once with CANCELED. A sent one is asked to stop, and the promise settles
+   * from the server's answer: CANCELED if the method had not committed yet,
+   * otherwise its real result.
+   */
+  signal?: AbortSignal;
+}
+
 interface PendingCall {
   id: number;
   m: string;
@@ -65,6 +77,8 @@ interface PendingCall {
   sent: boolean;
   // Sent on a socket that dropped; awaiting the resume outcome.
   held?: boolean;
+  // The caller aborted: send cancel after the call whenever it is sent.
+  cancel?: boolean;
   resolve: (r: { value: unknown; lag: boolean }) => void;
   reject: (e: CometError) => void;
 }
@@ -132,22 +146,36 @@ export class Comet {
   }
 
   /** Calls a server method. Resolves after its effects are in the store (§6.2). */
-  async call<R = unknown>(m: string, args?: unknown, opts: { noFence?: boolean } = {}): Promise<R> {
+  async call<R = unknown>(m: string, args?: unknown, opts: CallOptions = {}): Promise<R> {
     return (await this.callWithStatus<R>(m, args, opts)).value;
   }
 
   /** Like call, but also reports lag: true when the fence timed out. */
-  callWithStatus<R = unknown>(m: string, args?: unknown, opts: { noFence?: boolean } = {}): Promise<{ value: R; lag: boolean }> {
+  callWithStatus<R = unknown>(m: string, args?: unknown, opts: CallOptions = {}): Promise<{ value: R; lag: boolean }> {
     return new Promise((resolve, reject) => {
+      const { signal } = opts;
+      if (signal?.aborted) {
+        reject(canceled());
+        return;
+      }
+      const onAbort = () => this.#abort(c);
+      const settled = () => signal?.removeEventListener("abort", onAbort);
       const c: PendingCall = {
         id: this.#nextId++,
         m,
         args,
         noFence: !!opts.noFence,
         sent: false,
-        resolve: resolve as PendingCall["resolve"],
-        reject,
+        resolve: (r) => {
+          settled();
+          resolve(r as { value: R; lag: boolean });
+        },
+        reject: (e) => {
+          settled();
+          reject(e);
+        },
       };
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.#calls.set(c.id, c);
       // Unsent calls wait for the next connection; they never ran, so
       // sending them later is safe.
@@ -309,6 +337,22 @@ export class Comet {
   #sendCall(c: PendingCall): void {
     c.sent = true;
     this.#send({ t: "call", id: c.id, m: c.m, args: c.args ?? null, ...(c.noFence ? { noFence: true } : {}) });
+    // An aborted call held for a resume is re-sent (its outcome is still
+    // unknown) and cancelled right after.
+    if (c.cancel) this.#send({ t: "cancel", id: c.id });
+  }
+
+  // An unsent call never ran, so it settles here. A sent one may already
+  // have committed: ask the server to cancel and wait for its res.
+  #abort(c: PendingCall): void {
+    if (this.#calls.get(c.id) !== c) return; // already settled
+    if (!c.sent) {
+      this.#calls.delete(c.id);
+      c.reject(canceled());
+      return;
+    }
+    c.cancel = true;
+    if (!c.held && this.#isOpen()) this.#send({ t: "cancel", id: c.id });
   }
 
   #setStatus(s: ConnectionStatus): void {
@@ -580,6 +624,10 @@ export class Subscription<T> {
 async function resolveToken(t: TokenSource | undefined): Promise<string | null> {
   if (typeof t === "function") return (await t()) ?? null;
   return t ?? null;
+}
+
+function canceled(): CometError {
+  return new CometError({ code: "CANCELED", msg: "call canceled" });
 }
 
 function defaultUrl(): string {

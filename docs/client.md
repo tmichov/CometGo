@@ -116,6 +116,13 @@ const { value, lag } = await comet.callWithStatus("todos.add", { title: "Ship v1
 - **Read-your-writes.** The promise resolves only after the method's writes are reflected in this client's subscriptions, so the UI is already up to date when `await` returns.
 - **`lag`.** If the writes did not arrive within the server's `FenceTimeout` (5 s by default), the call still resolves, with `lag: true` from `callWithStatus`. `call` resolves the same way but does not report it.
 - **`{ noFence: true }`** skips that wait. Use it for calls that do not write.
+- **`{ signal }`** takes an `AbortSignal` to cancel the call. If the call has not been sent yet, it is rejected at once with `CANCELED` and never sent. Otherwise the client asks the server to cancel, and the promise settles from the server's answer: `CANCELED` if the method had not committed (nothing was written), or its real result if the cancel came too late. Aborting does not settle the promise by itself, because only the server knows whether the method committed.
+
+  ```ts
+  const ac = new AbortController();
+  const p = comet.call("reports.build", { id }, { signal: ac.signal });
+  cancelButton.onclick = () => ac.abort();
+  ```
 - **Errors.** A failed call rejects with a `CometError` carrying the server's code (see below).
 - **Before the connection is open,** calls are queued and sent when it opens.
 

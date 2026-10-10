@@ -120,6 +120,19 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 		}
 		return struct{}{}, nil
 	})
+	// sleepAdd inserts a row, then sleeps SleepMs in Postgres through
+	// c.Context, so a cancel can interrupt it.
+	Method(app, "sleepAdd", func(c *Call, a struct {
+		Name    string
+		SleepMs int
+	}) (string, error) {
+		var id string
+		if err := c.Tx.QueryRow(c.Context, "INSERT INTO "+table+" (owner, name) VALUES ('c', $1) RETURNING id::text", a.Name).Scan(&id); err != nil {
+			return "", err
+		}
+		_, err := c.Tx.Exec(c.Context, "SELECT pg_sleep($1::float8 / 1000)", a.SleepMs)
+		return id, err
+	})
 	app.Start(ctx)
 	// LISTEN comes up asynchronously; a fence notified before it would be
 	// lost and its call would wait FenceTimeout. The listener signals

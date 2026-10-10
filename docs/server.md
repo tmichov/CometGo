@@ -162,6 +162,7 @@ Other details:
 
 - Calls on one connection run concurrently, up to `Config.MaxInflight`. A client that needs two calls in order should await the first.
 - `c.Context` is **not** cancelled when the client disconnects. A call that has started runs to completion and commits or rolls back on its own. If the client resumes its session, it gets the result; otherwise it reports `CONNECTION_LOST`, because it cannot know which happened.
+- `c.Context` **is** cancelled when the client cancels the call (`signal` in the TypeScript client), and only then: it stays valid after the call returns, so work a handler starts with it is not cut off. Pass it to every query so a long one stops promptly. A cancel that arrives while the handler is running always rolls the transaction back and the client gets `CANCELED`, even if the handler ignores the context and returns normally. A cancel that arrives once the handler has returned is too late: the call commits and the client gets the real result.
 - A client can send a call with `noFence`, which commits without the fence and returns as soon as the transaction commits. Use it for calls that do not write.
 - An unknown method name returns `NOT_FOUND`.
 
@@ -233,7 +234,7 @@ Return a `*cometgo.Error` from a method, a publication or `Authenticate` to cont
 | `CodeConflict` | `CONFLICT` | never |
 | `CodeRateLimited` | `RATE_LIMITED` | over `MaxSubs` or `MaxInflight` |
 | `CodeTimeout` | `TIMEOUT` | a publication query exceeds `QueryTimeout` |
-| `CodeCanceled` | `CANCELED` | never in v1-core (call cancellation is planned) |
+| `CodeCanceled` | `CANCELED` | The client cancelled the call before it committed; nothing was written. |
 | `CodeResultTooLarge` | `RESULT_TOO_LARGE` | a publication result exceeds `MaxRows` |
 | `CodeUnavailable` | `UNAVAILABLE` | never |
 | `CodeInternal` | `INTERNAL` | any error that is not a `*cometgo.Error` |

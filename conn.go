@@ -97,9 +97,17 @@ type conn struct {
 	// ids maps call/auth ids seen to the seq of their res (0 while running),
 	// to deduplicate re-sent calls after resume. Pruned by ack.
 	ids map[uint64]uint64
+	// running maps the ids of calls still running to their cancel, for the
+	// client's cancel message (§5). An entry stays until the res is sent, but
+	// a cancel takes effect only before the handler returns.
+	running map[uint64]*runningCall
 
 	authMu   sync.Mutex // serializes identity changes
 	inflight atomic.Int32
+}
+
+type runningCall struct {
+	cancel context.CancelFunc
 }
 
 type replayMsg struct {
@@ -489,15 +497,44 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 			s.fail(closeProtocol, "PROTOCOL", "call requires id and m")
 			return
 		}
-		if !c.firstSeen(*msg.ID) {
-			return
-		}
 		if int(c.inflight.Add(1)) > c.a.cfg.MaxInflight {
 			c.inflight.Add(-1)
-			c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
+			if c.firstSeen(*msg.ID) {
+				c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
+			}
 			return
 		}
-		go c.call(msg, c.identity())
+		// The method outlives a dropped connection: its outcome is decided
+		// server-side either way. Only the client's cancel stops it.
+		hctx, cancel := context.WithCancel(context.WithoutCancel(c.ctx))
+		r := &runningCall{cancel: cancel}
+		// Dedupe and registration happen together: after a resume, the
+		// re-sent copy of a call is dropped only once the original is
+		// registered, so a cancel right behind it always finds it.
+		c.mu.Lock()
+		first := c.firstSeenLocked(*msg.ID)
+		if first {
+			if c.running == nil {
+				c.running = map[uint64]*runningCall{}
+			}
+			c.running[*msg.ID] = r
+		}
+		c.mu.Unlock()
+		if !first {
+			c.inflight.Add(-1)
+			return
+		}
+		go c.call(msg, c.identity(), hctx, r)
+	case "cancel":
+		// Unknown or finished ids are ignored: the res is sent or on its way.
+		if msg.ID != nil {
+			c.mu.Lock()
+			r := c.running[*msg.ID]
+			c.mu.Unlock()
+			if r != nil {
+				r.cancel()
+			}
+		}
 	case "auth":
 		if msg.ID == nil {
 			s.fail(closeProtocol, "PROTOCOL", "auth requires id")
@@ -531,6 +568,11 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 func (c *conn) firstSeen(id uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.firstSeenLocked(id)
+}
+
+// firstSeenLocked is firstSeen with c.mu held.
+func (c *conn) firstSeenLocked(id uint64) bool {
 	if c.ids == nil {
 		return true
 	}
@@ -585,10 +627,20 @@ func (c *conn) reauth(id uint64, rawToken json.RawMessage) {
 	c.a.engine.enqueue(rebindReq{c: c, ident: ident, after: res})
 }
 
-func (c *conn) call(msg *clientMsg, ident *Identity) {
+func (c *conn) call(msg *clientMsg, ident *Identity, hctx context.Context, r *runningCall) {
 	defer c.inflight.Add(-1)
 	id := *msg.ID
-	val, lag, err := c.runCall(msg, ident)
+	defer func() {
+		c.mu.Lock()
+		if c.running[id] == r {
+			delete(c.running, id)
+		}
+		c.mu.Unlock()
+		// r.cancel is not called: c.Context is cancelled only by the
+		// client's cancel, so work a handler started with it survives the
+		// call (hctx's parent never cancels, so nothing leaks).
+	}()
+	val, lag, err := c.runCall(msg, ident, hctx)
 	res := &resMsg{T: "res", ID: id, OK: err == nil, Val: val, Lag: lag}
 	if err != nil {
 		res.Err = c.a.toWireError(err, "method "+msg.M)
@@ -596,14 +648,17 @@ func (c *conn) call(msg *clientMsg, ident *Identity) {
 	c.send(res)
 }
 
-func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, lag bool, err error) {
+// runCall runs the handler with hctx, which the client's cancel cancels, and
+// everything after it (commit, fence) with a context cancel cannot reach.
+func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (val json.RawMessage, lag bool, err error) {
 	m := c.a.methods[msg.M]
 	if m == nil {
 		return nil, false, NewError(CodeNotFound, "unknown method "+msg.M)
 	}
-	// The method outlives a dropped connection: its outcome is decided
-	// server-side either way, and the client reports CONNECTION_LOST.
-	ctx := context.WithoutCancel(c.ctx)
+	ctx := context.WithoutCancel(hctx)
+	if hctx.Err() != nil {
+		return nil, false, NewError(CodeCanceled, "call canceled") // before it started
+	}
 	tx, err := c.a.db.Begin(ctx)
 	if err != nil {
 		return nil, false, err
@@ -616,8 +671,17 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 				err = fmt.Errorf("panic: %v", p)
 			}
 		}()
-		return m.run(&Call{Context: ctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
+		return m.run(&Call{Context: hctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
 	}()
+	// A cancel that arrived before this point rolls back, whatever the
+	// handler returned: its queries may have been interrupted, and the
+	// client asked for it before anything committed. A cancel after this
+	// point is too late; the real result is sent (§5). A query the handler
+	// ran with hctx was stopped in Postgres too: pgx answers a cancelled
+	// context by closing the connection and sending a cancel request.
+	if hctx.Err() != nil {
+		return nil, false, NewError(CodeCanceled, "call canceled")
+	}
 	if err != nil {
 		return nil, false, err
 	}
