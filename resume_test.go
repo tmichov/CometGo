@@ -385,3 +385,20 @@ func TestClientResumeEndToEnd(t *testing.T) {
 		t.Fatalf("call ran %d times", n)
 	}
 }
+
+func TestResumeAfterGraceFails(t *testing.T) {
+	e := setupWith(t, func(c *Config) { c.ResumeGrace = 100 * time.Millisecond })
+	a, w := e.dial(t, resumeHello(nil))
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	snap := a.next()
+	a.kill()
+	for deadline := time.Now().Add(5 * time.Second); e.app.lookupSession(w["session"].(string)) != nil; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("session outlived its grace window")
+		}
+	}
+	_, w2 := e.dial(t, resumeHello(map[string]any{"resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
+	if w2["resumed"] != false {
+		t.Fatalf("welcome %v", w2)
+	}
+}
