@@ -33,6 +33,7 @@
     .stale { opacity: .55; transition: opacity .2s; }
     .error { color: var(--warn); font-size: 13px; padding: 0 12px 8px; }
     p.hint { color: var(--muted); font-size: 13px; margin-top: 16px; }
+    p.hint a { color: inherit; }
   </style>
 </head>
 <body>
@@ -54,7 +55,7 @@
         <button id="clear" class="link" type="button">Clear done</button>
       </footer>
     </div>
-    <p class="hint">Open this page in a second tab: changes appear everywhere. When a call resolves, its result is already on screen.</p>
+    <p class="hint">Open this page in a second tab: changes appear everywhere. When a call resolves, its result is already on screen. Also available <a href="/react.html">written with React</a>.</p>
   </main>
   <script type="module" src="/app.js"></script>
 </body>
