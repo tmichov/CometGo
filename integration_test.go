@@ -70,11 +70,11 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 		tweak(&cfg)
 	}
 	app := New(cfg)
-	Publish(app, "items.all", PubOptions{Tables: []string{table}, Scope: ScopeShared},
+	Publish(app, "items.all", PubOptions{Tables: []string{table}, Scope: ScopeShared, Events: true},
 		func(c *SubCtx, _ struct{}) (Query, error) {
 			return Query{SQL: "SELECT id, owner, name, n FROM " + table + " ORDER BY id"}, nil
 		})
-	Publish(app, "items.mine", PubOptions{Tables: []string{table}},
+	Publish(app, "items.mine", PubOptions{Tables: []string{table}, Events: true},
 		func(c *SubCtx, _ struct{}) (Query, error) {
 			if c.Identity == nil {
 				return Query{}, ErrForbidden
@@ -95,6 +95,21 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 	Method(app, "bump", func(c *Call, a struct{ ID string }) (struct{}, error) {
 		_, err := c.Tx.Exec(c.Context, "UPDATE "+table+" SET n = n + 1 WHERE id = $1::int8", a.ID)
 		return struct{}{}, err
+	})
+	// addAndEmit inserts a row and announces it to items.all subscribers;
+	// with Name "" it emits and then fails, so the emit must roll back.
+	Method(app, "addAndEmit", func(c *Call, a addArgs) (string, error) {
+		var id string
+		if err := c.Tx.QueryRow(c.Context, "INSERT INTO "+table+" (owner, name) VALUES ($1, $2) RETURNING id::text", a.Owner, a.Name).Scan(&id); err != nil {
+			return "", err
+		}
+		if err := c.EmitAfterCommit("items.all", nil, "", "added", map[string]string{"id": id}); err != nil {
+			return "", err
+		}
+		if a.Name == "" {
+			return "", ValidationError(map[string]string{"name": "required"})
+		}
+		return id, nil
 	})
 	app.Start(ctx)
 	// LISTEN comes up asynchronously; a fence notified before it would be

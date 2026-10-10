@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -102,7 +103,7 @@ func seqOf(m map[string]any) uint64 { return uint64(m["seq"].(float64)) }
 func TestWelcomeAdvertisesResume(t *testing.T) {
 	e := setup(t)
 	_, w := e.dial(t, nil)
-	if fmt.Sprint(w["caps"]) != "[resume]" || w["resumed"] != false {
+	if !slices.Contains(w["caps"].([]any), any("resume")) || w["resumed"] != false {
 		t.Fatalf("welcome %v", w)
 	}
 	// A client without the cap gets no session kept for it.

@@ -101,6 +101,7 @@ All observers that need re-running in one tick run inside one `REPEATABLE READ R
 | `Key []string` | `["id"]` | The result columns that uniquely identify a row. They must be present in the `SELECT` list and must not be null. A missing key column fails the query with `INTERNAL`. |
 | `Unordered bool` | false | Declares that row order carries no meaning. The server then sends no positions, and the client's row order is arbitrary. Leave it false and use `ORDER BY` when order matters. |
 | `Scope Scope` | `ScopeUser` | Which connections may share one observer. See below. |
+| `Events bool` | false | Allows [events](#events) to be sent to this publication's subscriptions. |
 
 ### Scope
 
@@ -163,6 +164,40 @@ Other details:
 - `c.Context` is **not** cancelled when the client disconnects. A call that has started runs to completion and commits or rolls back on its own. If the client resumes its session, it gets the result; otherwise it reports `CONNECTION_LOST`, because it cannot know which happened.
 - A client can send a call with `noFence`, which commits without the fence and returns as soon as the transaction commits. Use it for calls that do not write.
 - An unknown method name returns `NOT_FOUND`.
+
+## Events
+
+Events are ephemeral messages to a publication's subscribers, for things that do not belong in a table: progress, typing indicators, "job finished". The publication must set `PubOptions.Events`.
+
+```go
+func (a *App) Emit(ctx context.Context, pubName string, args any, scope, topic string, data any) error
+func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, data any) error
+```
+
+An event is addressed to one observer: the publication, its args and its scope. It is delivered to every subscription bound to that observer, and the client receives it through `sub.onEvent(topic, fn)`.
+
+- `args` must encode to the same JSON value the client subscribed with (key order and whitespace do not matter). `nil` matches a subscription made without args.
+- `scope` is the user ID for a `ScopeUser` publication. It is ignored for `ScopeShared`.
+- `data` is JSON-encoded.
+
+`Emit` sends the event at once. `EmitAfterCommit` sends it from inside a method's transaction: the event is sent only if the method commits, and the client receives it after the update carrying the method's writes and before the method's result. Use it whenever the event refers to data the method writes.
+
+```go
+cometgo.Method(app, "jobs.finish", func(c *cometgo.Call, a FinishArgs) (struct{}, error) {
+	if _, err := c.Tx.Exec(c.Context, "UPDATE jobs SET done = true WHERE id = $1", a.ID); err != nil {
+		return struct{}{}, err
+	}
+	return struct{}{}, c.EmitAfterCommit("jobs.mine", nil, c.Identity.UserID, "finished", map[string]any{"id": a.ID})
+})
+```
+
+Delivery is **at-most-once**:
+
+- An event reaches the subscriptions bound when the server processes it. Nobody subscribed means it is dropped.
+- Events are not stored. A client that reconnects and resyncs does not receive events sent while it was away. A client that resumes its session (see [Session resume](#session-resume)) receives the ones in its replay buffer.
+- Only clients that negotiated the `evt` capability receive events; the TypeScript client always does.
+
+Events travel through `pg_notify` on the channel `comet_evt`, so in a multi-node deployment an emit on any node reaches subscribers on every node. A notification is limited in size: an event whose encoding exceeds 7,500 bytes is rejected with `ErrEventTooLarge`, and nothing is sent. Emitting to an unknown publication, or one without `Events`, also returns an error.
 
 ## Errors
 

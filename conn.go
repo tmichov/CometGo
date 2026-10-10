@@ -75,6 +75,7 @@ type conn struct {
 	a       *App
 	session string
 	resume  bool // client and server both have the resume cap
+	evt     bool // the client offered the evt cap: send it evt messages
 	ctx     context.Context
 	cancel  context.CancelFunc
 
@@ -325,7 +326,7 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 		}
 	}
 
-	c := &conn{a: a, session: "s_" + newID(9), resume: resume}
+	c := &conn{a: a, session: "s_" + newID(9), resume: resume, evt: slices.Contains(msg.Caps, capEvt)}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	if resume {
 		c.ids = map[uint64]uint64{}
@@ -346,7 +347,7 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 
 func (a *App) welcome(c *conn, ident *Identity, resumed bool) *welcomeMsg {
 	cfg := a.cfg
-	caps := []string{}
+	caps := []string{capEvt}
 	if cfg.ResumeGrace > 0 {
 		caps = append(caps, capResume)
 	}
@@ -608,7 +609,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 				err = fmt.Errorf("panic: %v", p)
 			}
 		}()
-		return m.run(&Call{Context: ctx, Identity: ident, Tx: tx}, msg.Args)
+		return m.run(&Call{Context: ctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
 	}()
 	if err != nil {
 		return nil, false, err

@@ -208,6 +208,9 @@ type PubOptions struct {
 	// then receives no positions.
 	Unordered bool
 	Scope     Scope
+	// Events lets the server send ephemeral events to this publication's
+	// subscriptions with App.Emit and Call.EmitAfterCommit.
+	Events bool
 }
 
 // Query is the SQL a publication runs. It is re-run whenever a table it
@@ -264,6 +267,8 @@ type Call struct {
 	// Tx is the method's transaction. Writes made through it are fenced:
 	// the client's call resolves only after their effects reach its subs.
 	Tx pgx.Tx
+
+	app *App
 }
 
 type method struct {
