@@ -47,6 +47,15 @@ export interface CallOptions {
   ik?: string;
 }
 
+/**
+ * How long after its first send an ik call may still be retried. Must stay
+ * well under the server's IdempotencyTTL (24h by default): past the TTL the
+ * stored result is gone and a retry would run the method again.
+ */
+const IK_RETRY_WINDOW_MS = 60 * 60 * 1000;
+
+const lost = () => new CometError({ code: "CONNECTION_LOST", msg: "connection lost; outcome unknown" });
+
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 export type SubStatus = "loading" | "ready" | "resyncing" | "ended";
 
@@ -66,6 +75,14 @@ interface PendingCall {
   noFence: boolean;
   ik?: string;
   sent: boolean;
+  /** When the call was first sent; bounds how long an ik call is retried. */
+  firstSent?: number;
+  /**
+   * Set when an ik call lost its connection after being sent. It is held
+   * until the next welcome, which decides whether it is re-sent: the server
+   * must advertise the ik cap and the user must be the one it ran as.
+   */
+  retry?: { user: string };
   resolve: (r: { value: unknown; lag: boolean }) => void;
   reject: (e: CometError) => void;
 }
@@ -94,8 +111,8 @@ export class Comet {
   #lastRecv = 0;
   #pinged = false;
   #closed = false;
-  /** Whether the last welcome advertised the "ik" cap, so ik calls may be re-sent. */
-  #canRetryIK = false;
+  /** Whether the current connection has received its welcome. */
+  #welcomed = false;
   #reconnectTimer?: ReturnType<typeof setTimeout>;
   #hbTimer?: ReturnType<typeof setInterval>;
   #statusListeners = new Set<() => void>();
@@ -166,6 +183,13 @@ export class Comet {
 
   close(): void {
     this.#closed = true;
+    // Calls held for a retry would otherwise never settle.
+    for (const c of [...this.#calls.values()]) {
+      if (c.retry) {
+        this.#calls.delete(c.id);
+        c.reject(lost());
+      }
+    }
     clearTimeout(this.#reconnectTimer);
     clearInterval(this.#hbTimer);
     this.#ws?.close(1000);
@@ -200,7 +224,8 @@ export class Comet {
       this.#lastRecv = Date.now();
       this.#send({ t: "hello", v: 1, caps: ["ik"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}) });
       for (const sub of this.#subs.values()) this.#sendSub(sub);
-      for (const c of this.#calls.values()) if (!c.sent) this.#sendCall(c);
+      // Held ik retries wait for welcome (see PendingCall.retry).
+      for (const c of this.#calls.values()) if (!c.sent && !c.retry) this.#sendCall(c);
     };
     ws.onmessage = (ev) => {
       this.#lastRecv = Date.now();
@@ -225,17 +250,19 @@ export class Comet {
     // Calls that reached the server have an unknown outcome: never replay them
     // (§7.1), unless they carry an idempotency key. Those are re-sent on the
     // next connection, and the server answers with the stored result if the
-    // first attempt committed. That needs a server that advertised the "ik"
-    // cap: an older one ignores the key and would run the call twice. After
+    // first attempt committed. Without this connection's welcome we do not
+    // know which user the call ran as, so it cannot be retried safely. After
     // close() there is no next connection.
-    const retryIK = this.#canRetryIK && !this.#closed;
-    this.#canRetryIK = false;
+    const welcomed = this.#welcomed;
+    this.#welcomed = false;
     for (const c of [...this.#calls.values()]) {
-      if (c.ik !== undefined && retryIK) {
-        c.sent = false;
-      } else if (c.sent) {
+      if (!c.sent) continue;
+      c.sent = false;
+      if (c.ik !== undefined && welcomed && !this.#closed) {
+        c.retry = { user: JSON.stringify(this.user) };
+      } else {
         this.#calls.delete(c.id);
-        c.reject(new CometError({ code: "CONNECTION_LOST", msg: "connection lost; outcome unknown" }));
+        c.reject(lost());
       }
     }
     for (const a of this.#auths.values()) a.reject(new CometError({ code: "CONNECTION_LOST" }));
@@ -276,7 +303,25 @@ export class Comet {
 
   #sendCall(c: PendingCall): void {
     c.sent = true;
+    c.firstSent ??= Date.now();
     this.#send({ t: "call", id: c.id, m: c.m, args: c.args ?? null, ...(c.noFence ? { noFence: true } : {}), ...(c.ik !== undefined ? { ik: c.ik } : {}) });
+  }
+
+  // Re-sends ik calls held since a disconnect, or rejects those it cannot
+  // retry safely: a server without the ik cap ignores the key and would run
+  // the call again, as would a different user's scope or an expired result.
+  #retryHeld(serverHasIK: boolean): void {
+    const user = JSON.stringify(this.user);
+    for (const c of [...this.#calls.values()]) {
+      if (!c.retry) continue;
+      if (serverHasIK && c.retry.user === user && Date.now() - c.firstSent! < IK_RETRY_WINDOW_MS) {
+        c.retry = undefined;
+        this.#sendCall(c);
+      } else {
+        this.#calls.delete(c.id);
+        c.reject(lost());
+      }
+    }
   }
 
   #setStatus(s: ConnectionStatus): void {
@@ -296,7 +341,8 @@ export class Comet {
         this.#hb = msg.hb ?? this.#hb;
         this.user = msg.user ?? null;
         this.serverBuild = msg.build;
-        this.#canRetryIK = Array.isArray(msg.caps) && msg.caps.includes("ik");
+        this.#welcomed = true;
+        this.#retryHeld(Array.isArray(msg.caps) && msg.caps.includes("ik"));
         this.status = "connected";
         this.#emit();
         return;

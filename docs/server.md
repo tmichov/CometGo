@@ -42,7 +42,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `Heartbeat` | 25s | The server pings every interval and closes the connection with 4408 if a ping gets no pong within twice the interval. Also sent to the client, which uses it for its own liveness check. |
 | `MinTickInterval` | 20ms | Minimum time between engine ticks. Bursts of changes inside the interval are coalesced into one re-run. |
 | `FenceTimeout` | 5s | How long a method result waits for its writes to reach the caller's subscriptions. After that the result is sent with `lag: true`. |
-| `IdempotencyTTL` | 24h | How long the result of a call carrying an [idempotency key](#idempotency-keys) is kept. A retry after that runs the method again. |
+| `IdempotencyTTL` | 24h | How long the result of a call carrying an [idempotency key](#idempotency-keys) is kept. A retry after that runs the method again. Keep it above an hour: the TypeScript client retries a call for up to an hour after first sending it. |
 | `QueryTimeout` | 30s | Hard `statement_timeout` for publication queries. A query that exceeds it ends its subscriptions with `TIMEOUT`. |
 | `MaxSubs int` | 500 | Subscriptions per connection. A subscription over the limit is ended with `RATE_LIMITED`. |
 | `MaxInflight int` | 32 | Concurrent method calls per connection. A call over the limit gets `RATE_LIMITED` with `retryAfterMs: 100`. |
@@ -173,9 +173,9 @@ A call whose connection dropped before its result arrived has an unknown outcome
 - A duplicate that arrives while the first is still running waits for it: if the first commits, the duplicate returns its result; if it fails, the duplicate runs the handler itself.
 - A failed call (an error, a panic, a rolled-back transaction) stores nothing, so a retry runs again.
 - The same key used for a different method returns `BAD_REQUEST`. The args are not compared.
-- Keys are scoped per user. A different user, or an anonymous connection, sending the same key is independent. All anonymous connections share one scope, so keys must be unguessable; the client generates random UUIDs.
+- Keys are scoped per user. A different user, or an anonymous connection, sending the same key is independent. All anonymous connections share one scope: an anonymous caller who knows another's key gets that caller's stored result. Keys must therefore be unguessable, such as the random UUIDs the client generates; never derive one from an id or other predictable value.
 - A key must be a non-empty string of at most 128 bytes, or the call gets `BAD_REQUEST`.
-- Stored results are deleted after `Config.IdempotencyTTL` (24h by default) by a cleanup that `Start` runs hourly.
+- Stored results are deleted after `Config.IdempotencyTTL` (24h by default) by a cleanup that `Start` runs every hour (every TTL if that is shorter, but at most once a minute).
 
 The table must exist: call [`InstallIdempotency`](#installidempotency) at startup. Without it, a call carrying a key fails with `INTERNAL`.
 

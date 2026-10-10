@@ -249,7 +249,7 @@ Any lost connection in v1-core leads to a resync:
 1. The client reconnects with exponential backoff and full jitter (base 500 ms, cap 30 s). It reconnects immediately on the `online` and `visibilitychange` events.
 2. It sends `hello`, then re-sends `sub` for every active subscription with the **same `s`** and `"have":true`.
 3. The server answers with `reset:true` entries. The client diffs and swaps at `ready` (§4.4), with no flicker.
-4. Calls in flight without a `res` are rejected locally with `CONNECTION_LOST`, meaning "outcome unknown". They are **never** re-executed blindly. Calls carrying `ik` are resent on the new connection, with the same `ik`, when the last `welcome` advertised the `ik` cap (§5).
+4. Calls in flight without a `res` are rejected locally with `CONNECTION_LOST`, meaning "outcome unknown". They are **never** re-executed blindly. Calls carrying `ik` are resent on the new connection, with the same `ik`, after its `welcome`, if that `welcome` advertises the `ik` cap (§5) and names the same user the call ran as.
 
 ### 7.2 [later] Session resume
 

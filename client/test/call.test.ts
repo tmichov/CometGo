@@ -21,10 +21,14 @@ class FakeWS {
   of(t: string): any[] {
     return this.sent.filter((m) => m.t === t);
   }
-  open(caps: string[] = ["ik"]): void {
+  open(caps: string[] = ["ik"], user: unknown = null): void {
+    this.connect();
+    this.recv({ t: "welcome", hb: 25000, user, caps });
+  }
+  /** The socket opens; the client sends hello. No welcome yet. */
+  connect(): void {
     this.readyState = 1;
     this.onopen!();
-    this.recv({ t: "welcome", hb: 25000, user: null, caps });
   }
   recv(msg: unknown): void {
     this.onmessage!({ data: JSON.stringify(msg) });
@@ -45,13 +49,21 @@ beforeEach(async () => {
 
 afterEach(() => comet.close());
 
-// Waits for the client's backoff timer to open the next socket.
-async function reconnected(prev: FakeWS): Promise<FakeWS> {
+// Waits for the client's backoff timer to create the next socket.
+async function nextSocket(prev: FakeWS): Promise<FakeWS> {
   for (let i = 0; i < 200 && FakeWS.last === prev; i++) await new Promise((r) => setTimeout(r, 5));
   assert.notEqual(FakeWS.last, prev, "client did not reconnect");
-  const ws = FakeWS.last;
-  ws.open();
+  return FakeWS.last;
+}
+
+async function reconnected(prev: FakeWS, caps?: string[], user?: unknown): Promise<FakeWS> {
+  const ws = await nextSocket(prev);
+  ws.open(caps, user);
   return ws;
+}
+
+async function lostConnection(p: Promise<unknown>): Promise<void> {
+  await assert.rejects(p, (e: unknown) => e instanceof CometError && e.code === "CONNECTION_LOST");
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -102,18 +114,45 @@ test("on disconnect, a sent call without ik is still rejected with CONNECTION_LO
   assert.equal(second.of("call").length, 0);
 });
 
-test("against a server without the ik cap, a sent ik call is rejected with CONNECTION_LOST", async () => {
+test("a retry waits for welcome, and is rejected if the new server lacks the ik cap", async () => {
   // An older server ignores ik, so re-sending would run the call twice.
-  comet.close();
-  comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
-  await Promise.resolve();
   const first = FakeWS.last;
-  first.open([]);
   const p = comet.call("pay", {}, { idempotent: true });
   first.drop();
-  await assert.rejects(p, (e: unknown) => e instanceof CometError && e.code === "CONNECTION_LOST");
-  const second = await reconnected(first);
+  const second = await nextSocket(first);
+  second.connect();
+  assert.equal(second.of("call").length, 0, "re-sent before welcome");
+  second.recv({ t: "welcome", hb: 25000, user: null, caps: [] });
+  await lostConnection(p);
   assert.equal(second.of("call").length, 0);
+});
+
+test("a retry is rejected when the user changed", async () => {
+  const first = FakeWS.last;
+  const p = comet.call("pay", {}, { idempotent: true });
+  first.drop();
+  const second = await reconnected(first, ["ik"], { id: "bob" });
+  await lostConnection(p);
+  assert.equal(second.of("call").length, 0);
+});
+
+test("an ik call sent before welcome is not retried", async () => {
+  const first = FakeWS.last;
+  first.drop();
+  const second = await nextSocket(first);
+  second.connect();
+  const p = comet.call("pay", {}, { idempotent: true });
+  assert.equal(second.of("call").length, 1);
+  second.drop(); // no welcome: the user it ran as is unknown
+  await lostConnection(p);
+});
+
+test("close() during backoff rejects a held ik call", async () => {
+  const first = FakeWS.last;
+  const p = comet.call("pay", {}, { idempotent: true });
+  first.drop();
+  comet.close();
+  await lostConnection(p);
 });
 
 test("an ik call that got its result is not re-sent", async () => {
@@ -132,4 +171,21 @@ test("close() rejects a pending ik call instead of leaving it pending", async ()
   comet.close();
   first.drop(); // the socket's close event after close()
   await assert.rejects(p, (e: unknown) => e instanceof CometError && e.code === "CONNECTION_LOST");
+});
+
+test("a retry more than an hour after the first send is rejected", async () => {
+  // Past the server's result TTL a retry would run the method again.
+  const first = FakeWS.last;
+  const p = comet.call("pay", {}, { idempotent: true });
+  first.drop();
+  const second = await nextSocket(first);
+  const now = Date.now;
+  Date.now = () => now() + 61 * 60 * 1000;
+  try {
+    second.open();
+  } finally {
+    Date.now = now;
+  }
+  await lostConnection(p);
+  assert.equal(second.of("call").length, 0);
 });

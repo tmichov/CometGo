@@ -3,6 +3,7 @@ package cometgo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -46,28 +47,35 @@ func InstallIdempotency(ctx context.Context, db *pgxpool.Pool) error {
 // reads the stored result; if the first rolls back (handler error), the
 // duplicate's insert succeeds and it runs the handler itself.
 func claimIK(ctx context.Context, tx pgx.Tx, ik, userID, method string) (stored json.RawMessage, err error) {
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO comet_idempotency (ik, user_id, method) VALUES ($1, $2, $3)
-		ON CONFLICT (ik, user_id) DO NOTHING`, ik, userID, method)
-	if err != nil {
-		return nil, err
+	// ON CONFLICT DO NOTHING does not lock the existing row, so TTL cleanup
+	// can delete it before the SELECT. The key has then expired: claim again.
+	for range 2 {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO comet_idempotency (ik, user_id, method) VALUES ($1, $2, $3)
+			ON CONFLICT (ik, user_id) DO NOTHING`, ik, userID, method)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() == 1 {
+			return nil, nil
+		}
+		var storedMethod string
+		var result []byte
+		err = tx.QueryRow(ctx, `
+			SELECT method, result::text FROM comet_idempotency WHERE ik = $1 AND user_id = $2`,
+			ik, userID).Scan(&storedMethod, &result)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if storedMethod != method {
+			return nil, NewError(CodeBadRequest, "idempotency key already used for method "+storedMethod)
+		}
+		return result, nil
 	}
-	if tag.RowsAffected() == 1 {
-		return nil, nil
-	}
-	var storedMethod string
-	var result []byte
-	if err := tx.QueryRow(ctx, `
-		SELECT method, result::text FROM comet_idempotency WHERE ik = $1 AND user_id = $2`,
-		ik, userID).Scan(&storedMethod, &result); err != nil {
-		// pgx.ErrNoRows: the row was deleted by TTL cleanup between the two
-		// statements. Rare enough to surface as an error the client can retry.
-		return nil, err
-	}
-	if storedMethod != method {
-		return nil, NewError(CodeBadRequest, "idempotency key already used for method "+storedMethod)
-	}
-	return result, nil
+	return nil, NewError(CodeConflict, "idempotency key is being cleaned up; retry")
 }
 
 // storeIK records the call's result in the row claimIK inserted, inside the
@@ -82,7 +90,7 @@ func storeIK(ctx context.Context, tx pgx.Tx, ik, userID string, val json.RawMess
 // cleanup interval until ctx is done. It does nothing while the table does
 // not exist, so apps that never call InstallIdempotency see no errors.
 func (a *App) cleanIdempotency(ctx context.Context) {
-	t := time.NewTicker(min(a.cfg.IdempotencyTTL, time.Hour))
+	t := time.NewTicker(cleanupInterval(a.cfg.IdempotencyTTL))
 	defer t.Stop()
 	for {
 		if err := a.deleteExpiredIK(ctx); err != nil && ctx.Err() == nil {
@@ -94,6 +102,11 @@ func (a *App) cleanIdempotency(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// cleanupInterval is hourly, or the TTL when shorter, but never below a minute.
+func cleanupInterval(ttl time.Duration) time.Duration {
+	return max(min(ttl, time.Hour), time.Minute)
 }
 
 func (a *App) deleteExpiredIK(ctx context.Context) error {
