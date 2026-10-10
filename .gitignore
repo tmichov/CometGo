@@ -1,0 +1,16 @@
+# Go
+/bin/
+*.test
+*.out
+coverage.*
+
+# Node / TS client
+node_modules/
+dist/
+
+# Env & editors
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
