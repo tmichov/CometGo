@@ -95,6 +95,14 @@ type unsubReq struct {
 
 type closeReq struct{ c *conn }
 
+// resumeReq unbinds every sub of c not in keep: the client unsubscribed
+// while its unsub was lost in transit (§7.2). The client no longer holds
+// those subs, so no end entry is sent.
+type resumeReq struct {
+	c    *conn
+	keep map[uint64]bool
+}
+
 // rebindReq re-binds every sub of c to ident, and sends after once the
 // resulting tx is enqueued (PROTOCOL.md §3.2).
 type rebindReq struct {
@@ -381,6 +389,14 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			e.detach(sub)
 		}
 		delete(e.conns, r.c)
+
+	case resumeReq:
+		for s, sub := range e.conns[r.c] {
+			if !r.keep[s] {
+				e.detach(sub)
+				delete(e.conns[r.c], s)
+			}
+		}
 
 	case rebindReq:
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.

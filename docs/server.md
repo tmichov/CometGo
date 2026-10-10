@@ -47,6 +47,8 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `MaxInflight int` | 32 | Concurrent method calls per connection. A call over the limit gets `RATE_LIMITED` with `retryAfterMs: 100`. |
 | `MaxMsg int` | 1 MiB | Largest message the server accepts from a client. A larger message closes the connection. |
 | `MaxRows int` | 10,000 | Row cap per publication result. A larger result ends its subscriptions with `RESULT_TOO_LARGE`. |
+| `ResumeGrace` | 60s | How long a session outlives a lost connection, waiting for the client to resume it ([protocol §7.2](protocol.md#72-session-resume)). Unlike the other durations, a **negative** value disables resume, and clients then resync on every reconnect. See [Session resume](#session-resume). |
+| `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay. A disconnected session that outgrows it ends, and its client resyncs. |
 | `Logger *slog.Logger` | `slog.Default()` | Where the framework logs, including the details of `INTERNAL` errors. |
 
 `MaxSubs`, `MaxInflight` and `MaxMsg` are also advertised to the client in `welcome.limits`.
@@ -158,7 +160,7 @@ Writes through another connection (the pool passed as `Config.DB`, or any other 
 Other details:
 
 - Calls on one connection run concurrently, up to `Config.MaxInflight`. A client that needs two calls in order should await the first.
-- `c.Context` is **not** cancelled when the client disconnects. A call that has started runs to completion and commits or rolls back on its own; the client reports `CONNECTION_LOST` because it cannot know which.
+- `c.Context` is **not** cancelled when the client disconnects. A call that has started runs to completion and commits or rolls back on its own. If the client resumes its session, it gets the result; otherwise it reports `CONNECTION_LOST`, because it cannot know which happened.
 - A client can send a call with `noFence`, which commits without the fence and returns as soon as the transaction commits. Use it for calls that do not write.
 - An unknown method name returns `NOT_FOUND`.
 
@@ -247,6 +249,23 @@ Called with the upgrade request, so it can read session cookies. Its result is u
 ### Expiry: `Identity.ExpiresAt`
 
 If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The client should call `setToken` with a fresh token before then. Proactive refresh by the client library and the HTTP refresh endpoint are *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
+
+## Session resume
+
+A client that loses its connection briefly (a network blip, a laptop waking up) resumes its session instead of starting over. The server keeps the session for `Config.ResumeGrace` after the socket drops: subscriptions stay bound, running calls finish, and everything that would have been sent is kept in a replay buffer of up to `Config.ResumeBuffer` bytes. When the client reconnects in time, it gets exactly the messages it missed: no snapshots are re-sent, and no call result is lost.
+
+The session is not resumed, and the client falls back to a full resync, when:
+
+- the server restarted,
+- the grace window passed,
+- the buffer overflowed while the client was away,
+- the reconnecting client authenticates as a different user than the session's.
+
+A token refresh for the same user is fine. A protocol error closes the connection and ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable.
+
+**Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node (sticky sessions, e.g. by cookie or client IP). Without sticky routing everything still works, but a reconnect that lands on another node resyncs.
+
+Memory cost: each disconnected session holds its subscriptions plus at most `ResumeBuffer` bytes for up to `ResumeGrace`. Connected sessions hold the unacknowledged tail, usually about one second of output. Set `ResumeGrace` negative to turn resume off.
 
 ## InstallTriggers
 

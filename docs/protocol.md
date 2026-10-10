@@ -30,7 +30,7 @@ Each observer:
 - is re-run at most once per tick, however many connections use it,
 - has its diff fanned out to every subscription bound to it.
 
-Per-connection server state is only `subId → observer`, plus the outbound queue. There is no per-connection document cache (no DDP-style mergebox).
+Per-connection server state is only `subId → observer`, plus the outbound queue and, with session resume, a bounded replay buffer (§7.2). There is no per-connection document cache (no DDP-style mergebox).
 
 ## 1. Transport
 
@@ -52,7 +52,8 @@ Per-connection server state is only `subId → observer`, plus the outbound queu
 - `seq` gives one total order per connection across data, method results and auth results.
 - `ping`, `pong` and `ack` carry no `seq`.
 - Client→server messages carry no sequence numbers.
-- In v1-core, `seq` is informational. **[later]** session resume uses it: the client acks `seq` and the server replays messages after the last ack (§7.2).
+- Session resume uses it: the client acks `seq` and the server replays messages after the last ack (§7.2). Without resume, `seq` is informational.
+- All parts of a split `tx` (§4.3) carry the same `seq`. A client counts that `seq` as received only once the final part has arrived.
 
 ## 3. Handshake and auth
 
@@ -241,39 +242,55 @@ In v1-core, ticks are sequential and every dirty observer runs in each tick, so 
 
 ### 7.1 Resync (v1-core)
 
-Any lost connection in v1-core leads to a resync:
+A lost connection leads to a resync when session resume (§7.2) is not available or fails:
 
 1. The client reconnects with exponential backoff and full jitter (base 500 ms, cap 30 s). It reconnects immediately on the `online` and `visibilitychange` events.
 2. It sends `hello`, then re-sends `sub` for every active subscription with the **same `s`** and `"have":true`.
 3. The server answers with `reset:true` entries. The client diffs and swaps at `ready` (§4.4), with no flicker.
 4. Calls in flight without a `res` are rejected locally with `CONNECTION_LOST`, meaning "outcome unknown". They are **never** re-executed blindly. **[later]** Calls carrying `ik` are resent safely.
 
-### 7.2 [later] Session resume
+### 7.2 Session resume
 
-When the same node, the same `epoch` and a grace window (default 60 s) all still apply:
+Resume makes a short drop invisible: no snapshot is re-sent, and calls in flight are not lost. It applies when the same node, the same `epoch` and a grace window (default 60 s) all still hold.
+
+**Negotiation.** The client sends `"caps":["resume"]` in `hello`; the server advertises `"caps":["resume"]` in `welcome`. The server keeps a session resumable only when both did. A client without the cap gets the v1-core behaviour and never needs to ack.
 
 **Client acks.**
-- The client acks with `{"t":"ack","seq":N}`, about every 1 s or 64 KiB, piggybacked on heartbeats where possible.
-- The server keeps a replay buffer of the serialized messages after the last ack, at most 1 MiB.
-- While the client is disconnected, observers stay bound and output keeps accumulating in that buffer.
+- The client acks with `{"t":"ack","seq":N}`, about every 1 s or 64 KiB, piggybacked on its liveness check. `N` is the last `seq` it has fully received.
+- An ack for a `seq` not yet sent, or not above the previous ack, is ignored.
+- The server keeps a replay buffer of the serialized stateful messages (`tx`, `res`, `authRes`) after the last ack, at most 1 MiB by default.
+- If the buffer overflows while the client is connected, the oldest messages are dropped. A resume to a `seq` below the dropped ones is impossible, and becomes possible again once the client acks past them.
+- When the socket is lost, the session is kept for the grace window. Observers stay bound, output keeps accumulating in the buffer, and in-flight calls and token expiry keep running. If the buffer overflows while the client is disconnected, the session ends at once.
 
 **Resume request.**
 
 ```json
-→ {"t":"hello","v":1,"auth":{…},"resume":{"session":"s_9fK2…","seq":1841,"subs":[7,9]}}
+→ {"t":"hello","v":1,"caps":["resume"],"auth":{…},"resume":{"session":"s_9fK2…","seq":1841,"subs":[7,9]}}
 ```
 
+`seq` is the last `seq` the client fully received, and `subs` lists every sub id it still holds.
+
+**Validity.** The resume succeeds only if all of these hold:
+- the session exists on this node and has not ended,
+- `seq` is not below the last ack or the overflow point, and not above the last `seq` sent,
+- the `hello` authenticates the same principal (same user ID, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
+
 **The server, on a valid resume:**
-- Replays the buffered messages with `seq > 1841` and answers `welcome{resumed:true}`.
-- Ends any bound sub not listed in `subs`. This covers unsubs lost in transit.
+- Answers `welcome{resumed:true}` with the same `session`, then replays the buffered messages with `seq > 1841`, in order, before anything new. The resume `seq` also counts as an ack.
+- If a previous socket of the session is still open (the client saw it die before the server did), closes it.
+- Unbinds any bound sub not listed in `subs`. This covers unsubs lost in transit. No `end` is sent, because the client no longer holds those subs.
 - Treats re-sent `sub` messages as no-ops (§4.1).
 - Deduplicates re-sent `call`/`auth` messages by `id`:
-  - if the call is still running, it is ignored,
+  - if the call is still running, it is ignored, and its `res` arrives when it finishes,
   - if it already completed, its `res` is already in the replay.
 
-**Fallback.** If the session is gone (restart, different node, expired grace window, replay overflow), the server answers `resumed:false` and the client falls back to §7.1.
+The client re-sends its subs pipelined after `hello`, as in §7.1, but holds calls and auths sent before the drop until `welcome` arrives. It re-sends them with their original ids only on `resumed:true`. On `resumed:false` it rejects them with `CONNECTION_LOST`.
 
-**Multi-node.** Resume requires sticky routing.
+**Fallback.** If the session is gone (restart, different node, expired grace window, replay overflow), the `seq` is out of range, or the principal differs, the server answers `resumed:false` with a new `session`, and the client falls back to §7.1. A failed resume ends the old session, because its owner has given up on it.
+
+An identity change during the gap is part of the replay. For example, a token that expires while the client is away produces the usual reset `tx` and `authRes{AUTH_EXPIRED}` (§3.2). The session is then anonymous, so only an anonymous `hello` can resume it.
+
+**Multi-node.** Sessions live in one node's memory, so resume requires sticky routing: the reconnect must reach the node that served the session. A reconnect that lands on another node gets `resumed:false` and resyncs, which is correct, just more expensive.
 
 ### 7.3 Server shutdown
 
@@ -413,7 +430,7 @@ Every node receives every fence and ignores the tokens it does not own.
 
 **v1-core** (Go server + TypeScript client + todo demo):
 - **Connection:** subprotocol `cometgo.1.json`; `hello`/`welcome` (token or cookie auth, `epoch`, `build`); `ping`/`pong`; error shapes and close codes.
-- **Subscriptions:** `sub`/`unsub`/`have`; `tx` with `init`/`ops`/`reset`/`ready`/`end`/`more`; resync on every reconnect.
+- **Subscriptions:** `sub`/`unsub`/`have`; `tx` with `init`/`ops`/`reset`/`ready`/`end`/`more`; resync on reconnect.
 - **Methods:** `call`/`res` with the fence and `lag`; `CONNECTION_LOST`; `maxInflight`.
 - **Auth:** `auth`/`authRes`, with identity change implemented as reset of all subs in one `tx`.
 - **Server engine:**
@@ -425,8 +442,11 @@ Every node receives every fence and ignores the tokens it does not own.
 - **Types:** `i4 i8 f8 num bool text enum uuid tstz date json bytes []<code>`.
 - **Backpressure:** hard limit only (4429).
 
+**Implemented since v1-core**, behind `caps`:
+- **Reconnect:** session resume (`seq`/`ack`/replay, §7.2).
+
 **[later]**, all additive and behind `caps`:
-- **Reconnect:** session resume (`seq`/`ack`/replay); `goaway`; `ik` idempotency.
+- **Reconnect:** `goaway`; `ik` idempotency.
 - **Engine and transport:**
   - coalesce→reset backpressure
   - slow-observer detachment and parallel ticks with an exported snapshot
@@ -451,7 +471,7 @@ Every node receives every fence and ignores the tokens it does not own.
 2. Half-applied multi-row updates are replaced by atomic per-snapshot `tx` messages.
 3. Separate `result` and `updated` messages are replaced by one `res`, ordered after its data.
 4. Blind method replay on reconnect is replaced by `CONNECTION_LOST` and idempotency keys.
-5. Resubscribe-with-flicker is replaced by diff-based `reset` and **[later]** seq/ack resume.
+5. Resubscribe-with-flicker is replaced by diff-based `reset` and seq/ack resume.
 6. EJSON per-value tagging, which had no int64 or decimal story, is replaced by column type descriptors.
 7. Client-side re-sorting with the wrong collation is replaced by server positions.
 8. Login as a method with non-atomic sub reruns is replaced by first-class `auth` with an atomic rebind.
