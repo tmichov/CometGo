@@ -96,8 +96,9 @@ type conn struct {
 	// ids maps call/auth ids seen to the seq of their res (0 while running),
 	// to deduplicate re-sent calls after resume. Pruned by ack.
 	ids map[uint64]uint64
-	// running maps the ids of calls in their handler phase to their cancel,
-	// for the client's cancel message (§5).
+	// running maps the ids of calls still running to their cancel, for the
+	// client's cancel message (§5). An entry stays until the res is sent, but
+	// a cancel takes effect only before the handler returns.
 	running map[uint64]*runningCall
 
 	authMu   sync.Mutex // serializes identity changes
@@ -488,24 +489,33 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 			s.fail(closeProtocol, "PROTOCOL", "call requires id and m")
 			return
 		}
-		if !c.firstSeen(*msg.ID) {
-			return
-		}
 		if int(c.inflight.Add(1)) > c.a.cfg.MaxInflight {
 			c.inflight.Add(-1)
-			c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
+			if c.firstSeen(*msg.ID) {
+				c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
+			}
 			return
 		}
 		// The method outlives a dropped connection: its outcome is decided
 		// server-side either way. Only the client's cancel stops it.
 		hctx, cancel := context.WithCancel(context.WithoutCancel(c.ctx))
 		r := &runningCall{cancel: cancel}
+		// Dedupe and registration happen together: after a resume, the
+		// re-sent copy of a call is dropped only once the original is
+		// registered, so a cancel right behind it always finds it.
 		c.mu.Lock()
-		if c.running == nil {
-			c.running = map[uint64]*runningCall{}
+		first := c.firstSeenLocked(*msg.ID)
+		if first {
+			if c.running == nil {
+				c.running = map[uint64]*runningCall{}
+			}
+			c.running[*msg.ID] = r
 		}
-		c.running[*msg.ID] = r
 		c.mu.Unlock()
+		if !first {
+			c.inflight.Add(-1)
+			return
+		}
 		go c.call(msg, c.identity(), hctx, r)
 	case "cancel":
 		// Unknown or finished ids are ignored: the res is sent or on its way.
@@ -550,6 +560,11 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 func (c *conn) firstSeen(id uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.firstSeenLocked(id)
+}
+
+// firstSeenLocked is firstSeen with c.mu held.
+func (c *conn) firstSeenLocked(id uint64) bool {
 	if c.ids == nil {
 		return true
 	}
@@ -613,7 +628,9 @@ func (c *conn) call(msg *clientMsg, ident *Identity, hctx context.Context, r *ru
 			delete(c.running, id)
 		}
 		c.mu.Unlock()
-		r.cancel()
+		// r.cancel is not called: c.Context is cancelled only by the
+		// client's cancel, so work a handler started with it survives the
+		// call (hctx's parent never cancels, so nothing leaks).
 	}()
 	val, lag, err := c.runCall(msg, ident, hctx)
 	res := &resMsg{T: "res", ID: id, OK: err == nil, Val: val, Lag: lag}
@@ -631,6 +648,9 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		return nil, false, NewError(CodeNotFound, "unknown method "+msg.M)
 	}
 	ctx := context.WithoutCancel(hctx)
+	if hctx.Err() != nil {
+		return nil, false, NewError(CodeCanceled, "call canceled") // before it started
+	}
 	tx, err := c.a.db.Begin(ctx)
 	if err != nil {
 		return nil, false, err
@@ -648,7 +668,9 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	// A cancel that arrived before this point rolls back, whatever the
 	// handler returned: its queries may have been interrupted, and the
 	// client asked for it before anything committed. A cancel after this
-	// point is too late; the real result is sent (§5).
+	// point is too late; the real result is sent (§5). A query the handler
+	// ran with hctx was stopped in Postgres too: pgx answers a cancelled
+	// context by closing the connection and sending a cancel request.
 	if hctx.Err() != nil {
 		return nil, false, NewError(CodeCanceled, "call canceled")
 	}

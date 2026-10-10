@@ -122,3 +122,17 @@ test("a call aborted while held for a resume is re-sent and then cancelled", asy
   next.recv({ t: "res", seq: 1, id, ok: false, err: { code: "CANCELED" } });
   await assert.rejects(p, isCode("CANCELED"));
 });
+
+test("a call aborted while held gets CONNECTION_LOST if the resume fails", async () => {
+  const ws = await start();
+  const ac = new AbortController();
+  const p = comet.call("m", {}, { signal: ac.signal });
+  ws.drop();
+  ac.abort();
+  while (FakeWS.all.length === 1) await new Promise((r) => setTimeout(r, 10));
+  const next = FakeWS.all[1];
+  next.open();
+  next.recv({ ...welcome, session: "s_2", resumed: false });
+  await assert.rejects(p, isCode("CONNECTION_LOST"));
+  assert.equal(next.of("call").length + next.of("cancel").length, 0);
+});

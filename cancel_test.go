@@ -33,6 +33,46 @@ func TestCancelDuringSleepRollsBack(t *testing.T) {
 	if n := e.rowsNamed(t, "slow"); n != 0 {
 		t.Fatalf("%d rows visible after cancel, want 0", n)
 	}
+	// The backend stopped too (pgx sends a cancel request when it drops a
+	// connection over a cancelled context): nothing still sleeps or holds
+	// the table's locks.
+	deadline := time.Now().Add(time.Second)
+	for {
+		var n int
+		if err := e.pool.QueryRow(context.Background(),
+			"SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE 'SELECT pg_sleep%'").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the cancelled query is still running in Postgres")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestContextOutlivesAFinishedCall(t *testing.T) {
+	// c.Context is cancelled only by the client's cancel, not when the call ends.
+	e := setup(t)
+	got := make(chan error, 1)
+	Method(e.app, "keepCtx", func(c *Call, _ struct{}) (struct{}, error) {
+		ctx := c.Context
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			got <- ctx.Err()
+		}()
+		return struct{}{}, nil
+	})
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "call", "id": 1, "m": "keepCtx"})
+	if r := a.next(); r["t"] != "res" || r["ok"] != true {
+		t.Fatalf("res %v", r)
+	}
+	if err := <-got; err != nil {
+		t.Fatalf("c.Context after the call: %v, want nil", err)
+	}
 }
 
 func TestCancelRacingCommitNeverMismatches(t *testing.T) {
