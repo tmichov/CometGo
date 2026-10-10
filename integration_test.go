@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,8 @@ type testEnv struct {
 	srv   *httptest.Server
 	pool  *pgxpool.Pool
 	table string
+	// slowRuns counts executions of the "slowAdd" method.
+	slowRuns atomic.Int32
 }
 
 func setup(t *testing.T) *testEnv {
@@ -46,6 +49,10 @@ func setup(t *testing.T) *testEnv {
 	if err := InstallTriggers(ctx, pool, table); err != nil {
 		t.Fatal(err)
 	}
+	if err := InstallIdempotency(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	env := &testEnv{pool: pool, table: table}
 
 	app := New(Config{
 		DB:              pool,
@@ -83,10 +90,53 @@ func setup(t *testing.T) *testEnv {
 		_, err := c.Tx.Exec(c.Context, "UPDATE "+table+" SET n = n + 1 WHERE id = $1::int8", a.ID)
 		return struct{}{}, err
 	})
+	// slowAdd holds its transaction open long enough for a concurrent
+	// duplicate to arrive while it runs.
+	Method(app, "slowAdd", func(c *Call, a addArgs) (string, error) {
+		env.slowRuns.Add(1)
+		if a.Name == "" {
+			time.Sleep(300 * time.Millisecond)
+			return "", ValidationError(map[string]string{"name": "required"})
+		}
+		var id string
+		err := c.Tx.QueryRow(c.Context, "INSERT INTO "+table+" (owner, name) VALUES ($1, $2) RETURNING id::text", a.Owner, a.Name).Scan(&id)
+		time.Sleep(300 * time.Millisecond)
+		return id, err
+	})
+	var started time.Time
+	if err := pool.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&started); err != nil {
+		t.Fatal(err)
+	}
 	app.Start(ctx)
+	waitListening(t, pool, started)
 	srv := httptest.NewServer(app)
 	t.Cleanup(srv.Close)
-	return &testEnv{app: app, srv: srv, pool: pool, table: table}
+	env.app, env.srv = app, srv
+	return env
+}
+
+// waitListening waits for the app's LISTEN connection, opened after started.
+// A fence notified before it is up is lost, and the call would wait out
+// FenceTimeout (CMTG-13).
+func waitListening(t *testing.T, pool *pgxpool.Pool, started time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var n int
+		err := pool.QueryRow(context.Background(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE query = 'LISTEN comet' AND backend_start >= $1`, started).Scan(&n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("listener did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 type client struct {

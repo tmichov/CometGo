@@ -104,6 +104,7 @@ const { value, lag } = await comet.callWithStatus("todos.add", { title: "Ship v1
 - **Read-your-writes.** The promise resolves only after the method's writes are reflected in this client's subscriptions, so the UI is already up to date when `await` returns.
 - **`lag`.** If the writes did not arrive within the server's `FenceTimeout` (5 s by default), the call still resolves, with `lag: true` from `callWithStatus`. `call` resolves the same way but does not report it.
 - **`{ noFence: true }`** skips that wait. Use it for calls that do not write.
+- **`{ idempotent: true }`** attaches a generated idempotency key, so the call survives a disconnect: instead of failing with `CONNECTION_LOST`, it is re-sent on the next connection, and the server runs the method at most once (see [Server: Idempotency keys](server.md#idempotency-keys)). Use it for writes that must not happen twice. **`{ ik: "..." }`** passes a key of your own instead, e.g. one stored with a form so a retry after a page reload is also deduplicated.
 - **Errors.** A failed call rejects with a `CometError` carrying the server's code (see below).
 - **Before the connection is open,** calls are queued and sent when it opens.
 
@@ -138,7 +139,7 @@ class CometError extends Error {
 
 | Code | Meaning |
 |---|---|
-| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived. The outcome is **unknown**: the method may or may not have committed. The client never re-sends it. Retry only if the method is safe to run twice. |
+| `CONNECTION_LOST` | The connection dropped after the call (or `setToken`) was sent and before its result arrived. The outcome is **unknown**: the method may or may not have committed. The client never re-sends it. Retry only if the method is safe to run twice. A call made with `idempotent` or `ik` gets this only from a server that does not support idempotency keys, or after `close()`. |
 | `VALIDATION` | `details.fields` maps field names to messages. |
 | `RATE_LIMITED` | Too many calls in flight; `retryAfterMs` says when to retry. |
 | `INTERNAL` | A server bug. `details.ref` matches a line in the server log. |
@@ -159,7 +160,7 @@ The client reconnects by itself:
 - **Backoff.** Exponential with full jitter, starting at 500 ms and capped at 30 s, reset after a successful connection. In a browser it also retries immediately on the `online` event and when the tab becomes visible.
 - **Liveness.** If nothing arrives for the server's heartbeat interval (25 s by default), the client sends a ping. After the heartbeat interval plus 10 s of silence, it closes the connection (code 4408) and reconnects.
 - **Subscriptions** survive. On reconnect each is re-sent; the server sends a fresh snapshot, and the client swaps it in only once it is complete. Unchanged rows keep their objects, so the UI does not flicker. While this happens, `status` is `"resyncing"`.
-- **Calls** that were queued but never sent go out on the new connection. Calls that were sent and had no result yet are rejected with `CONNECTION_LOST`.
+- **Calls** that were queued but never sent go out on the new connection. Calls that were sent and had no result yet are rejected with `CONNECTION_LOST`, except calls made with `idempotent` or `ik`: those are re-sent with the same key and resolve normally. They are re-sent under whatever identity the new connection has, so a key is deduplicated only while the user stays the same.
 
 Session resume (replaying missed messages instead of resyncing) is *planned* ([protocol §7.2](protocol.md#72-later-session-resume)).
 

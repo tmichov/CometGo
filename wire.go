@@ -28,8 +28,9 @@ type clientMsg struct {
 	Have bool            `json:"have"`
 
 	// call
-	M       string `json:"m"`
-	NoFence bool   `json:"noFence"`
+	M       string  `json:"m"`
+	NoFence bool    `json:"noFence"`
+	IK      *string `json:"ik"`
 
 	// ping
 	N json.RawMessage `json:"n"`

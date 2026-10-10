@@ -33,6 +33,20 @@ export interface ConnectOptions {
   WebSocket?: typeof WebSocket;
 }
 
+export interface CallOptions {
+  /** Skip the read-your-writes fence (§6.2); for calls that do not write. */
+  noFence?: boolean;
+  /**
+   * Attach a generated idempotency key (§5), so the call is re-sent after a
+   * disconnect instead of failing with CONNECTION_LOST. The server runs the
+   * method at most once per key and user, and returns the stored result to
+   * a retry. Use it for calls that must not run twice.
+   */
+  idempotent?: boolean;
+  /** An idempotency key of your own (implies idempotent), for retries across page loads. */
+  ik?: string;
+}
+
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 export type SubStatus = "loading" | "ready" | "resyncing" | "ended";
 
@@ -50,6 +64,7 @@ interface PendingCall {
   m: string;
   args: unknown;
   noFence: boolean;
+  ik?: string;
   sent: boolean;
   resolve: (r: { value: unknown; lag: boolean }) => void;
   reject: (e: CometError) => void;
@@ -79,6 +94,8 @@ export class Comet {
   #lastRecv = 0;
   #pinged = false;
   #closed = false;
+  /** Whether the last welcome advertised the "ik" cap, so ik calls may be re-sent. */
+  #canRetryIK = false;
   #reconnectTimer?: ReturnType<typeof setTimeout>;
   #hbTimer?: ReturnType<typeof setInterval>;
   #statusListeners = new Set<() => void>();
@@ -109,18 +126,19 @@ export class Comet {
   }
 
   /** Calls a server method. Resolves after its effects are in the store (§6.2). */
-  async call<R = unknown>(m: string, args?: unknown, opts: { noFence?: boolean } = {}): Promise<R> {
+  async call<R = unknown>(m: string, args?: unknown, opts: CallOptions = {}): Promise<R> {
     return (await this.callWithStatus<R>(m, args, opts)).value;
   }
 
   /** Like call, but also reports lag: true when the fence timed out. */
-  callWithStatus<R = unknown>(m: string, args?: unknown, opts: { noFence?: boolean } = {}): Promise<{ value: R; lag: boolean }> {
+  callWithStatus<R = unknown>(m: string, args?: unknown, opts: CallOptions = {}): Promise<{ value: R; lag: boolean }> {
     return new Promise((resolve, reject) => {
       const c: PendingCall = {
         id: this.#nextId++,
         m,
         args,
         noFence: !!opts.noFence,
+        ik: opts.ik ?? (opts.idempotent ? uuid() : undefined),
         sent: false,
         resolve: resolve as PendingCall["resolve"],
         reject,
@@ -180,7 +198,7 @@ export class Comet {
     ws.onopen = () => {
       // Pipelined handshake (§3.1): no need to wait for welcome.
       this.#lastRecv = Date.now();
-      this.#send({ t: "hello", v: 1, caps: [], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}) });
+      this.#send({ t: "hello", v: 1, caps: ["ik"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}) });
       for (const sub of this.#subs.values()) this.#sendSub(sub);
       for (const c of this.#calls.values()) if (!c.sent) this.#sendCall(c);
     };
@@ -204,9 +222,18 @@ export class Comet {
   #onDisconnect(code: number, reason: string): void {
     this.#ws = undefined;
     this.#txParts = [];
-    // Calls that reached the server have an unknown outcome: never replay them (§7.1).
+    // Calls that reached the server have an unknown outcome: never replay them
+    // (§7.1), unless they carry an idempotency key. Those are re-sent on the
+    // next connection, and the server answers with the stored result if the
+    // first attempt committed. That needs a server that advertised the "ik"
+    // cap: an older one ignores the key and would run the call twice. After
+    // close() there is no next connection.
+    const retryIK = this.#canRetryIK && !this.#closed;
+    this.#canRetryIK = false;
     for (const c of [...this.#calls.values()]) {
-      if (c.sent) {
+      if (c.ik !== undefined && retryIK) {
+        c.sent = false;
+      } else if (c.sent) {
         this.#calls.delete(c.id);
         c.reject(new CometError({ code: "CONNECTION_LOST", msg: "connection lost; outcome unknown" }));
       }
@@ -249,7 +276,7 @@ export class Comet {
 
   #sendCall(c: PendingCall): void {
     c.sent = true;
-    this.#send({ t: "call", id: c.id, m: c.m, args: c.args ?? null, ...(c.noFence ? { noFence: true } : {}) });
+    this.#send({ t: "call", id: c.id, m: c.m, args: c.args ?? null, ...(c.noFence ? { noFence: true } : {}), ...(c.ik !== undefined ? { ik: c.ik } : {}) });
   }
 
   #setStatus(s: ConnectionStatus): void {
@@ -269,6 +296,7 @@ export class Comet {
         this.#hb = msg.hb ?? this.#hb;
         this.user = msg.user ?? null;
         this.serverBuild = msg.build;
+        this.#canRetryIK = Array.isArray(msg.caps) && msg.caps.includes("ik");
         this.status = "connected";
         this.#emit();
         return;
@@ -448,6 +476,15 @@ export class Subscription<T> {
 async function resolveToken(t: TokenSource | undefined): Promise<string | null> {
   if (typeof t === "function") return (await t()) ?? null;
   return t ?? null;
+}
+
+// A random (v4) UUID. crypto.randomUUID needs a secure context; getRandomValues does not.
+function uuid(): string {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6]! & 0x0f) | 0x40;
+  b[8] = (b[8]! & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 function defaultUrl(): string {

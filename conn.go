@@ -220,11 +220,17 @@ func (c *conn) hello(msg *clientMsg) bool {
 	}
 	c.setIdentity(ident)
 	cfg := c.a.cfg
+	// The server honours ik whether or not it was negotiated; the cap tells
+	// the client it may re-send ik calls after a disconnect.
+	caps := []string{}
+	if slices.Contains(msg.Caps, capIK) {
+		caps = append(caps, capIK)
+	}
 	c.send(&welcomeMsg{
 		T: "welcome", Session: c.session, Epoch: c.a.epoch,
 		HB: cfg.Heartbeat.Milliseconds(), User: ident.wireUser(), AuthExp: ident.authExp(),
 		Limits: limitsMsg{MaxSubs: cfg.MaxSubs, MaxInflight: cfg.MaxInflight, MaxMsg: cfg.MaxMsg},
-		Build:  cfg.Build, Caps: []string{},
+		Build:  cfg.Build, Caps: caps,
 	})
 	if authErr != nil {
 		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
@@ -332,8 +338,13 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 	if m == nil {
 		return nil, false, NewError(CodeNotFound, "unknown method "+msg.M)
 	}
+	ik := msg.IK
+	if ik != nil && (*ik == "" || len(*ik) > maxIKLen) {
+		return nil, false, NewError(CodeBadRequest, "ik must be a non-empty string of at most 128 bytes")
+	}
 	// The method outlives a dropped connection: its outcome is decided
-	// server-side either way, and the client reports CONNECTION_LOST.
+	// server-side either way, and the client reports CONNECTION_LOST
+	// (or, for a call with ik, re-sends it and gets the stored result).
 	ctx := context.WithoutCancel(c.ctx)
 	tx, err := c.a.db.Begin(ctx)
 	if err != nil {
@@ -341,20 +352,41 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity) (val json.RawMessage, la
 	}
 	defer tx.Rollback(context.Background())
 
-	result, err := func() (r any, err error) {
-		defer func() {
-			if p := recover(); p != nil {
-				err = fmt.Errorf("panic: %v", p)
-			}
+	// With ik, a stored result from an earlier call by the same user is
+	// returned without running the handler. The claim row commits atomically
+	// with the handler's writes, or rolls back with them on error.
+	var stored json.RawMessage
+	if ik != nil {
+		if stored, err = claimIK(ctx, tx, *ik, ident.userID(), msg.M); err != nil {
+			return nil, false, err
+		}
+	}
+	if stored != nil {
+		val = stored
+	} else {
+		result, err := func() (r any, err error) {
+			defer func() {
+				if p := recover(); p != nil {
+					err = fmt.Errorf("panic: %v", p)
+				}
+			}()
+			return m.run(&Call{Context: ctx, Identity: ident, Tx: tx}, msg.Args)
 		}()
-		return m.run(&Call{Context: ctx, Identity: ident, Tx: tx}, msg.Args)
-	}()
-	if err != nil {
-		return nil, false, err
+		if err != nil {
+			return nil, false, err
+		}
+		if val, err = json.Marshal(result); err != nil {
+			return nil, false, err
+		}
+		if ik != nil {
+			if err := storeIK(ctx, tx, *ik, ident.userID(), val); err != nil {
+				return nil, false, err
+			}
+		}
 	}
-	if val, err = json.Marshal(result); err != nil {
-		return nil, false, err
-	}
+	// A replayed result goes through the same commit and fence as a first
+	// run, so it too resolves only once this connection's subscriptions
+	// reflect the original writes.
 
 	if msg.NoFence {
 		return val, false, tx.Commit(ctx)

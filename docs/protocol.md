@@ -190,9 +190,12 @@ Resets are used for reconnect resync, identity change and **[later]** slow-consu
 - **Concurrency.** Calls run concurrently, up to `limits.maxInflight`. A caller that needs ordering awaits. Calls beyond the limit get `RATE_LIMITED` with `retryAfterMs`.
 - **Exactly one `res` per `id`.**
 - **`"noFence":true`** skips the read-your-writes fence (§6.2). Use it for latency-sensitive calls that do not write.
-- **[later] `"ik":"<uuid>"` idempotency key.**
-  - The framework writes `(ik, userId, result)` to `comet_idempotency` inside the method's own transaction.
-  - A retry with the same `ik` returns the stored result instead of executing again.
+- **`"ik":"<uuid>"` idempotency key.** Negotiated with the `ik` cap: the client offers `"caps":["ik"]` in `hello`, and a server that supports keys includes `"ik"` in `welcome.caps`.
+  - The framework writes `(ik, userId, method, result)` to `comet_idempotency` inside the method's own transaction, so the record commits atomically with the method's effects.
+  - A retry with the same `ik` from the same user returns the stored result instead of executing again. Its `res` is fenced like any call's.
+  - A duplicate that arrives while the first is still running waits for its outcome; the handler runs once.
+  - A failed call stores nothing. The same `ik` for a different method is `BAD_REQUEST`. `ik` must be a non-empty string of at most 128 bytes.
+  - Stored results expire after a server-configured TTL (default 24 h).
 - **[later] cancel.** `{"t":"cancel","id":12}` cancels the method's Go `context`. The server still sends exactly one `res`: either `CANCELED`, or the real result if the method had already committed. Cancel does **not** imply rollback.
 
 ## 6. Consistency guarantees
@@ -246,7 +249,7 @@ Any lost connection in v1-core leads to a resync:
 1. The client reconnects with exponential backoff and full jitter (base 500 ms, cap 30 s). It reconnects immediately on the `online` and `visibilitychange` events.
 2. It sends `hello`, then re-sends `sub` for every active subscription with the **same `s`** and `"have":true`.
 3. The server answers with `reset:true` entries. The client diffs and swaps at `ready` (§4.4), with no flicker.
-4. Calls in flight without a `res` are rejected locally with `CONNECTION_LOST`, meaning "outcome unknown". They are **never** re-executed blindly. **[later]** Calls carrying `ik` are resent safely.
+4. Calls in flight without a `res` are rejected locally with `CONNECTION_LOST`, meaning "outcome unknown". They are **never** re-executed blindly. Calls carrying `ik` are resent on the new connection, with the same `ik`, when the last `welcome` advertised the `ik` cap (§5).
 
 ### 7.2 [later] Session resume
 
@@ -414,7 +417,7 @@ Every node receives every fence and ignores the tokens it does not own.
 **v1-core** (Go server + TypeScript client + todo demo):
 - **Connection:** subprotocol `cometgo.1.json`; `hello`/`welcome` (token or cookie auth, `epoch`, `build`); `ping`/`pong`; error shapes and close codes.
 - **Subscriptions:** `sub`/`unsub`/`have`; `tx` with `init`/`ops`/`reset`/`ready`/`end`/`more`; resync on every reconnect.
-- **Methods:** `call`/`res` with the fence and `lag`; `CONNECTION_LOST`; `maxInflight`.
+- **Methods:** `call`/`res` with the fence and `lag`; `CONNECTION_LOST`; `maxInflight`; `ik` idempotency keys (cap `ik`).
 - **Auth:** `auth`/`authRes`, with identity change implemented as reset of all subs in one `tx`.
 - **Server engine:**
   - shared observers keyed by `(pub, args, scopeKey)`
@@ -426,7 +429,7 @@ Every node receives every fence and ignores the tokens it does not own.
 - **Backpressure:** hard limit only (4429).
 
 **[later]**, all additive and behind `caps`:
-- **Reconnect:** session resume (`seq`/`ack`/replay); `goaway`; `ik` idempotency.
+- **Reconnect:** session resume (`seq`/`ack`/replay); `goaway`.
 - **Engine and transport:**
   - coalesce→reset backpressure
   - slow-observer detachment and parallel ticks with an exported snapshot
