@@ -139,7 +139,7 @@ func parseEvt(payload string) (*evtNote, bool) {
 }
 
 // deliverEvents sends each event to every sub of its observer whose client
-// negotiated the evt cap. It runs after the tick's tx is enqueued and before
+// negotiated the evt cap, except on coalescing connections. It runs after the tick's tx is enqueued and before
 // its fences are released, so an event follows the data committed before it
 // and precedes the res of the call that emitted it.
 func (e *engine) deliverEvents(evts []*evtNote) {
@@ -149,7 +149,10 @@ func (e *engine) deliverEvents(evts []*evtNote) {
 			continue // nobody subscribed: at-most-once means dropped
 		}
 		for _, sub := range obs.sortedSubs() {
-			if sub.c.evt {
+			// A coalescing connection (§8.1) gets no events: a held sub is
+			// behind the data the event follows, and queueing them would
+			// grow its memory with the event rate. At-most-once allows it.
+			if sub.c.evt && !e.coalescing[sub.c] {
 				sub.c.sendEvent(&evtMsg{T: "evt", S: sub.s, Topic: n.Topic, Data: n.Data})
 			}
 		}
