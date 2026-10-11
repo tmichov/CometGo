@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -46,6 +47,13 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"supported": []string{Subprotocol}})
 		return
 	}
+	ip, ok := a.acquireConn(r)
+	if !ok {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer a.releaseConn(ip)
 	var cookieIdent *Identity
 	var cookieErr error
 	if a.cfg.AuthenticateRequest != nil {
@@ -61,6 +69,45 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s := &socket{ws: ws, outSig: make(chan struct{}, 1), onDrain: a.engine.signal}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	a.serve(s, cookieIdent, cookieErr)
+}
+
+// acquireConn counts a new connection against MaxConns and MaxConnsPerIP,
+// reporting false (and counting nothing) if either is full.
+func (a *App) acquireConn(r *http.Request) (string, bool) {
+	var ip string
+	if a.cfg.MaxConnsPerIP > 0 {
+		if a.cfg.ClientIP != nil {
+			ip = a.cfg.ClientIP(r)
+		} else if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			ip = host
+		} else {
+			ip = r.RemoteAddr
+		}
+	}
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	if a.cfg.MaxConns > 0 && a.conns >= a.cfg.MaxConns {
+		return "", false
+	}
+	if a.cfg.MaxConnsPerIP > 0 && a.ipConns[ip] >= a.cfg.MaxConnsPerIP {
+		return "", false
+	}
+	a.conns++
+	if a.cfg.MaxConnsPerIP > 0 {
+		a.ipConns[ip]++
+	}
+	return ip, true
+}
+
+func (a *App) releaseConn(ip string) {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	a.conns--
+	if a.cfg.MaxConnsPerIP > 0 {
+		if a.ipConns[ip]--; a.ipConns[ip] == 0 {
+			delete(a.ipConns, ip)
+		}
+	}
 }
 
 func offersSubprotocol(r *http.Request) bool {

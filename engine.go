@@ -643,6 +643,9 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	}
 	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
 	obs := e.observers[key]
+	if obs == nil && e.a.cfg.MaxObservers > 0 && len(e.observers) >= e.a.cfg.MaxObservers {
+		return NewError(CodeOverloaded, "too many live queries on the server")
+	}
 	if obs == nil {
 		q, err := pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
 		if err != nil {
