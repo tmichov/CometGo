@@ -111,6 +111,82 @@ func TestJSONTSKeysMatchEncodingJSON(t *testing.T) {
 	}
 }
 
+type tsD struct{ X int }
+type tsB struct{ tsD }
+type tsC struct{ tsD }
+
+// tsTwice embeds tsD twice at one depth: encoding/json drops X.
+type tsTwice struct {
+	tsB
+	tsC
+	Y int
+}
+
+type tsTree map[string]tsTree
+type tsList []tsList
+
+// tsPtrText has MarshalText only on its pointer.
+type tsPtrText struct{ V int }
+
+func (p *tsPtrText) MarshalText() ([]byte, error) { return []byte("t"), nil }
+
+// tsUnText decodes from a string through UnmarshalText on its pointer.
+type tsUnText struct{ V int }
+
+func (p *tsUnText) UnmarshalText([]byte) error { return nil }
+
+func TestJSONTSDuplicateEmbeddingAnnihilates(t *testing.T) {
+	b, _ := json.Marshal(tsTwice{})
+	if string(b) != `{"Y":0}` {
+		t.Fatalf("encoding/json wrote %s", b)
+	}
+	if got := jsonTS(reflect.TypeFor[tsTwice]()); got != "{ Y: number }" {
+		t.Fatalf("got %s", got)
+	}
+}
+
+func TestJSONTSRecursiveNamedTypes(t *testing.T) {
+	if got := jsonTS(reflect.TypeFor[tsTree]()); got != "Record<string, unknown> | null" {
+		t.Errorf("tree: %s", got)
+	}
+	if got := jsonTS(reflect.TypeFor[tsList]()); got != "unknown[] | null" {
+		t.Errorf("list: %s", got)
+	}
+}
+
+// Pointer-receiver marshalers count only where encoding/json can take the
+// address, which the type checks against what json.Marshal writes.
+func TestJSONTSPointerReceiverMarshaler(t *testing.T) {
+	type res struct {
+		Val   tsPtrText            `json:"val"`
+		Ptr   *tsPtrText           `json:"ptr"`
+		Slice []tsPtrText          `json:"slice"`
+		Map   map[string]tsPtrText `json:"map"`
+	}
+	v := res{Ptr: &tsPtrText{}, Slice: []tsPtrText{{}}, Map: map[string]tsPtrText{"k": {}}}
+	direct, _ := json.Marshal(v)  // not addressable: Val and Map hold objects
+	viaPtr, _ := json.Marshal(&v) // addressable: Val is a string
+	if string(direct) != `{"val":{"V":0},"ptr":"t","slice":["t"],"map":{"k":{"V":0}}}` || !strings.Contains(string(viaPtr), `"val":"t"`) {
+		t.Fatalf("encoding/json wrote %s and %s", direct, viaPtr)
+	}
+	if got, want := jsonTS(reflect.TypeFor[res]()), "{ val: { V: number }; ptr: string | null; slice: string[] | null; map: Record<string, { V: number }> | null }"; got != want {
+		t.Errorf("by value\ngot  %s\nwant %s", got, want)
+	}
+	if got := jsonTS(reflect.TypeFor[*res]()); !strings.HasPrefix(got, "{ val: string;") {
+		t.Errorf("by pointer: %s", got)
+	}
+	// Args are decoded into an addressable value: UnmarshalText counts.
+	type args struct {
+		U tsUnText `json:"u"`
+	}
+	if got := argsTS(reflect.TypeFor[args]()); got != "{ u: string }" {
+		t.Errorf("args: %s", got)
+	}
+	if err := json.Unmarshal([]byte(`{"u":"x"}`), &args{}); err != nil {
+		t.Errorf("encoding/json rejects a string for u: %v", err)
+	}
+}
+
 func TestRowCols(t *testing.T) {
 	type row struct {
 		ID      int64      `json:"id"`
@@ -136,6 +212,28 @@ func TestRowCols(t *testing.T) {
 	}
 	if _, err := rowCols(reflect.TypeFor[int]()); err == nil {
 		t.Fatal("non-struct Row accepted")
+	}
+	type tagged struct {
+		ID   netip.Addr `json:"id"`                 // TextMarshaler: a string
+		Day  time.Time  `json:"day" cometgo:"date"` // a date column
+		Tags []string   `json:"tags" cometgo:"[]enum"`
+	}
+	cols, err = rowCols(reflect.TypeFor[tagged]())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(cols); got != "[{id text false []} {day date false []} {tags []enum false []}]" {
+		t.Fatalf("tagged: %s", got)
+	}
+	if _, err := rowCols(reflect.TypeFor[struct {
+		ID [16]byte `json:"id"`
+	}]()); err == nil || !strings.Contains(err.Error(), "cometgo tag") {
+		t.Fatalf("[16]byte without a tag: %v", err)
+	}
+	if _, err := rowCols(reflect.TypeFor[struct {
+		ID string `json:"id" cometgo:"varchar"`
+	}]()); err == nil {
+		t.Fatal("unknown cometgo code accepted")
 	}
 }
 
@@ -178,6 +276,18 @@ func TestDescribe(t *testing.T) {
 			func(c *SubCtx, _ struct{}) (Query, error) {
 				return Query{SQL: "SELECT d.id, d.title, i.name FROM " + e.table + "_d d LEFT JOIN " + e.table + " i ON i.id = d.id"}, nil
 			})
+		Publish(app, "d.unnest", PubOptions{Tables: []string{e.table + "_d"}},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT u.id, d.title FROM unnest('{1,2}'::bigint[]) u(id) LEFT JOIN " + e.table + "_d d ON d.id = u.id"}, nil
+			})
+		Publish(app, "d.rollup", PubOptions{Tables: []string{e.table + "_d"}, Key: []string{"k"}},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT row_number() OVER () AS k, mood FROM " + e.table + "_d GROUP BY ROLLUP (mood)"}, nil
+			})
+		Publish(app, "d.dup", PubOptions{Tables: []string{e.table + "_d"}},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT id, title, n AS title FROM " + e.table + "_d"}, nil
+			})
 		type row struct {
 			ID   string  `json:"id"`
 			Name *string `json:"name"`
@@ -188,6 +298,14 @@ func TestDescribe(t *testing.T) {
 	ctx := context.Background()
 	if _, err := Describe(ctx, e.app, DescribeOptions{}); err == nil || !strings.Contains(err.Error(), "items.mine") {
 		t.Fatalf("anonymous describe of items.mine: %v", err)
+	}
+	panicky := setupFull(t, nil, func(_ *testEnv, app *App) {
+		Publish(app, "p", PubOptions{Tables: []string{"x"}}, func(c *SubCtx, _ struct{}) (Query, error) {
+			return Query{SQL: "SELECT " + c.Identity.UserID}, nil // nil Identity
+		})
+	})
+	if _, err := newEngine(panicky.app).describeQuery(ctx, panicky.app.pubs["p"], nil); err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("builder panic not reported as an error: %v", err)
 	}
 	s, err := Describe(ctx, e.app, DescribeOptions{Identity: &Identity{UserID: "u"}})
 	if err != nil {
@@ -206,7 +324,18 @@ func TestDescribe(t *testing.T) {
 	if got := pubs["d.one"].Args; got != "{ mood: string }" {
 		t.Errorf("d.one args %s", got)
 	}
-	if got, want := ts("d.two"), "{ id: string | null; title: string | null; name: string | null }"; got != want {
+	// Outer join against a function, and grouping sets, can put null in
+	// NOT NULL columns of the one table read. The key never is null.
+	if got, want := ts("d.unnest"), "{ id: string; title: string | null }"; got != want {
+		t.Errorf("d.unnest row %s, want %s", got, want)
+	}
+	if got, want := ts("d.rollup"), `{ k: string; mood: "sad" | "ok" | "happy" | null }`; got != want {
+		t.Errorf("d.rollup row %s, want %s", got, want)
+	}
+	if got, want := ts("d.dup"), "{ id: string; title: number }"; got != want {
+		t.Errorf("d.dup row %s, want %s", got, want)
+	}
+	if got, want := ts("d.two"), "{ id: string; title: string | null; name: string | null }"; got != want {
 		t.Errorf("d.two row %s, want %s", got, want)
 	}
 	if got, want := ts("d.row"), "{ id: string; name: string | null }"; got != want {

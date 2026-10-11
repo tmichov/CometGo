@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // TypeScript renders s as a TypeScript module declaring Methods,
@@ -92,29 +93,77 @@ func tsString(s string) string {
 }
 
 var (
-	jsonMarshaler = reflect.TypeFor[json.Marshaler]()
-	textMarshaler = reflect.TypeFor[encoding.TextMarshaler]()
-	timeType      = reflect.TypeFor[time.Time]()
-	rawType       = reflect.TypeFor[json.RawMessage]()
-	numberType    = reflect.TypeFor[json.Number]()
+	jsonMarshaler   = reflect.TypeFor[json.Marshaler]()
+	jsonUnmarshaler = reflect.TypeFor[json.Unmarshaler]()
+	textMarshaler   = reflect.TypeFor[encoding.TextMarshaler]()
+	textUnmarshaler = reflect.TypeFor[encoding.TextUnmarshaler]()
+	timeType        = reflect.TypeFor[time.Time]()
+	rawType         = reflect.TypeFor[json.RawMessage]()
+	numberType      = reflect.TypeFor[json.Number]()
 )
 
-func implements(t, iface reflect.Type) bool {
-	return t.Implements(iface) || t.Kind() != reflect.Pointer && reflect.PointerTo(t).Implements(iface)
+// jsonTS is the TypeScript type of the JSON encoding/json writes for a
+// value of type t passed to it as an interface, as a method's result is.
+// Struct fields follow encoding/json: json tags rename or drop them,
+// omitempty and omitzero make them optional, embedded structs are
+// promoted, and the string option turns a number or bool into a string.
+// Values that marshal to null (nil pointers, slices, maps, interfaces)
+// include null. A type with its own MarshalJSON is unknown, except
+// time.Time (an RFC 3339 string); one with MarshalText is a string.
+// Methods on *T count only where encoding/json can take the address: under
+// a pointer or in a slice, not in a value passed directly or in a map.
+func jsonTS(t reflect.Type) string {
+	return (&tsGen{seen: map[reflect.Type]bool{}}).typ(t, false)
 }
 
-// jsonTS is the TypeScript type of t's encoding/json form. Struct fields
-// follow encoding/json: json tags rename or drop them, omitempty and
-// omitzero make them optional, embedded structs are promoted, and the
-// string option turns a number or bool into a string. Values that marshal
-// to null (nil pointers, slices, maps, interfaces) include null. A type
-// with its own MarshalJSON is unknown, except time.Time (an RFC 3339
-// string); one with MarshalText is a string.
-func jsonTS(t reflect.Type) string { return (&tsGen{seen: map[reflect.Type]bool{}}).typ(t) }
+// argsTS is the TypeScript type of the JSON encoding/json decodes into a
+// value of type t, as a method's or publication's args are. Decoding
+// always has the address, so UnmarshalJSON and UnmarshalText on *T count.
+// Empty args (struct{}) also accept null, so the client may omit them.
+func argsTS(t reflect.Type) string {
+	ts := (&tsGen{seen: map[reflect.Type]bool{}, decode: true}).typ(t, true)
+	if ts == "Record<string, never>" {
+		return ts + " | null"
+	}
+	return ts
+}
 
-type tsGen struct{ seen map[reflect.Type]bool }
+type tsGen struct {
+	seen   map[reflect.Type]bool // named types being expanded
+	decode bool
+}
 
-func (g *tsGen) typ(t reflect.Type) string {
+// custom reports whether t (not a pointer) has its own JSON form: "json"
+// for MarshalJSON/UnmarshalJSON, "text" for MarshalText/UnmarshalText.
+func (g *tsGen) custom(t reflect.Type, addr bool) string {
+	has := func(enc, dec reflect.Type) bool {
+		if g.decode {
+			return reflect.PointerTo(t).Implements(dec)
+		}
+		return t.Implements(enc) || addr && reflect.PointerTo(t).Implements(enc)
+	}
+	switch {
+	case has(jsonMarshaler, jsonUnmarshaler):
+		return "json"
+	case has(textMarshaler, textUnmarshaler):
+		return "text"
+	}
+	return ""
+}
+
+func isNumberKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
+// typ is the TypeScript type of t; addr reports whether encoding/json can
+// take the address of a value of t at this position.
+func (g *tsGen) typ(t reflect.Type, addr bool) string {
 	switch t {
 	case timeType:
 		return "string"
@@ -124,41 +173,50 @@ func (g *tsGen) typ(t reflect.Type) string {
 		return "number"
 	}
 	if t.Kind() == reflect.Pointer {
-		return nullable(g.typ(t.Elem()))
+		return nullable(g.typ(t.Elem(), true))
 	}
-	if implements(t, jsonMarshaler) {
+	switch g.custom(t, addr) {
+	case "json":
 		return "unknown"
-	}
-	if implements(t, textMarshaler) {
+	case "text":
 		return "string"
 	}
 	switch t.Kind() {
-	case reflect.Bool:
+	case reflect.Slice, reflect.Array, reflect.Map, reflect.Struct:
+		// A named type can contain itself (type Tree map[string]Tree).
+		if t.Name() != "" {
+			if g.seen[t] {
+				return "unknown"
+			}
+			g.seen[t] = true
+			defer delete(g.seen, t)
+		}
+	}
+	switch k := t.Kind(); {
+	case k == reflect.Bool:
 		return "boolean"
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64:
+	case isNumberKind(k):
 		return "number"
-	case reflect.String:
+	case k == reflect.String:
 		return "string"
-	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 && !implements(t.Elem(), jsonMarshaler) && !implements(t.Elem(), textMarshaler) {
+	case k == reflect.Slice:
+		if t.Elem().Kind() == reflect.Uint8 && g.custom(t.Elem(), true) == "" {
 			return "string | null" // base64
 		}
-		return nullable(g.array(t.Elem()))
-	case reflect.Array:
-		return g.array(t.Elem())
-	case reflect.Map:
-		return nullable("Record<string, " + g.typ(t.Elem()) + ">")
-	case reflect.Struct:
-		return g.object(t)
+		return nullable(g.array(t.Elem(), true))
+	case k == reflect.Array:
+		return g.array(t.Elem(), addr)
+	case k == reflect.Map:
+		return nullable("Record<string, " + g.typ(t.Elem(), false) + ">")
+	case k == reflect.Struct:
+		return g.object(t, addr)
 	}
 	// Interfaces, and kinds encoding/json rejects (chan, func, complex).
 	return "unknown"
 }
 
-func (g *tsGen) array(elem reflect.Type) string {
-	e := g.typ(elem)
+func (g *tsGen) array(elem reflect.Type, addr bool) string {
+	e := g.typ(elem, addr)
 	if strings.Contains(e, " ") {
 		e = "(" + e + ")"
 	}
@@ -172,12 +230,7 @@ func nullable(t string) string {
 	return t + " | null"
 }
 
-func (g *tsGen) object(t reflect.Type) string {
-	if g.seen[t] {
-		return "unknown" // recursive type
-	}
-	g.seen[t] = true
-	defer delete(g.seen, t)
+func (g *tsGen) object(t reflect.Type, addr bool) string {
 	fields := jsonFields(t)
 	if len(fields) == 0 {
 		return "Record<string, never>"
@@ -191,7 +244,7 @@ func (g *tsGen) object(t reflect.Type) string {
 				ft = "string | null"
 			}
 		} else {
-			ft = g.typ(f.typ)
+			ft = g.typ(f.typ, addr)
 		}
 		opt := ""
 		if f.optional {
@@ -207,23 +260,32 @@ type jsonField struct {
 	typ      reflect.Type
 	index    []int
 	tagged   bool
-	optional bool // omitempty or omitzero
-	quoted   bool // ,string on a scalar
+	optional bool   // omitempty or omitzero
+	quoted   bool   // ,string on a scalar
+	code     string // cometgo tag: the column's wire type code (PubOptions.Row)
 }
 
 // jsonFields lists the fields encoding/json encodes for struct type t, in
-// its order, applying its rules for embedded structs and name conflicts.
+// its order. It follows typeFields in encoding/json/encode.go, whose exits
+// are, per field: unexported (unless an embedded struct), tag "-", an
+// invalid tag name (falls back to the field name), an untagged embedded
+// struct (expanded one level down, once per type per level, and only the
+// first time a type is seen at any level), and a type embedded more than
+// once at one level (its fields annihilate each other); then per name, the
+// dominant field, or none if two tie on depth and taggedness.
 func jsonFields(t reflect.Type) []jsonField {
 	type level struct {
 		typ   reflect.Type
 		index []int
 	}
 	var fields []jsonField
+	var count, nextCount map[reflect.Type]int
 	visited := map[reflect.Type]bool{}
 	next := []level{{typ: t}}
 	for len(next) > 0 {
 		current := next
 		next = nil
+		count, nextCount = nextCount, map[reflect.Type]int{}
 		for _, l := range current {
 			if visited[l.typ] {
 				continue
@@ -247,6 +309,9 @@ func jsonFields(t reflect.Type) []jsonField {
 					continue
 				}
 				name, opts, _ := strings.Cut(tag, ",")
+				if !validTagName(name) {
+					name = ""
+				}
 				index := append(slices.Clone(l.index), i)
 				ft := sf.Type
 				if ft.Name() == "" && ft.Kind() == reflect.Pointer {
@@ -257,24 +322,28 @@ func jsonFields(t reflect.Type) []jsonField {
 					if name == "" {
 						name = sf.Name
 					}
-					f := jsonField{name: name, typ: sf.Type, index: index, tagged: tagged}
+					f := jsonField{name: name, typ: sf.Type, index: index, tagged: tagged, code: sf.Tag.Get("cometgo")}
 					for o := range strings.SplitSeq(opts, ",") {
 						switch o {
 						case "omitempty", "omitzero":
 							f.optional = true
 						case "string":
-							switch ft.Kind() {
-							case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-								reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-								reflect.Float32, reflect.Float64, reflect.String:
-								f.quoted = true
-							}
+							k := ft.Kind()
+							f.quoted = isNumberKind(k) || k == reflect.Bool || k == reflect.String
 						}
 					}
 					fields = append(fields, f)
+					if count[l.typ] > 1 {
+						// The type was embedded twice at this level: a
+						// duplicate makes the name tie and drop below.
+						fields = append(fields, f)
+					}
 					continue
 				}
-				next = append(next, level{typ: ft, index: index})
+				nextCount[ft]++
+				if nextCount[ft] == 1 {
+					next = append(next, level{typ: ft, index: index})
+				}
 			}
 		}
 	}
@@ -313,8 +382,9 @@ func jsonFields(t reflect.Type) []jsonField {
 }
 
 // rowCols describes the columns of Row struct type t for PubOptions.Row:
-// the column name is the json tag or field name, the code follows the Go
-// type the column would scan into, and pointer fields are nullable.
+// the column name is the json tag or field name, pointer fields are
+// nullable, and the wire type code is the field's cometgo tag, or else
+// follows its Go type (goCode).
 func rowCols(t reflect.Type) ([]ColSchema, error) {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -330,7 +400,12 @@ func rowCols(t reflect.Type) ([]ColSchema, error) {
 			c.Nullable = true
 			ft = ft.Elem()
 		}
-		code, err := goCode(ft)
+		code, err := f.code, error(nil)
+		if code == "" {
+			code, err = goCode(ft)
+		} else if !validCode(code) {
+			err = fmt.Errorf("unknown type code %q in cometgo tag", code)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("Row field %s: %w", f.name, err)
 		}
@@ -340,12 +415,26 @@ func rowCols(t reflect.Type) ([]ColSchema, error) {
 	return cols, nil
 }
 
+func validCode(code string) bool {
+	switch strings.TrimPrefix(code, "[]") {
+	case "i4", "i8", "f8", "num", "bool", "text", "enum", "uuid", "tstz", "ts", "date", "json", "bytes", "raw":
+		return true
+	}
+	return false
+}
+
+// goCode is the wire type code of a column of Go type t. A time.Time is
+// taken to be a timestamptz; a date or timestamp column needs a cometgo
+// tag.
 func goCode(t reflect.Type) (string, error) {
 	switch t {
 	case timeType:
 		return "tstz", nil
 	case rawType:
 		return "json", nil
+	}
+	if t.Implements(textMarshaler) || reflect.PointerTo(t).Implements(textMarshaler) {
+		return "text", nil // uuid types, netip.Addr: sent as strings
 	}
 	switch t.Kind() {
 	case reflect.Bool:
@@ -360,6 +449,9 @@ func goCode(t reflect.Type) (string, error) {
 		return "text", nil
 	case reflect.Slice, reflect.Array:
 		if t.Elem().Kind() == reflect.Uint8 {
+			if t.Kind() == reflect.Array {
+				return "", fmt.Errorf("no column type for %s; set a cometgo tag", t)
+			}
 			return "bytes", nil
 		}
 		elem, err := goCode(t.Elem())
@@ -370,15 +462,20 @@ func goCode(t reflect.Type) (string, error) {
 	case reflect.Map, reflect.Struct, reflect.Interface:
 		return "json", nil
 	}
-	return "", fmt.Errorf("no column type for %s", t)
+	return "", fmt.Errorf("no column type for %s; set a cometgo tag", t)
 }
 
-// argsTS is jsonTS for a method's or publication's args. Empty args
-// (struct{}) also accept null, so the client may omit them.
-func argsTS(t reflect.Type) string {
-	ts := jsonTS(t)
-	if ts == "Record<string, never>" {
-		return ts + " | null"
+// validTagName is encoding/json's isValidTag.
+func validTagName(s string) bool {
+	if s == "" {
+		return false
 	}
-	return ts
+	for _, c := range s {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return false
+		}
+	}
+	return true
 }

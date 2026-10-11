@@ -84,7 +84,14 @@ func Describe(ctx context.Context, a *App, opts DescribeOptions) (*Schema, error
 }
 
 func (e *engine) describeQuery(ctx context.Context, p *publication, ident *Identity) ([]ColSchema, error) {
-	q, err := p.build(&SubCtx{Context: ctx, Identity: ident}, json.RawMessage("null"))
+	q, err := func() (q Query, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		return p.build(&SubCtx{Context: ctx, Identity: ident}, json.RawMessage("null"))
+	}()
 	if err != nil {
 		return nil, fmt.Errorf("build query with zero-value args: %w (set PubOptions.Row or DescribeOptions.Identity)", err)
 	}
@@ -93,8 +100,8 @@ func (e *engine) describeQuery(ctx context.Context, p *publication, ident *Ident
 		return nil, err
 	}
 	defer tx.Rollback(context.Background())
-	sql := strings.TrimRight(strings.TrimSpace(q.SQL), "; \t\r\n")
-	rows, err := tx.Query(ctx, "SELECT * FROM ("+sql+"\n) q LIMIT 0", q.Args...)
+	sql := "SELECT * FROM (" + strings.TrimRight(strings.TrimSpace(q.SQL), "; \t\r\n") + "\n) q LIMIT 0"
+	rows, err := tx.Query(ctx, sql, q.Args...)
 	if err != nil {
 		return nil, fmt.Errorf("describe query: %w (set PubOptions.Row if it needs real args)", err)
 	}
@@ -107,42 +114,60 @@ func (e *engine) describeQuery(ctx context.Context, p *publication, ident *Ident
 	if err := e.resolveTypes(ctx, m, fds); err != nil {
 		return nil, err
 	}
-	notNull, err := notNullCols(ctx, tx, p, fds)
+	notNull, err := notNullCols(ctx, tx, p, sql, q.Args, fds)
 	if err != nil {
 		return nil, err
 	}
-	cols := make([]ColSchema, len(fds))
-	var enumOIDs []uint32
+	// The client keeps the last of several columns with one name.
+	last := map[string]int{}
 	for i, fd := range fds {
-		cols[i] = ColSchema{
-			Name:     fd.Name,
-			Code:     e.colCode(m, fd.DataTypeOID),
-			Nullable: !notNull[[2]uint32{fd.TableOID, uint32(fd.TableAttributeNumber)}],
-		}
-		if strings.TrimPrefix(cols[i].Code, "[]") == "enum" {
-			enumOIDs = append(enumOIDs, fd.DataTypeOID)
-		}
+		last[fd.Name] = i
 	}
-	if len(enumOIDs) > 0 {
-		labels, err := enumLabels(ctx, tx, enumOIDs)
+	var cols []ColSchema
+	enums := map[int]uint32{} // index in cols: type OID
+	for i, fd := range fds {
+		if last[fd.Name] != i {
+			continue
+		}
+		c := ColSchema{
+			Name: fd.Name,
+			Code: e.colCode(m, fd.DataTypeOID),
+			// A row with a null key fails the query, so a key is never null.
+			Nullable: !slices.Contains(p.opts.Key, fd.Name) && !notNull[[2]uint32{fd.TableOID, uint32(fd.TableAttributeNumber)}],
+		}
+		if strings.TrimPrefix(c.Code, "[]") == "enum" {
+			enums[len(cols)] = fd.DataTypeOID
+		}
+		cols = append(cols, c)
+	}
+	if len(enums) > 0 {
+		labels, err := enumLabels(ctx, tx, slices.Collect(maps.Values(enums)))
 		if err != nil {
 			return nil, err
 		}
-		for i, fd := range fds {
-			if strings.TrimPrefix(cols[i].Code, "[]") == "enum" {
-				cols[i].Enum = labels[fd.DataTypeOID]
-			}
+		for i, oid := range enums {
+			cols[i].Enum = labels[oid]
 		}
 	}
 	return cols, nil
 }
 
-// notNullCols returns the (table OID, attnum) pairs of fds that are NOT NULL
-// columns of p's table, when p reads exactly one table. A column of a
-// multi-table publication may come from the null side of an outer join.
-func notNullCols(ctx context.Context, tx pgx.Tx, p *publication, fds []pgconn.FieldDescription) (map[[2]uint32]bool, error) {
+// notNullCols returns the (table OID, attnum) pairs that are NOT NULL
+// columns of p's table, when p reads exactly one table and sql's plan has
+// no outer join and no grouping sets. Either can put null in such a column:
+// a column of a multi-table publication, or of an outer join against a
+// function or VALUES, may come from the null side, and ROLLUP and its kin
+// null out grouped columns.
+func notNullCols(ctx context.Context, tx pgx.Tx, p *publication, sql string, args []any, fds []pgconn.FieldDescription) (map[[2]uint32]bool, error) {
 	out := map[[2]uint32]bool{}
 	if len(p.tables) != 1 {
+		return out, nil
+	}
+	var plan []any
+	if err := tx.QueryRow(ctx, "EXPLAIN (VERBOSE, FORMAT JSON) "+sql, args...).Scan(&plan); err != nil {
+		return nil, fmt.Errorf("explain query: %w", err)
+	}
+	if mayAddNulls(plan) {
 		return out, nil
 	}
 	rows, err := tx.Query(ctx, `SELECT attrelid, attnum FROM pg_attribute
@@ -186,4 +211,27 @@ func enumLabels(ctx context.Context, tx pgx.Tx, oids []uint32) (map[uint32][]str
 		out[oid] = labels
 	}
 	return out, rows.Err()
+}
+
+// mayAddNulls reports whether an EXPLAIN (FORMAT JSON) plan has a node
+// that can produce null in a NOT NULL column: an outer join, or an
+// aggregate over grouping sets.
+func mayAddNulls(v any) bool {
+	switch v := v.(type) {
+	case []any:
+		return slices.ContainsFunc(v, mayAddNulls)
+	case map[string]any:
+		if jt, ok := v["Join Type"].(string); ok && jt != "Inner" && jt != "Semi" {
+			return true
+		}
+		if _, ok := v["Grouping Sets"]; ok {
+			return true
+		}
+		for _, c := range v {
+			if mayAddNulls(c) {
+				return true
+			}
+		}
+	}
+	return false
 }

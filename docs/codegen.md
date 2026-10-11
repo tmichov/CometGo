@@ -55,7 +55,9 @@ Method args and results are typed from the Go types given to `Method`, following
 | a type with `MarshalText` | `string` |
 | a type with `MarshalJSON`, `json.RawMessage`, interfaces | `unknown` |
 
-Struct fields follow `encoding/json`: `json` tags rename or drop them, `omitempty` and `omitzero` make them optional, embedded structs are promoted, and a field hidden by another of the same name is left out. A struct type that contains itself becomes `unknown` at the point where it repeats.
+Struct fields follow `encoding/json`: `json` tags rename or drop them, `omitempty` and `omitzero` make them optional, embedded structs are promoted, and a field hidden by another of the same name, or reached through the same embedded type twice, is left out. A named type that contains itself (`type Tree map[string]Tree`) becomes `unknown` where it repeats.
+
+Results are marshaled from the value the method returns, which `encoding/json` cannot take the address of. A `MarshalText` or `MarshalJSON` defined on `*T` therefore applies to a `T` only under a pointer or inside a slice, as in `encoding/json`; elsewhere `T` is typed by its fields. Args are decoded into an addressable value, so `UnmarshalText` (a `string`) and `UnmarshalJSON` (`unknown`) on `*T` always apply.
 
 Args of `struct{}` may be left out: `comet.call("todos.clearDone")`.
 
@@ -78,9 +80,14 @@ A publication's row type comes from its result columns. `Describe` calls the pub
 
 A `timestamptz` of `infinity` or `-infinity` arrives as that string, not as a `Date`. The generated type does not include that case.
 
-**Nullability.** Postgres does not say whether a result column can be null. A column is typed non-null only when the publication's `Tables` lists exactly one table and the column comes straight from a `NOT NULL` column of that table. Every other column, including expressions, aggregates and every column of a multi-table publication, is typed `T | null`. A single-table query that outer-joins the table to itself can still return null in a `NOT NULL` column; describe such a publication with `Row`.
+**Nullability.** Postgres does not say whether a result column can be null. A column is typed non-null when:
 
-**`PubOptions.Row`.** A query that cannot run with zero-value args, or whose types should be stated by hand, can set `Row` to a struct value. `Describe` then uses the struct and does not run the query. Each field is a column, named by its `json` tag or field name. A pointer field is nullable. The Go type picks the column type:
+- it is one of the publication's `Key` columns (a row with a null key fails the query, so a delivered row never has one), or
+- the publication's `Tables` lists exactly one table, the column comes straight from a `NOT NULL` column of that table, and the query's plan (`EXPLAIN`) has no outer join and no grouping sets (`ROLLUP`, `CUBE`, `GROUPING SETS`), either of which can put null in such a column.
+
+Every other column, including expressions, aggregates and the non-key columns of a multi-table publication, is typed `T | null`. To state the types by hand, use `Row`.
+
+**`PubOptions.Row`.** A query that cannot run with zero-value args, or whose types should be stated by hand, can set `Row` to a struct value. `Describe` then uses the struct and does not run the query. Each field is a column, named by its `json` tag or field name. A pointer field is nullable. A `cometgo` tag sets the column's type code directly (`cometgo:"date"`, `cometgo:"[]enum"`); otherwise the Go type picks it:
 
 | Go field | Column |
 |---|---|
@@ -88,9 +95,9 @@ A `timestamptz` of `infinity` or `-infinity` arrives as that string, not as a `D
 | `int8`, `int16`, `int32`, `uint8`, `uint16` | `i4` |
 | `int`, `int64`, `uint`, `uint32`, `uint64` | `i8` |
 | `float32`, `float64` | `f8` |
-| `string` | `text` |
-| `time.Time` | `tstz` |
-| `[]byte` | `bytes` |
+| `string`, or a type with `MarshalText` (UUID types, `netip.Addr`) | `text` |
+| `time.Time` | `tstz` (tag `date` or `ts` columns) |
+| `[]byte` | `bytes` (a byte array such as `[16]byte` needs a tag) |
 | `[]T` | `[]` of `T`'s column type |
 | `json.RawMessage`, maps, structs, interfaces | `json` |
 
