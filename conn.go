@@ -734,6 +734,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	// returned without running the handler. The claim row commits atomically
 	// with the handler's writes, or rolls back with them on error.
 	var stored json.RawMessage
+	var call *Call
 	if ik != nil {
 		if stored, err = claimIK(ctx, tx, *ik, ident.userID(), msg.M); err != nil {
 			return nil, false, err
@@ -748,7 +749,8 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 					err = fmt.Errorf("panic: %v", p)
 				}
 			}()
-			return m.run(&Call{Context: hctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
+			call = &Call{Context: hctx, Identity: ident, Tx: tx, app: c.a}
+			return m.run(call, msg.Args)
 		}()
 		// A cancel that arrived before this point rolls back, whatever the
 		// handler returned: its queries may have been interrupted, and the
@@ -777,6 +779,18 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 
 	if msg.NoFence {
 		return val, false, tx.Commit(ctx)
+	}
+	// A transaction that wrote nothing has no effects to wait for (§6.2),
+	// unless it emitted events (their evt must precede the res) or replayed
+	// a stored result (the original may still be running).
+	if stored == nil && !call.emitted {
+		var wrote bool
+		if err := tx.QueryRow(ctx, "SELECT txid_current_if_assigned() IS NOT NULL").Scan(&wrote); err != nil {
+			return nil, false, err
+		}
+		if !wrote {
+			return val, false, tx.Commit(ctx)
+		}
 	}
 	// Fence (§6.2): registered before commit, notified as the last
 	// statement, so its notification follows every row notification of

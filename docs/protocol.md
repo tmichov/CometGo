@@ -238,6 +238,8 @@ Guarantees hold per server node. In a multi-node deployment, each connection is 
 
 **Mechanism.** Methods that use the framework transaction (`ctx.Tx`) send `pg_notify('comet', '1|f|<nodeId>:<counter>')` as the **last** statement before commit.
 
+**No effects, no fence.** A call whose transaction was assigned no transaction ID wrote nothing and has no effects, so it commits without a fence and its `res` is sent at once. Two exceptions: a call that emitted events (`EmitAfterCommit` runs `pg_notify` without assigning an ID, and its `evt` must precede the `res`), and an idempotency replay. Rolled-back savepoints keep their ID, so they keep the fence too.
+
 Postgres delivers a transaction's notifications together, after commit, in commit order. So by the time the listener receives the fence, every row notification from that transaction has already been received.
 
 **Release rule.**

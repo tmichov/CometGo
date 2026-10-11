@@ -84,6 +84,9 @@ func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, da
 		return err
 	}
 	_, err = c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2)", evtChannel, payload)
+	if err == nil {
+		c.emitted = true
+	}
 	return err
 }
 
