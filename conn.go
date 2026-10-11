@@ -59,6 +59,9 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return // Accept already wrote the HTTP error (e.g. bad Origin)
 	}
 	s := &socket{ws: ws, outSig: make(chan struct{}, 1), onDrain: a.engine.signal}
+	if a.cfg.Metrics != nil {
+		s.onSlow = func() { a.metric(MetricSlowClose, "", 1) }
+	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	a.serve(s, cookieIdent, cookieErr)
 }
@@ -139,6 +142,8 @@ type socket struct {
 	outSig chan struct{}
 	// onDrain is called once the queue drops below drainAt (§8.1).
 	onDrain func()
+	// onSlow, if set, is called once when the socket is closed with 4429.
+	onSlow func()
 
 	mu       sync.Mutex // guards the fields below
 	out      [][]byte
@@ -209,6 +214,9 @@ func (s *socket) read() (*clientMsg, bool) {
 // slow consumer, going away) leave it resumable. It never blocks the caller.
 func (s *socket) fail(code websocket.StatusCode, name, msg string) {
 	s.mu.Lock()
+	if code == closeSlow && !s.dead && s.onSlow != nil {
+		defer s.onSlow() // after the unlock below
+	}
 	s.dead = true
 	s.out, s.outBytes = nil, 0
 	if code == closeProtocol || code == closeUnauth {
@@ -790,11 +798,19 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
+	var committed time.Time
+	if c.a.cfg.Metrics != nil {
+		committed = time.Now()
+	}
 	select {
 	case <-f.released:
+		if c.a.cfg.Metrics != nil {
+			c.a.metric(MetricFenceWait, "", time.Since(committed).Seconds())
+		}
 		return val, false, nil
 	case <-time.After(c.a.cfg.FenceTimeout):
 		c.a.engine.dropFence(token)
+		c.a.metric(MetricFenceLag, "", 1)
 		return val, true, nil
 	}
 }

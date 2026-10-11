@@ -256,7 +256,15 @@ func (e *engine) run(ctx context.Context) {
 			return
 		case <-e.wake:
 		}
+		var start time.Time
+		var runs int64
+		if e.a.cfg.Metrics != nil {
+			start, runs = time.Now(), e.runs.Load()
+		}
 		retry := e.tick(ctx)
+		if e.a.cfg.Metrics != nil {
+			e.tickMetrics(start, e.runs.Load()-runs)
+		}
 		if retry {
 			e.retryBackoff = min(max(e.retryBackoff*2, 250*time.Millisecond), 5*time.Second)
 			time.AfterFunc(e.retryBackoff, e.signal)
@@ -710,7 +718,14 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}
 		r := runResult{obs: obs}
 		var qerr error
+		var start time.Time
+		if e.a.cfg.Metrics != nil {
+			start = time.Now()
+		}
 		r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		if e.a.cfg.Metrics != nil {
+			e.a.metric(MetricPubRun, obs.pub.name, time.Since(start).Seconds())
+		}
 		if qerr != nil {
 			if err := sp.Rollback(ctx); err != nil {
 				return err
@@ -847,6 +862,7 @@ func (e *engine) listen(ctx context.Context) {
 			return
 		}
 		e.a.log.Warn("listener disconnected", "err", err, "retry", backoff)
+		e.a.metric(MetricListenReconnect, "", 1)
 		select {
 		case <-ctx.Done():
 			return
