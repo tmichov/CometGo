@@ -58,9 +58,17 @@ func observerKey(pub, argsKey, scope string) string {
 // but that its query does not read (a query that reads the permission table,
 // listed in Tables, picks up the change by itself).
 //
-// It returns at once; the re-check runs on the engine's next tick. An
-// anonymous session's UserID is "".
+// Only an error ends a sub: a fn that narrows its Query instead (say, to the
+// teams the user still belongs to) changes nothing, since the observer keeps
+// the Query it was created with. Any error ends the sub, a transient one too.
+//
+// It returns at once; the re-check runs on the engine's next tick, against
+// what fn reads then, so call it after the change has committed. It reaches
+// only sessions on this App's node. An empty userID does nothing.
 func (a *App) Revalidate(userID string) {
+	if userID == "" {
+		return // anonymous sessions have no per-user permission to revoke
+	}
 	a.engine.enqueue(revalidateReq{userID: userID})
 }
 

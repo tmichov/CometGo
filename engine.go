@@ -117,6 +117,7 @@ type subscription struct {
 	args    json.RawMessage
 	argsKey string
 	obs     *observer
+	userID  string // the UserID it was last bound for
 	// needInit: send init + full snapshot next tick. holds: the client
 	// already has data for the sub (an earlier snapshot, or have on sub), so
 	// that snapshot goes out as a reset.
@@ -630,11 +631,16 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		// Not a rebind: the observers stay as they are; fn only re-checks
 		// access, so its Query is discarded.
 		for c, subs := range e.conns {
+			// A session whose identity changed since its subs were bound
+			// has a rebind queued, which re-checks them anyway.
 			ident := c.identity()
 			if c.isClosed() || ident.userID() != r.userID {
 				continue
 			}
 			for s, sub := range subs {
+				if sub.userID != r.userID {
+					continue
+				}
 				if err := e.recheck(ctx, sub, ident); err != nil {
 					e.detach(sub)
 					delete(subs, s)
@@ -674,7 +680,7 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 		e.observers[key] = obs
 	}
 	obs.subs[sub] = struct{}{}
-	sub.obs = obs
+	sub.obs, sub.userID = obs, ident.userID()
 	return nil
 }
 

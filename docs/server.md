@@ -357,12 +357,14 @@ For a check that can't be expressed in SQL, call `Revalidate` after the change:
 func (a *App) Revalidate(userID string)
 ```
 
-It re-runs `fn` for every live subscription of every session whose `Identity.UserID` is `userID`. That includes sessions whose socket dropped and that are waiting to be [resumed](#session-resume); those get the end in the replay. A subscription whose `fn` now returns an error ends with that error (e.g. `FORBIDDEN`). The user's other subscriptions, and other users' subscriptions to the same observer, carry on untouched, and no query is re-run. A panic in `fn` ends that subscription with `INTERNAL`.
+It re-runs `fn`, with each session's current identity, for every live subscription of every session whose `Identity.UserID` is `userID`. That includes sessions whose socket dropped and that are waiting to be [resumed](#session-resume); those get the end in the replay. A subscription whose `fn` now returns an error ends with that error (e.g. `FORBIDDEN`). The user's other subscriptions, and other users' subscriptions to the same observer, carry on untouched, and no query is re-run. A panic in `fn` ends that subscription with `INTERNAL`.
 
-- It returns at once, and the re-check happens on the engine's next tick.
-- `fn` runs again with each session's current identity, so the change must be visible to `fn` by then (commit it first).
-- It only reaches sessions on the server it is called on. In a multi-node deployment, call it on every node.
-- An anonymous session's `UserID` is `""`.
+- **Only an error ends a subscription.** A `fn` that responds to the change by returning a narrower `Query` (for example, only the teams the user still belongs to) changes nothing, because the observer keeps the `Query` it was created with. To revoke, `fn` must return an error, such as `ErrForbidden`.
+- **Any error ends the subscription, a transient one too.** If `fn` queries the database and that query fails during the re-check, the subscription ends with `INTERNAL` and the client has to subscribe again.
+- It returns at once, and the re-check happens on the engine's next tick, against whatever `fn` reads at that point. Call it after the change has **committed**. Inside a [method](#methods), the transaction commits only after the handler returns, so a `Revalidate` called from the handler can run before the change is visible.
+- It reaches only sessions on the server it is called on. In a multi-node deployment, each node has to call it.
+- `Revalidate("")` does nothing: anonymous sessions have no per-user permissions to revoke.
+- A session whose user is changing (an auth request is in progress) is skipped; the rebind that follows re-checks every one of its subscriptions anyway.
 
 ## InstallIdempotency
 
