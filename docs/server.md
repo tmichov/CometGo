@@ -104,6 +104,7 @@ All observers that need re-running in one tick run inside one `REPEATABLE READ R
 | `Unordered bool` | false | Declares that row order carries no meaning. The server then sends no positions, and the client's row order is arbitrary. Leave it false and use `ORDER BY` when order matters. |
 | `Scope Scope` | `ScopeUser` | Which connections may share one observer. See below. |
 | `Events bool` | false | Allows [events](#events) to be sent to this publication's subscriptions. |
+| `Row any` | nil | A struct value describing one result row, used by `Describe` instead of running the query. See [Typed clients](codegen.md#publications). |
 
 ### Scope
 

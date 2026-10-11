@@ -405,7 +405,7 @@ Application-defined codes are namespaced `app.<name>`.
 
 ## 10. Type mapping
 
-Types are described once per sub in `init.cols`, and values are plain JSON. There is no per-value tagging. Method args and results use the same codes through Go→TypeScript codegen.
+Types are described once per sub in `init.cols`, and values are plain JSON. There is no per-value tagging. Method args and results are plain JSON, typed from their Go types by the TypeScript codegen ([Typed clients](codegen.md)).
 
 | Postgres | code | Wire (JSON) | TS decode (default) |
 |---|---|---|---|
@@ -419,7 +419,7 @@ Types are described once per sub in `init.cols`, and values are plain JSON. Ther
 | uuid | `uuid` | lowercase canonical string | string |
 | timestamptz | `tstz` | RFC 3339 UTC, microsecond precision, `Z`; `"infinity"`/`"-infinity"` | `Date` (opt-in: `Temporal.Instant` or raw string; `Date` drops µs) |
 | date | `date` | `"YYYY-MM-DD"` | string |
-| json, jsonb | `json` | inline JSON value (not double-encoded) | `unknown` / typed via codegen. Numbers above 2^53 inside jsonb lose precision (documented) |
+| json, jsonb | `json` | inline JSON value (not double-encoded) | `unknown`. Numbers above 2^53 inside jsonb lose precision (documented) |
 | bytea | `bytes` | standard padded base64 | `Uint8Array` |
 | 1-D arrays | `[]<code>` | JSON array, `null` elements allowed | array of the element decode |
 | NULL | any | `null` | `null` |

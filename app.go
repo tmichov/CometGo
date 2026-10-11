@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,6 +246,11 @@ type PubOptions struct {
 	// Events lets the server send ephemeral events to this publication's
 	// subscriptions with App.Emit and Call.EmitAfterCommit.
 	Events bool
+	// Row, if set, is a struct value describing one result row for
+	// Describe, which then does not run the query. Use it for a query that
+	// cannot run with zero-value args. Fields map to columns by their json
+	// tag or name; a pointer field is nullable (see Describe).
+	Row any
 }
 
 // Query is the SQL a publication runs. It is re-run whenever a table it
@@ -275,10 +281,11 @@ type SubCtx struct {
 }
 
 type publication struct {
-	name   string
-	opts   PubOptions
-	tables []string
-	build  func(c *SubCtx, args json.RawMessage) (Query, error)
+	name    string
+	opts    PubOptions
+	tables  []string
+	build   func(c *SubCtx, args json.RawMessage) (Query, error)
+	argType reflect.Type // for Describe
 }
 
 // Publish registers a publication. Args are decoded from the client's sub
@@ -293,7 +300,7 @@ func Publish[A any](a *App, name string, opts PubOptions, fn func(c *SubCtx, arg
 	if len(opts.Key) == 0 {
 		opts.Key = []string{"id"}
 	}
-	p := &publication{name: name, opts: opts}
+	p := &publication{name: name, opts: opts, argType: reflect.TypeFor[A]()}
 	for _, t := range opts.Tables {
 		p.tables = append(p.tables, qualifyTable(t))
 	}
@@ -319,8 +326,9 @@ type Call struct {
 }
 
 type method struct {
-	name string
-	run  func(c *Call, args json.RawMessage) (any, error)
+	name             string
+	run              func(c *Call, args json.RawMessage) (any, error)
+	argType, resType reflect.Type // for Describe
 }
 
 // Method registers a server method. Args are decoded into A; the handler's
@@ -329,7 +337,7 @@ func Method[A, R any](a *App, name string, fn func(c *Call, args A) (R, error)) 
 	if _, dup := a.methods[name]; dup {
 		panic("cometgo: duplicate method " + name)
 	}
-	a.methods[name] = &method{name: name, run: func(c *Call, raw json.RawMessage) (any, error) {
+	a.methods[name] = &method{name: name, argType: reflect.TypeFor[A](), resType: reflect.TypeFor[R](), run: func(c *Call, raw json.RawMessage) (any, error) {
 		var args A
 		if err := decodeArgs(raw, &args); err != nil {
 			return nil, err

@@ -3,8 +3,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"embed"
+	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -41,7 +44,14 @@ type added struct {
 	ID string `json:"id"`
 }
 
+// schemaFile is the generated client schema, relative to this directory.
+const schemaFile = "web/src/schema.ts"
+
 func main() {
+	gen := flag.Bool("gen", false, "write the TypeScript schema to "+schemaFile+" and exit")
+	check := flag.Bool("check", false, "with -gen: fail if "+schemaFile+" is out of date instead of writing it")
+	flag.Parse()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -51,11 +61,59 @@ func main() {
 		log.Fatal(err)
 	}
 	defer pool.Close()
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	app, err := newApp(ctx, pool)
+	if err != nil {
 		log.Fatal(err)
 	}
-	if err := cometgo.InstallTriggers(ctx, pool, "todos"); err != nil {
+	if *gen {
+		if err := generate(ctx, app, schemaFile, *check); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	// The app outlives ctx: Shutdown stops it once the signal arrives.
+	app.Start(context.Background())
+
+	public, err := fs.Sub(webFS, "web/public")
+	if err != nil {
 		log.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/_comet", app)
+	mux.Handle("/", http.FileServerFS(public))
+
+	addr := env("ADDR", ":8080")
+	srv := &http.Server{Addr: addr, Handler: mux}
+	shut := make(chan struct{})
+	go func() {
+		defer close(shut)
+		<-ctx.Done()
+		// Graceful: in-flight calls finish, and clients reconnect spread
+		// over the next few seconds instead of all at once.
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := app.Shutdown(sctx); err != nil {
+			log.Printf("todo: cometgo shutdown: %v", err)
+		}
+		if err := srv.Shutdown(sctx); err != nil {
+			log.Printf("todo: http shutdown: %v", err)
+		}
+	}()
+	log.Printf("todo: listening on http://localhost%s", addr)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+	<-shut
+}
+
+// newApp creates the schema and registers the todo publications and methods.
+func newApp(ctx context.Context, pool *pgxpool.Pool) (*cometgo.App, error) {
+	if _, err := pool.Exec(ctx, schema); err != nil {
+		return nil, err
+	}
+	if err := cometgo.InstallTriggers(ctx, pool, "todos"); err != nil {
+		return nil, err
 	}
 
 	app := cometgo.New(cometgo.Config{DB: pool})
@@ -93,39 +151,28 @@ func main() {
 		return tag.RowsAffected(), err
 	})
 
-	// The app outlives ctx: Shutdown stops it once the signal arrives.
-	app.Start(context.Background())
+	return app, nil
+}
 
-	public, err := fs.Sub(webFS, "web/public")
+// generate writes the TypeScript schema for app to path, or with check
+// reports whether path already holds it.
+func generate(ctx context.Context, app *cometgo.App, path string, check bool) error {
+	s, err := cometgo.Describe(ctx, app, cometgo.DescribeOptions{})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/_comet", app)
-	mux.Handle("/", http.FileServerFS(public))
-
-	addr := env("ADDR", ":8080")
-	srv := &http.Server{Addr: addr, Handler: mux}
-	shut := make(chan struct{})
-	go func() {
-		defer close(shut)
-		<-ctx.Done()
-		// Graceful: in-flight calls finish, and clients reconnect spread
-		// over the next few seconds instead of all at once.
-		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := app.Shutdown(sctx); err != nil {
-			log.Printf("todo: cometgo shutdown: %v", err)
+	out := s.TypeScript()
+	if check {
+		cur, err := os.ReadFile(path)
+		if err != nil {
+			return err
 		}
-		if err := srv.Shutdown(sctx); err != nil {
-			log.Printf("todo: http shutdown: %v", err)
+		if !bytes.Equal(cur, out) {
+			return fmt.Errorf("%s is out of date; run make gen", path)
 		}
-	}()
-	log.Printf("todo: listening on http://localhost%s", addr)
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatal(err)
+		return nil
 	}
-	<-shut
+	return os.WriteFile(path, out, 0o644)
 }
 
 func env(k, def string) string {
