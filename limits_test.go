@@ -109,8 +109,50 @@ func TestMaxConnsPerIP(t *testing.T) {
 // Without ClientIP, connections count against the host of RemoteAddr.
 func TestMaxConnsPerIPDefaultsToRemoteAddr(t *testing.T) {
 	e := setupWith(t, func(c *Config) { c.MaxConnsPerIP = 1 })
-	e.upgrade(t, "1.1.1.1")
+	if st, _ := e.upgrade(t, "1.1.1.1"); st != http.StatusSwitchingProtocols {
+		t.Fatalf("first: %d", st)
+	}
 	if st, _ := e.upgrade(t, "2.2.2.2"); st != http.StatusServiceUnavailable {
 		t.Fatalf("second from 127.0.0.1: %d, want 503", st)
+	}
+}
+
+// At the cap, an fn's own error is reported, not OVERLOADED.
+func TestMaxObserversReportsFnErrorFirst(t *testing.T) {
+	e := setupWith(t, func(c *Config) { c.MaxObservers = 1 })
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	a.next()
+	a.send(map[string]any{"t": "sub", "s": 2, "name": "items.mine"}) // anonymous: FORBIDDEN
+	if end, _ := entries(a.next())[0]["end"].(map[string]any); end["code"] != CodeForbidden {
+		t.Fatalf("got %v, want FORBIDDEN", end)
+	}
+}
+
+// An identity change frees the old identity's observers before binding the
+// new ones, so swapping one user-scoped observer for another fits the cap.
+func TestMaxObserversRebind(t *testing.T) {
+	e := setupWith(t, func(c *Config) { c.MaxObservers = 2 })
+	other, _ := e.dial(t, nil)
+	other.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	other.next()
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	for s := 1; s <= 2; s++ { // two subs on one alice observer
+		a.send(map[string]any{"t": "sub", "s": s, "name": "items.mine"})
+		if en := entries(a.next()); en[0]["ready"] != true {
+			t.Fatalf("alice sub %d: %v", s, en)
+		}
+	}
+	a.send(map[string]any{"t": "auth", "id": 1, "token": "bob"})
+	for {
+		m := a.next()
+		if m["t"] == "authRes" {
+			break
+		}
+		for _, en := range entries(m) {
+			if en["end"] != nil {
+				t.Fatalf("sub %v ended on rebind: %v", en["s"], en["end"])
+			}
+		}
 	}
 }

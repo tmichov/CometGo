@@ -47,13 +47,15 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"supported": []string{Subprotocol}})
 		return
 	}
-	ip, ok := a.acquireConn(r)
-	if !ok {
-		w.Header().Set("Retry-After", "5")
-		http.Error(w, "too many connections", http.StatusServiceUnavailable)
-		return
+	if a.cfg.MaxConns > 0 || a.cfg.MaxConnsPerIP > 0 {
+		ip, ok := a.acquireConn(r)
+		if !ok {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "too many connections", http.StatusServiceUnavailable)
+			return
+		}
+		defer a.releaseConn(ip)
 	}
-	defer a.releaseConn(ip)
 	var cookieIdent *Identity
 	var cookieErr error
 	if a.cfg.AuthenticateRequest != nil {
@@ -78,10 +80,15 @@ func (a *App) acquireConn(r *http.Request) (string, bool) {
 	if a.cfg.MaxConnsPerIP > 0 {
 		if a.cfg.ClientIP != nil {
 			ip = a.cfg.ClientIP(r)
-		} else if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			ip = host
-		} else {
-			ip = r.RemoteAddr
+		}
+		// An empty ClientIP (e.g. a missing forwarded header) falls back to
+		// the peer address rather than one bucket shared by all such clients.
+		if ip == "" {
+			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				ip = host
+			} else {
+				ip = r.RemoteAddr
+			}
 		}
 	}
 	a.connMu.Lock()

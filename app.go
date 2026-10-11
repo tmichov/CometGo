@@ -112,9 +112,10 @@ type Config struct {
 	// no limit.
 	MaxConns      int
 	MaxConnsPerIP int
-	// ClientIP returns the address MaxConnsPerIP counts against. Default:
-	// the host of r.RemoteAddr. Behind a proxy, return the client address
-	// the proxy forwards, or every client shares the proxy's limit.
+	// ClientIP returns the address MaxConnsPerIP counts against. Default,
+	// and when it returns "": the host of r.RemoteAddr. Behind a proxy,
+	// return the client address the proxy forwards, or every client shares
+	// the proxy's limit.
 	ClientIP func(r *http.Request) string
 
 	// ResumeGrace is how long a session outlives a lost socket, waiting for

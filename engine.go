@@ -623,9 +623,13 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 
 	case rebindReq:
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
-		for s, sub := range e.conns[r.c] {
+		// Every sub is detached before any rebinds, so observers only the old
+		// identity held are freed before MaxObservers is checked.
+		for _, sub := range e.conns[r.c] {
 			e.detach(sub)
 			sub.needInit, sub.needsReset = true, false
+		}
+		for s, sub := range e.conns[r.c] {
 			if err := e.bind(ctx, sub, r.ident); err != nil {
 				end(r.c, s, err)
 				delete(e.conns[r.c], s)
@@ -643,13 +647,15 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	}
 	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
 	obs := e.observers[key]
-	if obs == nil && e.a.cfg.MaxObservers > 0 && len(e.observers) >= e.a.cfg.MaxObservers {
-		return NewError(CodeOverloaded, "too many live queries on the server")
-	}
 	if obs == nil {
 		q, err := pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
 		if err != nil {
 			return e.a.toWireError(err, "publication "+sub.name)
+		}
+		// Checked after fn, so its FORBIDDEN or VALIDATION wins over a
+		// retryable OVERLOADED.
+		if e.a.cfg.MaxObservers > 0 && len(e.observers) >= e.a.cfg.MaxObservers {
+			return NewError(CodeOverloaded, "too many live queries on the server")
 		}
 		obs = &observer{key: key, pub: pub, q: q, tables: pub.tables, subs: map[*subscription]struct{}{}}
 		e.observers[key] = obs
