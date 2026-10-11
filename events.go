@@ -51,6 +51,19 @@ func observerKey(pub, argsKey, scope string) string {
 	return pub + "\x00" + argsKey + "\x00" + scope
 }
 
+// Revalidate re-runs the publication fn of every live subscription held by
+// sessions whose Identity.UserID is userID, including sessions waiting to be
+// resumed. A sub whose fn now returns an error ends with that error; the
+// others are untouched. Call it after changing a permission that fn checks
+// but that its query does not read (a query that reads the permission table,
+// listed in Tables, picks up the change by itself).
+//
+// It returns at once; the re-check runs on the engine's next tick. An
+// anonymous session's UserID is "".
+func (a *App) Revalidate(userID string) {
+	a.engine.enqueue(revalidateReq{userID: userID})
+}
+
 // Emit sends an ephemeral event to every subscription of the publication
 // pubName with the given args and scope: the subs that share one observer.
 // args must encode to the same JSON value the client subscribed with. scope
