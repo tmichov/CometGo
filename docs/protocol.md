@@ -321,12 +321,12 @@ An identity change during the gap is part of the replay. For example, a token th
 
 ### 7.3 Server shutdown
 
-- **[later] Graceful shutdown:**
-  1. The server sends `{"t":"goaway","reason":"restart","retryInMs":<random 0–5000>}`.
-  2. It stops accepting calls and drains in-flight calls.
-  3. It closes the connection with code 4503.
+- **Graceful shutdown:**
+  1. The server sends `{"t":"goaway","reason":"restart","retryInMs":<random 0–5000>}`. `goaway` is not stateful: it has no `seq` and is never replayed. New WebSocket upgrades get HTTP 503.
+  2. It stops accepting calls and drains in-flight calls. A `call` that arrives after `goaway` gets `res` with `UNAVAILABLE` and `retryAfterMs` equal to `retryInMs`. A call already running completes, and its `res` (after its fence, §6.2) is sent before the close.
+  3. Once no call is in flight, or the server's shutdown deadline passes, it closes the connection with code 4503, after writing everything queued for it.
 
-  Clients reconnect with jitter.
+  The client waits `retryInMs` before reconnecting, instead of its backoff. Calls made after `goaway` are not sent on the closing connection; they wait for the next one. Calls already sent settle from their `res` if it arrives before the close, and otherwise as on any drop (§7.1, §7.2). `goaway` needs no cap: a client that does not know it ignores it and reconnects with its backoff after the 4503.
 - **Crash.** Clients reconnect using the backoff rules in §7.1.
 
 ## 8. Flow control, liveness, limits
@@ -478,10 +478,10 @@ Every node receives every fence and ignores the tokens it does not own.
 - **Events:** `evt` (ephemeral, at-most-once, sub-scoped, §4.5), behind `caps`.
 - **Methods:** `cancel` (§5). It needs no cap: a server without it ignores the message, and the call settles from its normal `res`.
 - **Methods:** `ik` idempotency keys (§5), behind `caps`.
+- **Reconnect:** `goaway` graceful shutdown (§7.3). It needs no cap: clients ignore unknown message types.
 - **Backpressure:** coalesce→reset for slow clients (§8.1). It needs no cap: it only sends `reset` entries, which every client handles.
 
 **[later]**, all additive and behind `caps`:
-- **Reconnect:** `goaway`.
 - **Engine and transport:**
   - slow-observer detachment and parallel ticks with an exported snapshot
   - minimal-diff identity rebind

@@ -24,7 +24,8 @@ Register every publication and method before `Start` and before serving requests
 | Identifier | Description |
 |---|---|
 | `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil. |
-| `(*App) Start(ctx)` | Starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done. Panics if called twice. |
+| `(*App) Start(ctx)` | Starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. Panics if called twice. |
+| `(*App) Shutdown(ctx) error` | Stops the server gracefully: see [Graceful shutdown](#graceful-shutdown). |
 | `(*App) ServeHTTP(w, r)` | `App` is an `http.Handler`. It upgrades the request to a CometGo WebSocket. Mount it at `/_comet`, the client's default URL. |
 | `Subprotocol` | The WebSocket subprotocol, `"cometgo.1.json"`. A request that does not offer it gets HTTP 426 with `{"supported":["cometgo.1.json"]}`. |
 
@@ -335,6 +336,33 @@ A token refresh for the same user is fine. A protocol error, or a deliberate clo
 **Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node (sticky sessions, e.g. by cookie or client IP). Without sticky routing everything still works, but a reconnect that lands on another node resyncs.
 
 Memory cost: each disconnected session holds its subscriptions plus at most `ResumeBuffer` bytes for up to `ResumeGrace`. Connected sessions hold the unacknowledged tail, usually about one second of output. Set `ResumeGrace` negative to turn resume off.
+
+## Graceful shutdown
+
+`App.Shutdown(ctx)` lets a deploy restart the server without failing calls or making every client reconnect at the same moment:
+
+1. Every connection gets a `goaway` with a random delay of 0–5 s. New WebSocket connections are refused with HTTP 503.
+2. New calls are refused with `UNAVAILABLE` (with `retryAfterMs`). The TypeScript client does not send them: it holds calls made after `goaway` for the next connection. Calls already running finish, and their results are delivered.
+3. Once no call is running, every socket is closed with code 4503 after its queued messages are written.
+4. The engine, the Postgres listener and the idempotency cleanup stop.
+
+Each client reconnects after its own delay, so a rolling restart spreads the reconnects (and their resyncs) over five seconds. If `ctx` ends first, `Shutdown` closes the remaining sockets at once and returns `ctx.Err()`. Calls still running then finish on their own, and their clients see `CONNECTION_LOST`.
+
+Pass `Start` a context that outlives the shutdown signal (or `context.Background()`): the engine and the listener must keep running while `Shutdown` drains, or in-flight calls wait out `FenceTimeout` and subscriptions stop updating. Call `Shutdown` before `http.Server.Shutdown`, which does not wait for WebSocket connections. Calling `Shutdown` again, or concurrently, waits for the first one.
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+app.Start(context.Background()) // not ctx: it must outlive the signal
+// ... set up srv, then:
+<-ctx.Done()
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+app.Shutdown(shutdownCtx)
+srv.Shutdown(shutdownCtx)
+```
+
+Sessions do not survive the shutdown: a client that comes back resyncs.
 
 ## Slow clients
 
