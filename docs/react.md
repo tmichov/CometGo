@@ -34,10 +34,27 @@ The todo example has a React version at `/react.html` ([`examples/todo/web/src/r
 ## CometProvider
 
 ```ts
-function CometProvider(props: { client: Comet; children?: ReactNode }): ReactNode
+function CometProvider(props: { client: Comet | TypedComet<any>; children?: ReactNode }): ReactNode
 ```
 
 Makes `client` available to the hooks below. Every hook throws if it is used outside a provider. Render it near the root. Subscriptions are shared per `Comet` (see below), so several providers for the same client share them too.
+
+## Typed hooks
+
+```ts
+function hooksFor<S extends Schema>(): TypedHooks<S>
+```
+
+Returns `useComet`, `useSubscription` and `useCall` typed against a schema generated from the server (see [Typed clients](codegen.md)). They are the same functions as the untyped exports, so they share the provider and its subscriptions.
+
+```tsx
+import type { Schema } from "./schema.ts"; // generated
+export const { useSubscription, useCall } = hooksFor<Schema>();
+
+const todos = useSubscription("todos.all"); // rows typed from the server
+```
+
+`CometProvider` accepts the typed client from `connect<Schema>()` as well as an untyped one.
 
 ## useComet
 

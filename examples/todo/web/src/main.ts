@@ -1,11 +1,6 @@
-import { CometError, connect } from "../../../../client/src/index.ts";
-
-interface Todo {
-  id: string;
-  title: string;
-  done: boolean;
-  created_at: Date;
-}
+import { type CallRest, CometError, connect, type MethodArgs, type MethodName } from "../../../../client/src/index.ts";
+// Generated from the Go server: go run ./examples/todo -gen
+import type { Schema } from "./schema.ts";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const list = $<HTMLUListElement>("list");
@@ -15,8 +10,8 @@ const timing = $("timing");
 const errorBox = $("error");
 const titleInput = $<HTMLInputElement>("title");
 
-const comet = connect();
-const todos = comet.subscribe<Todo>("todos.all");
+const comet = connect<Schema>();
+const todos = comet.subscribe("todos.all");
 
 comet.onChange(() => {
   status.textContent = comet.status;
@@ -55,11 +50,11 @@ function render(): void {
   count.textContent = `${left} left`;
 }
 
-async function run(method: string, args: unknown): Promise<void> {
+async function run<M extends MethodName<Schema>>(method: M, ...rest: CallRest<MethodArgs<Schema, M>>): Promise<void> {
   errorBox.hidden = true;
   const start = performance.now();
   try {
-    const { lag } = await comet.callWithStatus(method, args);
+    const { lag } = await comet.callWithStatus(method, ...rest);
     // The call resolves only after its effects reached our subscription,
     // so the list above is already up to date here.
     timing.textContent = `${method} ${Math.round(performance.now() - start)} ms${lag ? " (lagging)" : ""}`;
@@ -77,4 +72,4 @@ $<HTMLFormElement>("add").onsubmit = async (ev) => {
   titleInput.focus();
 };
 
-$("clear").onclick = () => run("todos.clearDone", null);
+$("clear").onclick = () => run("todos.clearDone");

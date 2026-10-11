@@ -3,29 +3,26 @@
 
 import { type FormEvent, StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { CometError, connect } from "../../../../client/src/index.ts";
-import { CometProvider, useCall, useConnection, useSubscription } from "../../../../client/src/react.ts";
+import { type CallRest, CometError, connect, type MethodArgs, type MethodName } from "../../../../client/src/index.ts";
+import { CometProvider, hooksFor, useConnection } from "../../../../client/src/react.ts";
+// Generated from the Go server: go run ./examples/todo -gen
+import type { Schema } from "./schema.ts";
 
-interface Todo {
-  id: string;
-  title: string;
-  done: boolean;
-  created_at: Date;
-}
+const { useSubscription, useCall } = hooksFor<Schema>();
 
 function App() {
   const { status } = useConnection();
-  const todos = useSubscription<Todo>("todos.all");
+  const todos = useSubscription("todos.all");
   const call = useCall();
   const [title, setTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  async function run(method: string, args: unknown): Promise<void> {
+  async function run<M extends MethodName<Schema>>(method: M, ...rest: CallRest<MethodArgs<Schema, M>>): Promise<void> {
     setError(null);
     try {
       // Normally resolves after its effects reached our subscription, so the
       // list already shows the change (callWithStatus reports when it lagged).
-      await call(method, args);
+      await call(method, ...rest);
     } catch (e) {
       setError(e instanceof CometError ? `${e.code}: ${e.message}` : String(e));
     }
@@ -73,7 +70,7 @@ function App() {
         <footer>
           <span>{left} left</span>
           <span />
-          <button className="link" type="button" onClick={() => run("todos.clearDone", null)}>
+          <button className="link" type="button" onClick={() => run("todos.clearDone")}>
             Clear done
           </button>
         </footer>
@@ -85,7 +82,7 @@ function App() {
   );
 }
 
-const comet = connect();
+const comet = connect<Schema>();
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <CometProvider client={comet}>

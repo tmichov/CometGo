@@ -28,4 +28,5 @@ promise resolves ◄────────── res ──────  (sent
 - [Getting started](getting-started.md): run the todo example and see how it is built.
 - [Server](server.md): the Go API (`Config`, `Publish`, `Method`, errors, auth, `InstallTriggers`).
 - [Client](client.md): the TypeScript API (`connect`, subscriptions, calls, auth, reconnects, type decoding).
+- [Typed clients](codegen.md): generate TypeScript types for methods and publications from the Go server.
 - [Wire protocol](protocol.md): the full protocol specification, including planned features.

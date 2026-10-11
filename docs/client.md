@@ -24,9 +24,10 @@ await comet.call("todos.add", { title: "Ship v1" }); // the new row is already i
 
 ```ts
 function connect(opts?: ConnectOptions): Comet
+function connect<S extends Schema>(opts?: ConnectOptions): TypedComet<S>
 ```
 
-Creates a `Comet` and starts connecting immediately. One `Comet` holds one WebSocket and reconnects on its own until you call `close()`.
+Creates a `Comet` and starts connecting immediately. With a schema generated from the server, `connect<Schema>()` returns the same object typed so that method and publication names, args, results and rows are checked at compile time. See [Typed clients](codegen.md). One `Comet` holds one WebSocket and reconnects on its own until you call `close()`.
 
 | `ConnectOptions` field | Default | Meaning |
 |---|---|---|

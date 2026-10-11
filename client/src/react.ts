@@ -11,7 +11,19 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import type { Comet, CometError, ConnectionStatus, Subscription, SubStatus } from "./index.ts";
+import type {
+  Comet,
+  CometError,
+  ConnectionStatus,
+  PubArgs,
+  PubName,
+  PubRow,
+  Schema,
+  SubRest,
+  Subscription,
+  SubStatus,
+  TypedComet,
+} from "./index.ts";
 
 // ---- shared subscriptions ----
 
@@ -101,13 +113,13 @@ function registryFor(client: Comet): Registry {
 }
 
 export interface CometProviderProps {
-  client: Comet;
+  client: Comet | TypedComet<any>;
   children?: ReactNode;
 }
 
 /** Makes a Comet available to the hooks below. */
 export function CometProvider({ client, children }: CometProviderProps): ReactNode {
-  const registry = registryFor(client);
+  const registry = registryFor(client as Comet);
   return createElement(CometContext.Provider, { value: registry }, children);
 }
 
@@ -242,4 +254,20 @@ export function useConnection(): ConnectionState {
 export function useCall(): Comet["call"] {
   const comet = useComet();
   return useCallback<Comet["call"]>((m, args, opts) => comet.call(m, args, opts), [comet]);
+}
+
+/** The hooks above, checked against a generated schema S. */
+export interface TypedHooks<S extends Schema> {
+  useComet(): TypedComet<S>;
+  useSubscription<P extends PubName<S>>(name: P, ...rest: SubRest<PubArgs<S, P>>): SubState<PubRow<S, P>>;
+  useCall(): TypedComet<S>["call"];
+}
+
+/**
+ * Returns the hooks typed against S, for use with connect<S>():
+ * `export const { useSubscription, useCall } = hooksFor<Schema>();`
+ * They are the same functions as the untyped exports.
+ */
+export function hooksFor<S extends Schema>(): TypedHooks<S> {
+  return { useComet, useSubscription, useCall } as unknown as TypedHooks<S>;
 }

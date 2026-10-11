@@ -99,14 +99,16 @@ mux.Handle("/", http.FileServerFS(public)) // the UI
 ### 6. The client
 
 ```ts
-const comet = connect();
-const todos = comet.subscribe<Todo>("todos.all");
+import type { Schema } from "./schema.ts";
+
+const comet = connect<Schema>();
+const todos = comet.subscribe("todos.all");
 todos.subscribe(render);
 
 const { lag } = await comet.callWithStatus("todos.add", { title });
 ```
 
-`connect()` with no options connects to `/_comet` on the page's own host. `todos.rows` always holds the current rows and `todos.subscribe` fires after each change. Because the call resolves only after its effects arrive, `render` has already run with the new row by the time the `await` returns. `created_at` is a `timestamptz`, so it arrives as a `Date`. See [Client](client.md).
+`schema.ts` is generated from the Go server with `make gen`, so a misspelled method or wrong args fail `npm run typecheck` (see [Typed clients](codegen.md)). `connect()` with no options connects to `/_comet` on the page's own host. `todos.rows` always holds the current rows and `todos.subscribe` fires after each change. Because the call resolves only after its effects arrive, `render` has already run with the new row by the time the `await` returns. `created_at` is a `timestamptz`, so it arrives as a `Date`. See [Client](client.md).
 
 ## Tests
 

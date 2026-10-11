@@ -113,8 +113,42 @@ interface PendingCall {
   reject: (e: CometError) => void;
 }
 
+/**
+ * Opens a connection. With a Schema type argument (as generated on the
+ * server by cometgo.Describe), method names, args, results, publication
+ * names and rows are checked: `connect<Schema>()`.
+ */
+export function connect(opts?: ConnectOptions): Comet;
+export function connect<S extends Schema>(opts?: ConnectOptions): TypedComet<S>;
 export function connect(opts: ConnectOptions = {}): Comet {
   return new Comet(opts);
+}
+
+/**
+ * The shape of a generated schema: per method its args and result, per
+ * publication its args and row.
+ */
+export interface Schema {
+  methods: object;
+  publications: object;
+}
+
+export type MethodName<S extends Schema> = keyof S["methods"] & string;
+export type MethodArgs<S extends Schema, M extends MethodName<S>> = S["methods"][M] extends { args: infer A } ? A : never;
+export type MethodResult<S extends Schema, M extends MethodName<S>> = S["methods"][M] extends { result: infer R } ? R : never;
+export type PubName<S extends Schema> = keyof S["publications"] & string;
+export type PubArgs<S extends Schema, P extends PubName<S>> = S["publications"][P] extends { args: infer A } ? A : never;
+export type PubRow<S extends Schema, P extends PubName<S>> = S["publications"][P] extends { row: infer R } ? R : never;
+
+/** Args may be left out when they accept null (Go args of struct{}). */
+export type CallRest<A> = null extends A ? [args?: A, opts?: CallOptions] : [args: A, opts?: CallOptions];
+export type SubRest<A> = null extends A ? [args?: A] : [args: A];
+
+/** A Comet whose calls and subscriptions are checked against S. */
+export interface TypedComet<S extends Schema> extends Omit<Comet, "call" | "callWithStatus" | "subscribe"> {
+  call<M extends MethodName<S>>(m: M, ...rest: CallRest<MethodArgs<S, M>>): Promise<MethodResult<S, M>>;
+  callWithStatus<M extends MethodName<S>>(m: M, ...rest: CallRest<MethodArgs<S, M>>): Promise<{ value: MethodResult<S, M>; lag: boolean }>;
+  subscribe<P extends PubName<S>>(name: P, ...rest: SubRest<PubArgs<S, P>>): Subscription<PubRow<S, P>>;
 }
 
 export class Comet {
