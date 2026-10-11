@@ -410,7 +410,7 @@ Types are described once per sub in `init.cols`, and values are plain JSON. Ther
 | numeric | `num` | exact decimal string (`"NaN"` allowed) | string (pluggable Decimal) |
 | bool | `bool` | bool | boolean |
 | text, varchar, citext | `text` | string | string |
-| enum | `enum` | string | string (TS union via codegen). User-defined enums are detected from the catalog; arrays of them are `[]enum`. |
+| enum | `enum` | string | string (TS union via codegen). User-defined enums are detected from the catalog; arrays of them (or of a domain over one) are `[]enum`. |
 | uuid | `uuid` | lowercase canonical string | string |
 | timestamptz | `tstz` | RFC 3339 UTC, microsecond precision, `Z`; `"infinity"`/`"-infinity"` | `Date` (opt-in: `Temporal.Instant` or raw string; `Date` drops µs) |
 | date | `date` | `"YYYY-MM-DD"` | string |

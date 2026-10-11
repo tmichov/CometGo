@@ -51,8 +51,8 @@ func typeCode(m *pgtype.Map, oid uint32) string {
 	}
 	t, ok := m.TypeForOID(oid)
 	if !ok {
-		// Types pgx does not know arrive in text format as strings. User enums
-		// are registered before this is reached (types.go).
+		// Types pgx does not know arrive in text format as strings. User
+		// enums are recognised from the catalog instead (engine.colCode).
 		return "text"
 	}
 	switch c := t.Codec.(type) {
@@ -107,6 +107,9 @@ func encodeCell(m *pgtype.Map, code string, oid uint32, v any, raw []byte, forma
 	if elem, ok := strings.CutPrefix(code, "[]"); ok {
 		items, ok := v.([]any)
 		if !ok {
+			if s, isLit := v.(string); isLit && elem == "enum" {
+				return encodeEnumArray(s) // unknown to pgx: an array literal (types.go)
+			}
 			return textCell(m, oid, v)
 		}
 		eoid := elemOID(m, oid)

@@ -39,9 +39,9 @@ type engine struct {
 	// tracks again. Sub ids are never reused (§4.1), so a sub for one of
 	// these is always that re-send.
 	ended map[*conn]map[uint64]bool
-	// pgTypes caches what the catalog says about types pgx does not know,
-	// by OID (types.go).
-	pgTypes      map[uint32]*pgTypeInfo
+	// pgTypes caches the wire code the catalog gives types pgx does not
+	// know, by OID: "enum", "[]enum", or "" for the default (types.go).
+	pgTypes      map[uint32]string
 	carryFences  []*fence
 	carryEvts    []*evtNote
 	carryOut     map[*conn]*connOut
@@ -131,7 +131,7 @@ func newEngine(a *App) *engine {
 		observers: map[string]*observer{},
 		conns:     map[*conn]map[uint64]*subscription{},
 		ended:     map[*conn]map[uint64]bool{},
-		pgTypes:   map[uint32]*pgTypeInfo{},
+		pgTypes:   map[uint32]string{},
 	}
 }
 
@@ -587,24 +587,14 @@ func (e *engine) query(ctx context.Context, tx pgx.Tx, obs *observer) ([]colSpec
 	defer rows.Close()
 	m := tx.Conn().TypeMap()
 	fds := rows.FieldDescriptions()
-	// Columns of types this connection does not know yet, such as user
-	// enums: look them up (once per App) and register them on the
-	// connection, then run the query again so its values are decoded with
-	// them. This happens once per type and connection.
-	if pending := e.typesToRegister(m, fds); len(pending) > 0 {
-		rows.Close()
-		if err := e.registerTypes(ctx, tx, m, pending); err != nil {
-			return nil, nil, nil, err
-		}
-		if rows, err = tx.Query(ctx, obs.q.SQL, obs.q.Args...); err != nil {
-			return nil, nil, nil, err
-		}
-		defer rows.Close()
-		fds = rows.FieldDescriptions()
+	// Types pgx does not know, such as user enums: ask the catalog, once
+	// per type, before the row loop.
+	if err := e.resolveTypes(ctx, m, fds); err != nil {
+		return nil, nil, nil, err
 	}
 	cols := make([]colSpec, len(fds))
 	for i, fd := range fds {
-		cols[i] = colSpec{name: fd.Name, code: typeCode(m, fd.DataTypeOID), oid: fd.DataTypeOID}
+		cols[i] = colSpec{name: fd.Name, code: e.colCode(m, fd.DataTypeOID), oid: fd.DataTypeOID}
 	}
 	keyIdx := make([]int, 0, len(obs.pub.opts.Key))
 	for _, k := range obs.pub.opts.Key {

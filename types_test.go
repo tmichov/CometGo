@@ -2,19 +2,45 @@ package cometgo
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 )
 
+func TestParseArrayLiteral(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{`{}`, `[]`},
+		{`{happy,sad}`, `["happy","sad"]`},
+		{`{"it's complicated",NULL,"NULL","a\"b\\c","x,y"}`, `["it's complicated",null,"NULL","a\"b\\c","x,y"]`},
+		{`{{a,b},{c,d}}`, `[["a","b"],["c","d"]]`},
+		{`[0:1]={a,b}`, `["a","b"]`},
+	} {
+		got, err := encodeEnumArray(c.in)
+		if err != nil || string(got) != c.want {
+			t.Errorf("%s: %s, %v; want %s", c.in, got, err, c.want)
+		}
+	}
+	// Escaped like every other string cell (quote).
+	if got, _ := encodeEnumArray(`{<b>}`); string(got) != "["+string(quote("<b>"))+"]" {
+		t.Errorf("escaping: %s", got)
+	}
+	for _, bad := range []string{``, `{`, `{a`, `{"a}`, `{a}x`, `[0:1]`} {
+		if _, err := parseArrayLiteral(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
 // User-defined enums, unknown to pgx, are reported as enum (and arrays of
-// them as []enum), with values as strings.
+// them, or of a domain over one, as []enum), with values as strings.
 func TestUserEnumTypeCode(t *testing.T) {
 	var table, mood string
 	e := setupFull(t, nil, func(e *testEnv, app *App) {
 		table, mood = e.table+"_m", "mood_"+e.table[len("items_"):]
 		for _, ddl := range []string{
 			fmt.Sprintf("CREATE TYPE %s AS ENUM ('happy', 'sad', 'it''s complicated')", mood),
-			fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, m %s, ms %s[], note text)", table, mood, mood),
+			fmt.Sprintf("CREATE DOMAIN %s_d AS %s", mood, mood),
+			fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, m %s, ms %s[], md %s_d, mds %s_d[], note text)", table, mood, mood, mood, mood),
 		} {
 			if _, err := e.pool.Exec(context.Background(), ddl); err != nil {
 				t.Fatal(err)
@@ -22,6 +48,7 @@ func TestUserEnumTypeCode(t *testing.T) {
 		}
 		t.Cleanup(func() {
 			e.pool.Exec(context.Background(), "DROP TABLE "+table)
+			e.pool.Exec(context.Background(), "DROP DOMAIN "+mood+"_d")
 			e.pool.Exec(context.Background(), "DROP TYPE "+mood)
 		})
 		if err := InstallTriggers(context.Background(), e.pool, table); err != nil {
@@ -29,11 +56,11 @@ func TestUserEnumTypeCode(t *testing.T) {
 		}
 		Publish(app, "moods", PubOptions{Tables: []string{table}, Scope: ScopeShared},
 			func(c *SubCtx, _ struct{}) (Query, error) {
-				return Query{SQL: "SELECT id, m, ms, note FROM " + table + " ORDER BY id"}, nil
+				return Query{SQL: "SELECT id, m, ms, md, mds, note FROM " + table + " ORDER BY id"}, nil
 			})
 	})
 	if _, err := e.pool.Exec(context.Background(), fmt.Sprintf(
-		"INSERT INTO %s VALUES (1, 'happy', ARRAY['sad', 'it''s complicated']::%s[], 'x'), (2, NULL, '{}', NULL)", table, mood)); err != nil {
+		"INSERT INTO %s VALUES (1, 'happy', ARRAY['sad', 'it''s complicated']::%[2]s[], 'sad', ARRAY['happy']::%[2]s_d[], 'x'), (2, NULL, '{}', NULL, NULL, NULL)", table, mood)); err != nil {
 		t.Fatal(err)
 	}
 	a, _ := e.dial(t, nil)
@@ -43,22 +70,64 @@ func TestUserEnumTypeCode(t *testing.T) {
 		t.Fatalf("ended: %v", en["end"])
 	}
 	cols := fmt.Sprint(en["init"].(map[string]any)["cols"])
-	if want := "[[id i4] [m enum] [ms []enum] [note text]]"; cols != want {
+	if want := "[[id i4] [m enum] [ms []enum] [md enum] [mds []enum] [note text]]"; cols != want {
 		t.Fatalf("cols %s, want %s", cols, want)
 	}
-	ops := en["ops"].([]any)
-	if got := fmt.Sprint(ops[0].([]any)[2], ops[1].([]any)[2]); got != "[1 happy [sad it's complicated] x] [2 <nil> [] <nil>]" {
-		t.Fatalf("rows %s", got)
+	ops, _ := json.Marshal(en["ops"])
+	if want := `[["i","1",[1,"happy",["sad","it's complicated"],"sad",["happy"],"x"],0],["i","2",[2,null,[],null,null,null],1]]`; string(ops) != want {
+		t.Fatalf("ops %s\nwant %s", ops, want)
 	}
-	// Live diffs decode the same way, on whatever pooled connection runs them.
-	for i := range 3 {
-		if _, err := e.pool.Exec(context.Background(), fmt.Sprintf("UPDATE %s SET m = '%s' WHERE id = 1", table, []string{"sad", "happy", "it''s complicated"}[i])); err != nil {
+	for i, m := range []string{"sad", "it''s complicated"} {
+		if _, err := e.pool.Exec(context.Background(), fmt.Sprintf("UPDATE %s SET m = '%s', ms = ms || '{happy}' WHERE id = 1", table, m)); err != nil {
 			t.Fatal(err)
 		}
-		m := a.next()
-		ops := entries(m)[0]["ops"].([]any)
-		if got := fmt.Sprint(ops[0].([]any)[2]); got != fmt.Sprintf("[1 %s]", []string{"sad", "happy", "it's complicated"}[i]) {
-			t.Fatalf("patch %s", got)
+		ops, _ := json.Marshal(entries(a.next())[0]["ops"])
+		want := []string{
+			`[["u","1",[1,"sad",2,["sad","it's complicated","happy"]]]]`,
+			`[["u","1",[1,"it's complicated",2,["sad","it's complicated","happy","happy"]]]]`,
+		}[i]
+		if string(ops) != want {
+			t.Fatalf("patch %s\nwant  %s", ops, want)
 		}
+	}
+	// Nothing is registered on the pool's connections: the app's own
+	// queries still get an unknown array type as its text literal.
+	for range 4 {
+		var lit string
+		if err := e.pool.QueryRow(context.Background(), "SELECT ms FROM "+table+" WHERE id = 1").Scan(&lit); err != nil || lit[0] != '{' {
+			t.Fatalf("app query got %q, %v", lit, err)
+		}
+	}
+}
+
+// A type created after the server started (a migration while it runs) is
+// looked up when first seen, not missed for good.
+func TestUserEnumCreatedWhileRunning(t *testing.T) {
+	var table, mood string
+	e := setupFull(t, nil, func(e *testEnv, app *App) {
+		table, mood = e.table+"_late", "late_"+e.table[len("items_"):]
+		t.Cleanup(func() {
+			e.pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+table)
+			e.pool.Exec(context.Background(), "DROP TYPE IF EXISTS "+mood)
+		})
+		Publish(app, "late", PubOptions{Tables: []string{table}, Scope: ScopeShared},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT id, m FROM " + table + " ORDER BY id"}, nil
+			})
+	})
+	for _, ddl := range []string{
+		fmt.Sprintf("CREATE TYPE %s AS ENUM ('on', 'off')", mood),
+		fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, m %s)", table, mood),
+		fmt.Sprintf("INSERT INTO %s VALUES (1, 'on')", table),
+	} {
+		if _, err := e.pool.Exec(context.Background(), ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "late"})
+	en := entries(a.next())[0]
+	if cols := fmt.Sprint(en["init"].(map[string]any)["cols"]); cols != "[[id i4] [m enum]]" {
+		t.Fatalf("cols %s", cols)
 	}
 }

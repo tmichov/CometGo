@@ -2,96 +2,181 @@ package cometgo
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// pgTypeInfo is what the catalog says about a type pgx does not know.
-type pgTypeInfo struct {
-	enum bool   // a user-defined enum
-	name string // its name, for registering it
-	// elem is set for an array of a user-defined enum: the element type.
-	elem *pgTypeInfo
-	oid  uint32
-}
+// User-defined enums are unknown OIDs to pgx: their values arrive in text
+// format as strings, and arrays of them as one array literal. The engine
+// asks the catalog what such a type is and reports enums as "enum" and
+// arrays of them as "[]enum", parsing the literal itself. Nothing is
+// registered on the pool's connections, so the app's own queries see pgx
+// exactly as configured.
 
-// registrable reports whether the connection can be taught info's type.
-func (info *pgTypeInfo) registrable() bool {
-	return info.enum || info.elem != nil
-}
-
-// typesToRegister returns the OIDs among fds that m does not know and that
-// are, or may be, enums or enum arrays: never looked up, or known to be
-// one. Other unknown types stay as they are (text, §10) and cost nothing
-// once looked up.
-func (e *engine) typesToRegister(m *pgtype.Map, fds []pgconn.FieldDescription) []uint32 {
-	var out []uint32
+// resolveTypes looks up, in one query, the OIDs among fds that m does not
+// know and that are not cached yet, and caches what they are. It reads the
+// catalog on its own connection rather than in the tick's snapshot, so a
+// type created since that snapshot began is still found. A type the
+// catalog does not return is not cached and is looked up again next time.
+func (e *engine) resolveTypes(ctx context.Context, m *pgtype.Map, fds []pgconn.FieldDescription) error {
+	var oids []uint32
 	for _, fd := range fds {
-		if _, ok := m.TypeForOID(fd.DataTypeOID); ok {
+		if _, known := m.TypeForOID(fd.DataTypeOID); known {
 			continue
 		}
-		if info, seen := e.pgTypes[fd.DataTypeOID]; seen && !info.registrable() {
-			continue
-		}
-		out = append(out, fd.DataTypeOID)
-	}
-	return out
-}
-
-// registerTypes looks up the types in oids not yet in the cache, then
-// registers the enums and enum arrays among them on m, so that typeCode
-// reports them as enum and []enum and their values decode as strings.
-func (e *engine) registerTypes(ctx context.Context, tx pgx.Tx, m *pgtype.Map, oids []uint32) error {
-	for _, oid := range oids {
-		info, seen := e.pgTypes[oid]
-		if !seen {
-			var err error
-			if info, err = lookupType(ctx, tx, oid); err != nil {
-				return err
-			}
-			e.pgTypes[oid] = info
-		}
-		switch {
-		case info.enum:
-			registerEnum(m, info)
-		case info.elem != nil:
-			elem := registerEnum(m, info.elem)
-			m.RegisterType(&pgtype.Type{Name: "_" + info.elem.name, OID: info.oid, Codec: &pgtype.ArrayCodec{ElementType: elem}})
+		if _, cached := e.pgTypes[fd.DataTypeOID]; !cached {
+			oids = append(oids, fd.DataTypeOID)
 		}
 	}
-	return nil
-}
-
-func registerEnum(m *pgtype.Map, info *pgTypeInfo) *pgtype.Type {
-	if t, ok := m.TypeForOID(info.oid); ok {
-		return t
+	if len(oids) == 0 {
+		return nil
 	}
-	t := &pgtype.Type{Name: info.name, OID: info.oid, Codec: &pgtype.EnumCodec{}}
-	m.RegisterType(t)
-	return t
-}
-
-// lookupType reads oid's kind from pg_type: an enum, an array of an enum,
-// or anything else.
-func lookupType(ctx context.Context, tx pgx.Tx, oid uint32) (*pgTypeInfo, error) {
-	var typtype, name, elemType, elemName string
-	var elem uint32
-	err := tx.QueryRow(ctx, `
-		SELECT t.typtype::text, t.typname, COALESCE(e.oid, 0), COALESCE(e.typtype::text, ''), COALESCE(e.typname, '')
+	rows, err := e.a.db.Query(ctx, `
+		SELECT t.oid, t.typtype::text, COALESCE(el.typtype::text, ''), COALESCE(base.typtype::text, '')
 		FROM pg_type t
-		LEFT JOIN pg_type e ON e.oid = t.typelem AND t.typcategory = 'A'
-		WHERE t.oid = $1`, oid).Scan(&typtype, &name, &elem, &elemType, &elemName)
-	if err == pgx.ErrNoRows {
-		return &pgTypeInfo{oid: oid}, nil
+		LEFT JOIN pg_type el ON el.oid = t.typelem AND t.typcategory = 'A'
+		LEFT JOIN pg_type base ON base.oid = el.typbasetype AND el.typtype = 'd'
+		WHERE t.oid = ANY($1)`, oids)
+	if err != nil {
+		return fmt.Errorf("look up column types: %w", err)
 	}
+	defer rows.Close()
+	for rows.Next() {
+		var oid uint32
+		var typ, elemTyp, baseTyp string
+		if err := rows.Scan(&oid, &typ, &elemTyp, &baseTyp); err != nil {
+			return err
+		}
+		code := ""
+		switch {
+		case typ == "e":
+			code = "enum"
+		case elemTyp == "e", elemTyp == "d" && baseTyp == "e":
+			// An array of an enum, or of a domain over one (a scalar
+			// domain column already arrives as its base type).
+			code = "[]enum"
+		}
+		e.pgTypes[oid] = code
+	}
+	return rows.Err()
+}
+
+// colCode is typeCode with the catalog's answer for types pgx does not know.
+func (e *engine) colCode(m *pgtype.Map, oid uint32) string {
+	if _, known := m.TypeForOID(oid); !known {
+		if code := e.pgTypes[oid]; code != "" {
+			return code
+		}
+	}
+	return typeCode(m, oid)
+}
+
+// parseArrayLiteral parses a Postgres array literal of text elements, such
+// as {happy,"it's complicated",NULL}, into nested []any of string and nil.
+func parseArrayLiteral(s string) (any, error) {
+	if strings.HasPrefix(s, "[") {
+		// Explicit bounds, e.g. [0:1]={a,b}: drop them, keep the elements.
+		i := strings.Index(s, "=")
+		if i < 0 {
+			return nil, fmt.Errorf("malformed array literal %q", s)
+		}
+		s = s[i+1:]
+	}
+	p := &arrayParser{s: s}
+	v, err := p.array()
 	if err != nil {
 		return nil, err
 	}
-	info := &pgTypeInfo{oid: oid, name: name, enum: typtype == "e"}
-	if elem != 0 && elemType == "e" {
-		info.elem = &pgTypeInfo{oid: elem, name: elemName, enum: true}
+	if p.i != len(p.s) {
+		return nil, fmt.Errorf("malformed array literal %q", s)
 	}
-	return info, nil
+	return v, nil
+}
+
+type arrayParser struct {
+	s string
+	i int
+}
+
+func (p *arrayParser) array() ([]any, error) {
+	if p.i >= len(p.s) || p.s[p.i] != '{' {
+		return nil, fmt.Errorf("malformed array literal %q", p.s)
+	}
+	p.i++
+	out := []any{}
+	if p.i < len(p.s) && p.s[p.i] == '}' {
+		p.i++
+		return out, nil
+	}
+	for {
+		v, err := p.element()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+		if p.i >= len(p.s) {
+			return nil, fmt.Errorf("malformed array literal %q", p.s)
+		}
+		switch p.s[p.i] {
+		case ',':
+			p.i++
+		case '}':
+			p.i++
+			return out, nil
+		default:
+			return nil, fmt.Errorf("malformed array literal %q", p.s)
+		}
+	}
+}
+
+func (p *arrayParser) element() (any, error) {
+	if p.i >= len(p.s) {
+		return nil, fmt.Errorf("malformed array literal %q", p.s)
+	}
+	switch p.s[p.i] {
+	case '{':
+		return p.array()
+	case '"':
+		p.i++
+		var sb strings.Builder
+		for p.i < len(p.s) {
+			c := p.s[p.i]
+			p.i++
+			switch c {
+			case '\\':
+				if p.i >= len(p.s) {
+					return nil, fmt.Errorf("malformed array literal %q", p.s)
+				}
+				sb.WriteByte(p.s[p.i])
+				p.i++
+			case '"':
+				return sb.String(), nil
+			default:
+				sb.WriteByte(c)
+			}
+		}
+		return nil, fmt.Errorf("malformed array literal %q", p.s)
+	}
+	start := p.i
+	for p.i < len(p.s) && p.s[p.i] != ',' && p.s[p.i] != '}' {
+		p.i++
+	}
+	tok := strings.TrimSpace(p.s[start:p.i])
+	if strings.EqualFold(tok, "NULL") {
+		return nil, nil
+	}
+	return tok, nil
+}
+
+// encodeEnumArray encodes an enum array that arrived as a literal.
+func encodeEnumArray(lit string) (json.RawMessage, error) {
+	v, err := parseArrayLiteral(lit)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(v)
 }
