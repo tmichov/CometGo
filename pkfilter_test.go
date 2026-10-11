@@ -102,6 +102,8 @@ func TestSQLEqual(t *testing.T) {
 		{u, "12345678-9abc-def0-0102-030405060708", true, true},
 		{u, u, true, true},
 		{u, "not-a-uuid", false, false},
+		{int32(7), uint8(7), true, true},
+		{int64(7), uint64(1 << 63), false, false},
 		{"5", 5, false, false},   // no implicit casts: re-run
 		{1.5, 1.5, false, false}, // floats are not compared
 		{"a", nil, false, false},
@@ -391,5 +393,58 @@ func BenchmarkChangedKeyFilter(b *testing.B) {
 				b.ReportMetric(float64(e.app.engine.runs.Load()-before)/float64(b.N), "queries/write")
 			})
 		}
+	}
+}
+
+// Columns sqlEqual cannot compare like `=`, and result keys that are not the
+// table's primary key as-is, must fall back to full re-runs: char(n) pads,
+// and a composite key with id::text builds different keys than the
+// notification's (["a","1"] against ["a",1]).
+func TestChangedKeyFilterFallsBackWhenItCannotCompare(t *testing.T) {
+	var padded, comp string
+	e := setupFull(t, nil, func(e *testEnv, app *App) {
+		padded, comp = e.table+"_p", e.table+"_k"
+		for _, ddl := range []string{
+			"CREATE TABLE " + padded + " (id int PRIMARY KEY, owner char(8) NOT NULL)",
+			"CREATE TABLE " + comp + " (org text, id int, owner text NOT NULL, PRIMARY KEY (org, id))",
+		} {
+			if _, err := e.pool.Exec(context.Background(), ddl); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Cleanup(func() { e.pool.Exec(context.Background(), "DROP TABLE "+padded+", "+comp) })
+		if err := InstallTriggers(context.Background(), e.pool, padded, comp); err != nil {
+			t.Fatal(err)
+		}
+		Publish(app, "padded", PubOptions{Tables: []string{padded}, Scope: ScopeShared},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT id, owner FROM " + padded + " WHERE owner = 'bob' ORDER BY id", Match: map[string]any{"owner": "bob"}}, nil
+			})
+		Publish(app, "castKey", PubOptions{Tables: []string{comp}, Key: []string{"org", "id"}, Scope: ScopeShared},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT org, id::text AS id FROM " + comp + " WHERE owner = 'bob' ORDER BY org, id", Match: map[string]any{"owner": "bob"}}, nil
+			})
+		Method(app, "exec", func(c *Call, a struct{ SQL []string }) (struct{}, error) {
+			for _, s := range a.SQL {
+				if _, err := c.Tx.Exec(c.Context, s); err != nil {
+					return struct{}{}, err
+				}
+			}
+			return struct{}{}, nil
+		})
+	})
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "padded"})
+	a.send(map[string]any{"t": "sub", "s": 2, "name": "castKey"})
+	a.waitInits(2)
+	rows := subRows{}
+	a.execCall(rows, 1, "INSERT INTO "+padded+" VALUES (1, 'bob')", "INSERT INTO "+comp+" VALUES ('a', 1, 'bob')")
+	if len(rows[1]) != 1 || len(rows[2]) != 1 {
+		t.Fatalf("inserts missed: %v", rows)
+	}
+	// The row stops matching: only the result's key can tell.
+	a.execCall(rows, 2, "UPDATE "+padded+" SET owner = 'al'", "UPDATE "+comp+" SET owner = 'al'")
+	if len(rows[1]) != 0 || len(rows[2]) != 0 {
+		t.Fatalf("rows that stopped matching kept: %v", rows)
 	}
 }

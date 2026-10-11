@@ -40,8 +40,8 @@ type engine struct {
 	// tracks again. Sub ids are never reused (§4.1), so a sub for one of
 	// these is always that re-send.
 	ended map[*conn]map[uint64]bool
-	// pks caches tables' primary keys for changed-key filtering.
-	pks map[string]*pkInfo
+	// tables caches table metadata for changed-key filtering.
+	tables map[string]*tableInfo
 	// runs counts observer query executions (tests and benchmarks).
 	runs         atomic.Int64
 	carryFences  []*fence
@@ -134,7 +134,7 @@ func newEngine(a *App) *engine {
 		observers: map[string]*observer{},
 		conns:     map[*conn]map[uint64]*subscription{},
 		ended:     map[*conn]map[uint64]bool{},
-		pks:       map[string]*pkInfo{},
+		tables:    map[string]*tableInfo{},
 	}
 }
 
@@ -526,41 +526,11 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		return err
 	}
 	if len(cands) > 0 {
-		fetched := map[string]*changedRows{}
-		for _, obs := range cands {
-			t := obs.tables[0]
-			if _, done := fetched[t]; done {
-				continue
-			}
-			// A savepoint, so a failure only costs the filtering: nil
-			// changed rows make every candidate re-run.
-			sp, err := tx.Begin(ctx)
-			if err != nil {
-				return err
-			}
-			ch, err := e.fetchChanged(ctx, sp, t, changes[t])
-			if err != nil {
-				e.a.log.Debug("changed-key filter unavailable, re-running", "table", t, "err", err)
-				ch = nil
-				if err := sp.Rollback(ctx); err != nil {
-					return err
-				}
-			} else if err := sp.Commit(ctx); err != nil {
-				return err
-			}
-			fetched[t] = ch
+		affected, err := e.filterCandidates(ctx, tx, cands, changes)
+		if err != nil {
+			return err
 		}
-		// Notifications that arrived after this tick's drain may be for
-		// commits the snapshot already holds; their keys are not in ch, so
-		// those tables' candidates run. This narrows, but cannot close, the
-		// gap between LISTEN delivery and the snapshot; whatever slips
-		// through is caught next tick, as for observers of other tables.
-		lateAll, late := e.lateTables()
-		for _, obs := range cands {
-			if lateAll || late[obs.tables[0]] || obs.affected(fetched[obs.tables[0]]) {
-				toRun = append(toRun, obs)
-			}
-		}
+		toRun = append(toRun, affected...)
 	}
 	staged := make([]runResult, 0, len(toRun))
 	for _, obs := range toRun {
