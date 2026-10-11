@@ -121,8 +121,9 @@ const (
 
 ```go
 type Query struct {
-	SQL  string
-	Args []any
+	SQL   string
+	Args  []any
+	Match map[string]any // optional, see below
 }
 
 type SubCtx struct {
@@ -131,9 +132,46 @@ type SubCtx struct {
 }
 ```
 
-The query is re-run in full on every change, so it must be deterministic for a given snapshot: add `ORDER BY` to any publication that is not `Unordered`. `Args` are passed to pgx as query parameters.
+The query is re-run in full when a table it reads changes, so it must be deterministic for a given snapshot: add `ORDER BY` to any publication that is not `Unordered`. `Args` are passed to pgx as query parameters.
 
 `SubCtx.Context` is the engine's context, not the client's.
+
+#### Skipping unaffected re-runs: `Query.Match`
+
+By default, every write to a table re-runs every observer that reads it. With 1,000 users each subscribed to their own rows of `todos` (`ScopeUser`), one insert costs 1,000 queries. `Match` declares which rows the query returns, so the engine can tell which observers a write can affect and re-run only those:
+
+```go
+cometgo.Publish(app, "todos.mine", cometgo.PubOptions{Tables: []string{"todos"}},
+	func(c *cometgo.SubCtx, _ struct{}) (cometgo.Query, error) {
+		return cometgo.Query{
+			SQL:   `SELECT id, title, done FROM todos WHERE owner = $1 ORDER BY id`,
+			Args:  []any{c.Identity.UserID},
+			Match: map[string]any{"owner": c.Identity.UserID},
+		}, nil
+	})
+```
+
+For each write, the engine reads the changed rows once, by primary key, inside the tick's snapshot. It then re-runs an observer only if a changed row matches its `Match`, or its current result holds one of the changed keys (a delete, or a row that stopped matching). The re-run is the normal full query, so what clients receive is unchanged.
+
+`Match` is a promise about the query, and the engine trusts it. It must describe the query's rows exactly:
+
+- The publication reads one table, and `Key` is that table's primary key, with the same columns in the same order.
+- The result is every row of the table where each `Match` column equals its value. There is no `LIMIT`, `OFFSET`, join, subquery or other condition. `ORDER BY` is fine. An empty map means every row.
+- Values are compared the way pgx decodes the column:
+  - `string` for `text` and `varchar` (with a deterministic collation)
+  - Go integer types (`int`, `int8`–`int64`, `uint8`–`uint32`, and `uint`/`uint64` up to `math.MaxInt64`) for `int2`, `int4` and `int8`
+  - `bool`
+  - `[16]byte` or the usual string form for `uuid`
+
+  Other column types are never compared in Go: `char(n)` (its padding), `citext`, enums, floats, numerics, and `text` with a nondeterministic collation all re-run, as without `Match`.
+
+If the engine can't decide, it re-runs the observer, exactly as without `Match`. That happens for:
+- a `nil` value, a value of another Go type, or a column the table lacks
+- a primary key that isn't `int2`/`int4`/`int8`, `text` or `uuid`, or a result key column whose type differs from the table's (e.g. `id::text AS id`)
+- a statement whose change list the triggers could not send: more than 1,000 rows, or keys that do not fit in one notification (about 7,500 bytes), so only the table is reported
+- the listener reconnecting
+
+Notifications that arrive between the start of a tick and its snapshot are folded into that tick's checks: their keys are checked too. One that is still on its way from Postgres when the snapshot is taken can slip through. A transaction's notifications can thus be split across two ticks while the first tick's snapshot already holds the whole transaction. An observer skipped on the first tick then catches up on the next, as observers of other tables already do. A call's result still waits for all of its writes (§6.2).
 
 ## Methods
 
@@ -391,6 +429,6 @@ Requirements:
 - Tables are named `"table"` (meaning `public.table`) or `"schema.table"`.
 - Postgres 11 or newer (the triggers use `EXECUTE FUNCTION`; the protocol spec's "PG 10+" is the minimum for transition tables, not for this code).
 
-Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. In v1-core any notification for a table re-runs every observer that reads it.
+Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. Every notification for a table re-runs the observers that read it, except observers whose query declares [`Match`](#skipping-unaffected-re-runs-querymatch), which re-run only if the changed rows can affect them.
 
 If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.

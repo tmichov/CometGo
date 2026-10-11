@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -39,6 +40,10 @@ type engine struct {
 	// tracks again. Sub ids are never reused (§4.1), so a sub for one of
 	// these is always that re-send.
 	ended map[*conn]map[uint64]bool
+	// tables caches table metadata for changed-key filtering.
+	tables map[string]*tableInfo
+	// runs counts observer query executions (tests and benchmarks).
+	runs atomic.Int64
 	// coalescing holds the connections in coalescing mode (§8.1): their
 	// queue went over softQueuedBytes, so their subs' changes are held as
 	// needsReset until it drains below lowWaterBytes.
@@ -59,6 +64,7 @@ type notification struct {
 	n     uint64
 	all   bool   // listener (re)connected or unparseable: everything is dirty
 	table string // r/t notifications
+	keys  string // r notifications: JSON array of PK arrays
 	token string // fence
 	evt   *evtNote
 }
@@ -143,6 +149,7 @@ func newEngine(a *App) *engine {
 		observers:   map[string]*observer{},
 		conns:       map[*conn]map[uint64]*subscription{},
 		ended:       map[*conn]map[uint64]bool{},
+		tables:      map[string]*tableInfo{},
 		coalescing:  map[*conn]bool{},
 		snapshotted: map[*conn]int{},
 	}
@@ -239,14 +246,19 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	}
 	e.mu.Unlock()
 
-	dirtyTables := map[string]bool{}
+	changes := map[string]*tableChange{}
 	allDirty := false
 	for _, n := range notes {
 		switch {
 		case n.all:
 			allDirty = true
 		case n.table != "":
-			dirtyTables[n.table] = true
+			tc := changes[n.table]
+			if tc == nil {
+				tc = &tableChange{}
+				changes[n.table] = tc
+			}
+			tc.add(n)
 		}
 	}
 
@@ -299,8 +311,17 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		}
 	}
 
+	// Observers whose query declares Match and whose table only reported
+	// changed keys are candidates: they run only if those keys can affect
+	// them, decided inside the snapshot (pkfilter.go).
+	var cands []*observer
 	for _, obs := range e.observers {
-		if allDirty || slices.ContainsFunc(obs.tables, func(t string) bool { return dirtyTables[t] }) {
+		if !allDirty && !slices.ContainsFunc(obs.tables, func(t string) bool { return changes[t] != nil }) {
+			continue
+		}
+		if !allDirty && !obs.dirty && !obs.awaitsInit() && obs.filterable(changes[obs.tables[0]]) {
+			cands = append(cands, obs)
+		} else {
 			obs.dirty = true
 		}
 	}
@@ -314,11 +335,16 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			toRun = append(toRun, obs)
 		}
 	}
-	if len(toRun) > 0 {
-		if err := e.runObservers(ctx, toRun); err != nil {
+	if len(toRun) > 0 || len(cands) > 0 {
+		if err := e.runObservers(ctx, toRun, cands, changes); err != nil {
 			e.a.log.Warn("tick snapshot failed, retrying", "err", err)
 			// Observers stay dirty; fences wait for a tick that actually
 			// reflects their writes. Requests already applied stay applied.
+			// Candidates lose the keys that made them candidates, so they
+			// re-run in full.
+			for _, obs := range cands {
+				obs.dirty = true
+			}
 			e.carryFences = fences
 			e.carryEvts = evts
 			e.carryOut = out
@@ -581,10 +607,11 @@ type runResult struct {
 	err    *Error
 }
 
-// runObservers re-runs toRun inside one REPEATABLE READ snapshot. Results are
-// staged and applied only once the snapshot transaction has committed, so a
-// failure leaves every observer exactly as it was, still dirty.
-func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
+// runObservers re-runs toRun inside one REPEATABLE READ snapshot, plus each
+// candidate the changed rows can affect. Results are staged and applied only
+// once the snapshot transaction has committed, so a failure leaves every
+// observer exactly as it was.
+func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange) error {
 	tx, err := e.a.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
@@ -593,8 +620,16 @@ func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", e.a.cfg.QueryTimeout.Milliseconds())); err != nil {
 		return err
 	}
+	if len(cands) > 0 {
+		affected, err := e.filterCandidates(ctx, tx, cands, changes)
+		if err != nil {
+			return err
+		}
+		toRun = append(toRun, affected...)
+	}
 	staged := make([]runResult, 0, len(toRun))
 	for _, obs := range toRun {
+		e.runs.Add(1)
 		// A savepoint per observer keeps one failing query from poisoning
 		// the snapshot for the rest.
 		sp, err := tx.Begin(ctx)
@@ -780,7 +815,7 @@ func parseNotification(p string) notification {
 		switch parts[1] {
 		case "r":
 			if len(parts) == 5 {
-				return notification{table: parts[3]}
+				return notification{table: parts[3], keys: parts[4]}
 			}
 		case "t":
 			if len(parts) == 4 {

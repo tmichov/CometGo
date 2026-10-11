@@ -253,6 +253,19 @@ type PubOptions struct {
 type Query struct {
 	SQL  string
 	Args []any
+
+	// Match, if set, lets the engine skip re-running this query for writes
+	// that cannot affect it (PROTOCOL.md §11). It must describe the query's
+	// row set exactly: the publication reads one table, Key is that table's
+	// primary key (same columns, same order), and the result is every row
+	// of the table where each column equals its value, with no LIMIT,
+	// OFFSET, join, subquery or other condition. An empty map means every
+	// row. Values are compared as pgx decodes the column: string for text
+	// and enums (deterministic collations only), int types for integers,
+	// bool, and [16]byte or its string form for uuid. Anything else, a nil
+	// value, or a column the table lacks, makes every change re-run the
+	// query, as without Match.
+	Match map[string]any
 }
 
 // SubCtx is passed to publication query builders.
