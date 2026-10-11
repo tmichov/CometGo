@@ -297,7 +297,7 @@ Resume makes a short drop invisible: no snapshot is re-sent, and calls in flight
 **Validity.** The resume succeeds only if all of these hold:
 - the session exists on this node and has not ended,
 - `seq` is not below the last ack or the overflow point, and not above the last `seq` sent,
-- the `hello` authenticates the same principal (same user ID, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
+- the `hello` authenticates the same principal (same user ID and server-side scope key, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
 
 For an anonymous session, the session id is the only credential, as a session cookie would be. It is 72 random bits, is sent only in `welcome`, and must be kept as secret as a token.
 

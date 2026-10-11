@@ -115,7 +115,7 @@ const (
 )
 ```
 
-- **`ScopeUser`** (the default) shares an observer only between connections whose `Identity.UserID` is the same. Anonymous connections share with each other. This is the safe choice for any query that depends on who is asking, **as long as `UserID` alone determines the query**. The scope key is `UserID` and nothing else: an identity with an empty `UserID` shares with anonymous connections, and two identities with the same `UserID` but different `Data` (say, a different tenant or role) share one observer. If the query depends on anything in `Identity` besides `UserID`, make `UserID` unique per distinct query (for example `tenant + ":" + user`) or pass that value in the subscription args and check it in `fn`.
+- **`ScopeUser`** (the default) shares an observer only between connections with the same **scope key**: `Identity.ScopeKey`, or `Identity.UserID` when `ScopeKey` is empty. Anonymous connections share with each other. This is the safe choice for any query that depends on who is asking, **as long as the scope key alone determines the query**. Nothing else is compared: an identity with an empty scope key shares with anonymous connections, and two identities with the same scope key but different `Data` share one observer. If the query depends on anything in `Identity` besides `UserID`, such as a tenant or a role, set `ScopeKey` to include it (for example `tenant + ":" + userID`), or pass that value in the subscription args and check it in `fn`.
 - **`ScopeShared`** shares one observer between every connection. Only use it when the query does not depend on the caller's identity at all, such as a public feed. Because `fn` runs once per observer, a `ScopeShared` publication that reads `c.Identity` serves the **first** subscriber's result to everyone else.
 
 ### Query and SubCtx
@@ -213,7 +213,7 @@ Other details:
 A call whose connection dropped before its result arrived has an unknown outcome. A client that marks a call idempotent (`call(m, args, { idempotent: true })`) attaches a key, `ik`, and re-sends the call after reconnecting. The server runs the method at most once per key and user:
 
 - The first call with a key inserts a row into `comet_idempotency` inside the method's own transaction, runs the handler, and stores the encoded result in that row. The row commits together with the handler's writes.
-- A later call with the same key and the same `Identity.UserID` gets the stored result back, without running the handler. It still commits with a fence (unless sent with `noFence`), like any call.
+- A later call with the same key and the same scope key (`Identity.ScopeKey`, or `UserID`) gets the stored result back, without running the handler. It still commits with a fence (unless sent with `noFence`), like any call.
 - A duplicate that arrives while the first is still running waits for it: if the first commits, the duplicate returns its result; if it fails, the duplicate runs the handler itself.
 - A failed call (an error, a panic, a rolled-back transaction) stores nothing, so a retry runs again.
 - The same key used for a different method returns `BAD_REQUEST`. The args are not compared.
@@ -235,7 +235,7 @@ func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, da
 An event is addressed to one observer: the publication, its args and its scope. It is delivered to every subscription bound to that observer, and the client receives it through `sub.onEvent(topic, fn)`.
 
 - `args` must encode to the same JSON value the client sent when subscribing (key order and whitespace do not matter). The comparison is on JSON, not on the decoded args: a Go struct without `json` tags encodes `ProjectID`, which does not match a client's `projectId`, and fields the client omitted must be omitted too. Tag your args types and use the same type for the publication and `Emit`. `nil` matches a subscription made without args. An event that matches no subscription is dropped without an error.
-- `scope` is the user ID for a `ScopeUser` publication, and must not be empty: anonymous subscribers cannot be targeted. It is ignored for `ScopeShared`.
+- `scope` is the subscribers' scope key (`Identity.ScopeKey`, or `UserID` when that is empty) for a `ScopeUser` publication, and must not be empty: anonymous subscribers cannot be targeted. It is ignored for `ScopeShared`.
 - `data` is JSON-encoded.
 
 `Emit` sends the event at once. `EmitAfterCommit` sends it from inside a method's transaction: the event is sent only if the method commits, and the client receives it after the update carrying the method's writes and before the method's result. Use it whenever the event refers to data the method writes.
@@ -304,7 +304,8 @@ A connection is either anonymous or bound to an `*Identity`:
 
 ```go
 type Identity struct {
-	UserID    string    // used by ScopeUser to separate users
+	UserID    string    // identifies the user
+	ScopeKey  string    // optional; the scope key, defaults to UserID (see below)
 	User      any       // sent to the client; defaults to {"id": UserID}
 	ExpiresAt time.Time // optional; see below
 	Data      any       // free-form, server-side only
@@ -312,6 +313,16 @@ type Identity struct {
 ```
 
 Publications and methods see it as `c.Identity` (nil when anonymous). `User` is what the client sees as `comet.user`; `Data` never leaves the server.
+
+The **scope key** is `ScopeKey` if set, otherwise `UserID`. It decides:
+
+- which connections share a `ScopeUser` observer ([Scope](#scope));
+- which subscriptions `Emit`'s `scope` argument targets ([Events](#events));
+- whether an auth change counts as the same principal (same `UserID` **and** same scope key). Switching to another scope key under the same `UserID`, for example to another tenant, rebinds and resets every subscription like a login;
+- whether a session can be [resumed](#session-resume): the resuming identity must have the same `UserID` and scope key;
+- which [idempotency keys](#idempotency-keys) a call can reuse.
+
+Set `ScopeKey` when two identities of one user must not see each other's data, as with multi-tenant users. It shares a namespace with `UserID` values, so build it from the `UserID` (e.g. `tenant + ":" + userID`), so that it can never equal another user's `UserID`.
 
 There are two ways to authenticate.
 
@@ -327,7 +338,7 @@ Called with the token the client sends when it connects and every time it calls 
 - Return a `*cometgo.Error` (typically `UNAUTHENTICATED`) to reject it with that error, or `(nil, nil)` to reject it as `UNAUTHENTICATED`.
 - An invalid token never closes the connection: the connection continues as anonymous and the client is told the token was rejected.
 
-When the identity changes (login, logout, a different user), every subscription on the connection is re-bound to the new identity and reset in one atomic update. Subscriptions the new identity may not read end with the error their publication returns. Calls already running keep the identity they started with. A refresh that keeps the same `UserID` changes nothing on the connection's subscriptions.
+When the identity changes (login, logout, a different user), every subscription on the connection is re-bound to the new identity and reset in one atomic update. Subscriptions the new identity may not read end with the error their publication returns. Calls already running keep the identity they started with. A refresh that keeps the same `UserID` and scope key changes nothing on the connection's subscriptions; a change of scope key alone (another tenant) counts as a different identity.
 
 ### Cookie sessions: `AuthenticateRequest`
 
@@ -368,9 +379,9 @@ The session is not resumed, and the client falls back to a full resync, when:
 - the server restarted,
 - the grace window passed,
 - the buffer overflowed while the client was away,
-- the reconnecting client authenticates as a different user than the session's.
+- the reconnecting client authenticates as a different user, or the same user with a different scope key, than the session's.
 
-A token refresh for the same user is fine. A protocol error, or a deliberate close by the client (code 1000/1001, e.g. a page unload), ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable. An anonymous session is resumable by whoever holds its session id, which the client keeps in memory only.
+A token refresh for the same user and scope key is fine. A protocol error, or a deliberate close by the client (code 1000/1001, e.g. a page unload), ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable. An anonymous session is resumable by whoever holds its session id, which the client keeps in memory only.
 
 **Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node (sticky sessions, e.g. by cookie or client IP). Without sticky routing everything still works, but a reconnect that lands on another node resyncs.
 

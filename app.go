@@ -23,8 +23,16 @@ import (
 // Identity is an authenticated principal.
 type Identity struct {
 	// UserID identifies the user. Publications with ScopeUser are shared only
-	// between connections with the same UserID.
+	// between connections with the same scope key: ScopeKey, or UserID when
+	// ScopeKey is empty.
 	UserID string
+	// ScopeKey, if set, replaces UserID as the scope key: it separates
+	// ScopeUser observers, is the scope Emit targets, and must match for a
+	// session to be resumed, an auth change to skip the rebind, or an
+	// idempotency key to return its stored result. Set it when the query
+	// depends on more than the user, e.g. tenant + ":" + UserID. It shares a
+	// namespace with UserID values, so include the UserID in it.
+	ScopeKey string
 	// User is sent to the client in welcome/authRes. Defaults to {"id": UserID}.
 	User any
 	// ExpiresAt, if set, downgrades the connection to anonymous when reached
@@ -37,6 +45,17 @@ type Identity struct {
 func (id *Identity) userID() string {
 	if id == nil {
 		return ""
+	}
+	return id.UserID
+}
+
+// scope is the identity's scope key: ScopeKey, or UserID if that is empty.
+func (id *Identity) scope() string {
+	if id == nil {
+		return ""
+	}
+	if id.ScopeKey != "" {
+		return id.ScopeKey
 	}
 	return id.UserID
 }
