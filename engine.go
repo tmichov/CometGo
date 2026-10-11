@@ -53,7 +53,10 @@ type engine struct {
 	// Their soft limit is that much higher: a queue full of a snapshot is
 	// not a client falling behind on diffs, and coalescing would answer it
 	// with yet another snapshot.
-	snapshotted  map[*conn]int
+	snapshotted map[*conn]int
+	// pgTypes caches the wire code the catalog gives types pgx does not
+	// know, by OID: "enum", "[]enum", or "" for the default (types.go).
+	pgTypes      map[uint32]string
 	carryFences  []*fence
 	carryEvts    []*evtNote
 	carryOut     map[*conn]*connOut
@@ -152,6 +155,7 @@ func newEngine(a *App) *engine {
 		tables:      map[string]*tableInfo{},
 		coalescing:  map[*conn]bool{},
 		snapshotted: map[*conn]int{},
+		pgTypes:     map[uint32]string{},
 	}
 }
 
@@ -713,9 +717,14 @@ func (e *engine) query(ctx context.Context, tx pgx.Tx, obs *observer) ([]colSpec
 	defer rows.Close()
 	m := tx.Conn().TypeMap()
 	fds := rows.FieldDescriptions()
+	// Types pgx does not know, such as user enums: ask the catalog, once
+	// per type, before the row loop.
+	if err := e.resolveTypes(ctx, m, fds); err != nil {
+		return nil, nil, nil, err
+	}
 	cols := make([]colSpec, len(fds))
 	for i, fd := range fds {
-		cols[i] = colSpec{name: fd.Name, code: typeCode(m, fd.DataTypeOID), oid: fd.DataTypeOID}
+		cols[i] = colSpec{name: fd.Name, code: e.colCode(m, fd.DataTypeOID), oid: fd.DataTypeOID}
 	}
 	keyIdx := make([]int, 0, len(obs.pub.opts.Key))
 	for _, k := range obs.pub.opts.Key {
