@@ -187,3 +187,95 @@ func TestClientShutdownEndToEnd(t *testing.T) {
 	}
 	t.Log(strings.Join(out, "\n"))
 }
+
+// A call keeps running after its session ends (the outcome is decided
+// server-side), and Shutdown waits for it too.
+func TestShutdownWaitsForCallOfEndedSession(t *testing.T) {
+	e := setup(t)
+	a, _ := e.dial(t, nil) // no resume: the session ends with the socket
+	a.send(map[string]any{"t": "call", "id": 1, "m": "slowAdd", "args": map[string]any{"Owner": "x", "Name": "orphan"}})
+	for e.slowRuns.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	a.kill()
+	for deadline := time.Now().Add(5 * time.Second); len(e.app.liveConns()) > 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("session never ended")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Two callers: the second waits for the first, not returning early.
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- e.app.Shutdown(ctx) }()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if n := e.rowsNamed(t, "orphan"); n != 1 {
+			t.Fatalf("Shutdown returned with the call not committed (%d rows)", n)
+		}
+	}
+}
+
+// Smoke test: Shutdown completes while a subscription keeps receiving
+// changes. It does not force the writer to always find a non-empty queue,
+// so it passes without the push-drop-on-closing guard too.
+func TestShutdownClosesDespiteTraffic(t *testing.T) {
+	e := setup(t)
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	a.next()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('x', 'busy')")
+		}
+	}()
+	go func() {
+		for {
+			if _, _, err := a.ws.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := e.app.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// At its inflight limit, a call after goaway is still told UNAVAILABLE,
+// not RATE_LIMITED.
+func TestShutdownRefusalBeatsRateLimit(t *testing.T) {
+	e := setupWith(t, func(c *Config) { c.MaxInflight = 1 })
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "call", "id": 1, "m": "slowAdd", "args": map[string]any{"Owner": "x", "Name": "first"}})
+	for e.slowRuns.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	go e.app.Shutdown(context.Background())
+	if g := a.next(); g["t"] != "goaway" {
+		t.Fatalf("expected goaway, got %v", g)
+	}
+	a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "x", "Name": "second"}})
+	for {
+		m := a.next()
+		if m["t"] == "res" && m["id"].(float64) == 2 {
+			if code := m["err"].(map[string]any)["code"]; code != CodeUnavailable {
+				t.Fatalf("got %v", code)
+			}
+			return
+		}
+	}
+}

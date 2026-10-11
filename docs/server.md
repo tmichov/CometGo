@@ -348,12 +348,13 @@ Memory cost: each disconnected session holds its subscriptions plus at most `Res
 
 Each client reconnects after its own delay, so a rolling restart spreads the reconnects (and their resyncs) over five seconds. If `ctx` ends first, `Shutdown` closes the remaining sockets at once and returns `ctx.Err()`. Calls still running then finish on their own, and their clients see `CONNECTION_LOST`.
 
-Call it before `http.Server.Shutdown`, which does not wait for WebSocket connections:
+Pass `Start` a context that outlives the shutdown signal (or `context.Background()`): the engine and the listener must keep running while `Shutdown` drains, or in-flight calls wait out `FenceTimeout` and subscriptions stop updating. Call `Shutdown` before `http.Server.Shutdown`, which does not wait for WebSocket connections. Calling `Shutdown` again, or concurrently, waits for the first one.
 
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 defer stop()
-// ... set up app and srv, then:
+app.Start(context.Background()) // not ctx: it must outlive the signal
+// ... set up srv, then:
 <-ctx.Done()
 shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 defer cancel()

@@ -111,6 +111,9 @@ type conn struct {
 	// retryIn is the retryInMs of the goaway sent to this session; calls
 	// refused during shutdown carry it as retryAfterMs.
 	retryIn atomic.Int64
+	// goawaySock is the socket goaway was sent on (guarded by mu), so each
+	// socket gets it once.
+	goawaySock *socket
 }
 
 type runningCall struct {
@@ -375,6 +378,11 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 	if authErr != nil {
 		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
 	}
+	// The socket is attached before checking shutting, which Shutdown sets
+	// before it sends goaway: the socket gets it from one side or the other.
+	if a.shutting.Load() {
+		c.goaway()
+	}
 	return c
 }
 
@@ -457,6 +465,9 @@ func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr 
 	if authErr != nil {
 		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
 	}
+	if a.shutting.Load() {
+		c.goaway() // as in hello
+	}
 	return c
 }
 
@@ -524,19 +535,22 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 			return
 		}
 		// Counted before checking shutting, which Shutdown sets before it
-		// waits for inflight to reach zero: a call is either waited for or
-		// refused.
-		if int(c.inflight.Add(1)) > c.a.cfg.MaxInflight {
-			c.inflight.Add(-1)
-			if c.firstSeen(*msg.ID) {
-				c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
-			}
-			return
+		// waits for the app's count to reach zero: a call is either waited
+		// for or refused.
+		n := c.inflight.Add(1)
+		c.a.calls.Add(1)
+		var refuse *Error
+		switch {
+		case c.a.shutting.Load():
+			refuse = &Error{Code: CodeUnavailable, Msg: "server is shutting down", RetryAfterMs: c.retryIn.Load()}
+		case int(n) > c.a.cfg.MaxInflight:
+			refuse = &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}
 		}
-		if c.a.shutting.Load() {
+		if refuse != nil {
 			c.inflight.Add(-1)
+			c.a.calls.Add(-1)
 			if c.firstSeen(*msg.ID) {
-				c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeUnavailable, Msg: "server is shutting down", RetryAfterMs: c.retryIn.Load()}})
+				c.send(&resMsg{T: "res", ID: *msg.ID, Err: refuse})
 			}
 			return
 		}
@@ -558,6 +572,7 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 		c.mu.Unlock()
 		if !first {
 			c.inflight.Add(-1)
+			c.a.calls.Add(-1)
 			return
 		}
 		go c.call(msg, c.identity(), hctx, r)
@@ -664,6 +679,8 @@ func (c *conn) reauth(id uint64, rawToken json.RawMessage) {
 }
 
 func (c *conn) call(msg *clientMsg, ident *Identity, hctx context.Context, r *runningCall) {
+	// Last: Shutdown waits for calls to reach zero, by then the res is queued.
+	defer c.a.calls.Add(-1)
 	defer c.inflight.Add(-1)
 	id := *msg.ID
 	defer func() {
@@ -885,7 +902,9 @@ func (c *conn) buffer(seq uint64, b []byte) bool {
 // push appends to the socket's outbound queue.
 func (s *socket) push(b []byte) {
 	s.mu.Lock()
-	if s.dead {
+	// Once a close is requested, the writer finishes what is queued and
+	// closes; later messages would only keep it from getting there.
+	if s.dead || s.closing != nil {
 		s.mu.Unlock()
 		return
 	}

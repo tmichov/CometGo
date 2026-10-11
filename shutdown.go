@@ -3,7 +3,6 @@ package cometgo
 import (
 	"context"
 	"math/rand/v2"
-	"slices"
 	"time"
 )
 
@@ -22,16 +21,29 @@ const maxGoawayRetryMs = 5000
 //  4. The engine, the listener and the idempotency cleanup stop.
 //
 // It returns ctx.Err() if ctx ended before the calls or the closes
-// finished; the remaining sockets are then closed at once. Call it before
-// http.Server.Shutdown, which does not wait for hijacked connections.
+// finished; the remaining sockets are then closed at once. A concurrent or
+// later Shutdown waits for the first (or for its own ctx) and returns its
+// result. Call it before http.Server.Shutdown, which does not wait for
+// hijacked connections.
 func (a *App) Shutdown(ctx context.Context) error {
-	if !a.shutting.CompareAndSwap(false, true) {
-		return nil
+	a.shutOnce.Do(func() {
+		go func() {
+			a.shutErr = a.shutdown(ctx)
+			close(a.shutDone)
+		}()
+	})
+	select {
+	case <-a.shutDone:
+		return a.shutErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
+
+func (a *App) shutdown(ctx context.Context) error {
+	a.shutting.Store(true)
 	for _, c := range a.liveConns() {
-		ms := rand.Int64N(maxGoawayRetryMs + 1)
-		c.retryIn.Store(ms)
-		c.send(&goawayMsg{T: "goaway", Reason: "restart", RetryInMs: ms})
+		c.goaway()
 	}
 
 	err := a.drainCalls(ctx)
@@ -60,8 +72,11 @@ func (a *App) Shutdown(ctx context.Context) error {
 		c.end()
 	}
 
-	if a.stop != nil {
-		a.stop()
+	a.startMu.Lock()
+	stop := a.stop
+	a.startMu.Unlock()
+	if stop != nil {
+		stop()
 		done := make(chan struct{})
 		go func() {
 			a.running.Wait()
@@ -76,13 +91,29 @@ func (a *App) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// drainCalls waits until no session has a call in flight, or ctx is done.
-// New calls are refused once shutting is set, so the count only falls.
+// goaway sends goaway on c's current socket, once per socket. Its delay
+// is drawn once per session.
+func (c *conn) goaway() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sock == nil || c.goawaySock == c.sock {
+		return
+	}
+	c.goawaySock = c.sock
+	if c.retryIn.Load() == 0 {
+		c.retryIn.Store(1 + rand.Int64N(maxGoawayRetryMs))
+	}
+	c.sendLocked(&goawayMsg{T: "goaway", Reason: "restart", RetryInMs: c.retryIn.Load()})
+}
+
+// drainCalls waits until no call is in flight on any session, ended ones
+// included, or ctx is done. New calls are refused once shutting is set, so
+// the count only falls.
 func (a *App) drainCalls(ctx context.Context) error {
 	t := time.NewTicker(10 * time.Millisecond)
 	defer t.Stop()
 	for {
-		if !slices.ContainsFunc(a.liveConns(), func(c *conn) bool { return c.inflight.Load() > 0 }) {
+		if a.calls.Load() == 0 {
 			return nil
 		}
 		select {

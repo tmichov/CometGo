@@ -133,8 +133,13 @@ type App struct {
 
 	// Graceful shutdown (§7.3).
 	shutting atomic.Bool
+	calls    atomic.Int64 // calls in flight on every session, ended ones too
 	liveMu   sync.Mutex
 	live     map[*conn]struct{} // every session not yet ended
+	shutOnce sync.Once
+	shutDone chan struct{}
+	shutErr  error
+	startMu  sync.Mutex         // guards started and stop
 	stop     context.CancelFunc // stops what Start runs
 	running  sync.WaitGroup
 }
@@ -183,18 +188,26 @@ func New(cfg Config) *App {
 		methods:  map[string]*method{},
 		sessions: map[string]*conn{},
 		live:     map[*conn]struct{}{},
+		shutDone: make(chan struct{}),
 	}
 	a.engine = newEngine(a)
 	return a
 }
 
 // Start runs the Postgres listener, the tick engine and the idempotency-key
-// cleanup until ctx is done or Shutdown stops them.
+// cleanup until ctx is done or Shutdown stops them. Shutdown needs them
+// running while it drains, so with Shutdown pass a ctx that outlives the
+// shutdown signal. After Shutdown, Start does nothing.
 func (a *App) Start(ctx context.Context) {
+	a.startMu.Lock()
+	defer a.startMu.Unlock()
 	if a.started {
 		panic("cometgo: Start called twice")
 	}
 	a.started = true
+	if a.shutting.Load() {
+		return
+	}
 	ctx, a.stop = context.WithCancel(ctx)
 	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
 		a.running.Add(1)
