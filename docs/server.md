@@ -435,17 +435,17 @@ type Metric struct {
 | `MetricTickRuns` (`tick_runs`) | number | once per tick: how many observer queries it ran |
 | `MetricObservers` (`observers`) | gauge | after every tick: live observers |
 | `MetricSubscriptions` (`subscriptions`) | gauge | after every tick: bound subscriptions, on all sessions, including detached ones |
-| `MetricQueuedBytes` (`queued_bytes`) | gauge | after every tick: bytes waiting to be written, summed over all sockets |
+| `MetricQueuedBytes` (`queued_bytes`) | gauge | after every tick: bytes waiting to be written, summed over every live session's socket |
 | `MetricCoalescing` (`coalescing_conns`) | gauge | after every tick: connections that are [coalescing](#slow-clients) |
-| `MetricFenceWait` (`fence_wait_seconds`) | duration | per method call: from its commit until its update was sent (its fence released) |
+| `MetricFenceWait` (`fence_wait_seconds`) | duration | per fenced method call: from its commit until its update was sent (its fence released), or until `FenceTimeout` for a lagged call |
 | `MetricFenceLag` (`fence_lag`) | counter | 1 per call answered with `lag: true` after `FenceTimeout` |
-| `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed with 4429 (slow consumer) |
-| `MetricListenReconnect` (`listen_reconnects`) | counter | 1 each time the `LISTEN` connection drops or fails to connect |
-| `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` set |
+| `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed as a slow consumer: its queue went over 8 MiB, or a write timed out. A write that fails because the peer went away also closes with 4429, but is not counted |
+| `MetricListenReconnect` (`listen_reconnects`) | counter | 1 per failed `LISTEN` attempt: each drop, and each failed reconnect during an outage (retried with backoff up to 10 s) |
+| `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` set, reported once the tick's snapshot commits |
 
 Gauges are the current value, so map them to a gauge and set it; a counter is reported as `1` per occurrence; a duration is one observation, for a histogram. A tick happens only when there is work (a change, a request, a timer), so an idle server reports no gauges until something happens.
 
-The hook is called synchronously from the engine goroutine and from connection goroutines, so it must be fast and safe for concurrent use. Do the aggregation there, such as incrementing a counter or recording into a histogram, and never block. When `Metrics` is nil, each measurement point costs one nil check, and the gauges are not computed.
+The hook is called synchronously from the engine goroutine and from connection goroutines, so it must be fast and safe for concurrent use. Do the aggregation there, such as incrementing a counter or recording into a histogram, and never block. A panic in the hook is recovered and logged. When `Metrics` is nil, each measurement point costs one nil check, and the gauges are not computed. When it is set, computing the gauges visits every session after each tick.
 
 ## InstallTriggers
 

@@ -685,6 +685,7 @@ type runResult struct {
 	keyIdx []int
 	res    *result
 	err    *Error
+	took   time.Duration // query time, measured only for Config.Metrics
 }
 
 // runObservers re-runs toRun inside one REPEATABLE READ snapshot, plus each
@@ -724,7 +725,7 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}
 		r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
 		if e.a.cfg.Metrics != nil {
-			e.a.metric(MetricPubRun, obs.pub.name, time.Since(start).Seconds())
+			r.took = time.Since(start)
 		}
 		if qerr != nil {
 			if err := sp.Rollback(ctx); err != nil {
@@ -738,6 +739,13 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	if e.a.cfg.Metrics != nil {
+		// Reported after the commit: runs of a failed snapshot are retried
+		// and would be counted twice.
+		for _, r := range staged {
+			e.a.metric(MetricPubRun, r.obs.pub.name, r.took.Seconds())
+		}
 	}
 	for _, r := range staged {
 		obs := r.obs

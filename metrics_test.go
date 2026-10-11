@@ -82,13 +82,14 @@ func TestMetricsReportEachSignal(t *testing.T) {
 	}
 	log.wait(t, MetricListenReconnect, func(m Metric) bool { return m.Value == 1 })
 
-	// Every 4429 close goes through socket.fail; once per socket.
+	// A queue over its limit closes the socket with 4429: reported once,
+	// however many pushes overflow it.
 	c := e.app.liveConns()[0]
 	c.mu.Lock()
 	s := c.sock
 	c.mu.Unlock()
-	s.fail(closeSlow, "SLOW_CONSUMER", "test")
-	s.fail(closeSlow, "SLOW_CONSUMER", "test")
+	s.push(make([]byte, maxQueuedBytes+1))
+	s.push(make([]byte, maxQueuedBytes+1))
 	log.wait(t, MetricSlowClose, nil)
 	time.Sleep(50 * time.Millisecond)
 	log.mu.Lock()
@@ -112,4 +113,18 @@ func TestMetricsReportFenceLag(t *testing.T) {
 		t.Fatalf("expected a lagged res, got %v", r)
 	}
 	log.wait(t, MetricFenceLag, func(m Metric) bool { return m.Value == 1 })
+}
+
+// A panicking hook is logged; the server keeps serving.
+func TestMetricsHookPanicIsContained(t *testing.T) {
+	e := setupWith(t, func(c *Config) {
+		c.Metrics = func(Metric) { panic("broken exporter") }
+	})
+	a, _ := e.dial(t, nil)
+	for i := 1; i <= 2; i++ {
+		a.send(map[string]any{"t": "call", "id": i, "m": "add", "args": map[string]any{"Owner": "a", "Name": "n"}})
+		if r := a.next(); r["t"] != "res" || r["ok"] != true {
+			t.Fatalf("call %d: %v", i, r)
+		}
+	}
 }

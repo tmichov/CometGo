@@ -27,11 +27,19 @@ const (
 	MetricPubRun          = "pub_run_seconds"    // duration of one observer query, with Pub
 )
 
-// metric reports v under name if a hook is set.
+// metric reports v under name if a hook is set. A panicking hook is logged
+// instead of taking down the engine or connection goroutine it runs on.
 func (a *App) metric(name, pub string, v float64) {
-	if m := a.cfg.Metrics; m != nil {
-		m(Metric{Name: name, Pub: pub, Value: v})
+	m := a.cfg.Metrics
+	if m == nil {
+		return
 	}
+	defer func() {
+		if p := recover(); p != nil {
+			a.log.Error("metrics hook panicked", "metric", name, "panic", p)
+		}
+	}()
+	m(Metric{Name: name, Pub: pub, Value: v})
 }
 
 // tickMetrics reports a finished tick and the engine's gauges. Engine
@@ -42,8 +50,11 @@ func (e *engine) tickMetrics(start time.Time, runs int64) {
 	a.metric(MetricTickRuns, "", float64(runs))
 	a.metric(MetricObservers, "", float64(len(e.observers)))
 	subs, queued := 0, 0
-	for c, s := range e.conns {
+	for _, s := range e.conns {
 		subs += len(s)
+	}
+	// Every live session, not only those with subs: calls and events queue too.
+	for _, c := range a.liveConns() {
 		q, _ := c.queuedBytes(0)
 		queued += q
 	}
