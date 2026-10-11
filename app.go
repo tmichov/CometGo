@@ -202,7 +202,9 @@ func New(cfg Config) *App {
 //
 // Start first checks that every table in a publication's Tables exists under
 // exactly that name and has the triggers InstallTriggers creates, and returns
-// an error without starting anything if not. A later Start may retry.
+// an error without starting anything if not. The check needs the database:
+// if it is unreachable, Start fails after at most Config.QueryTimeout. A
+// later Start may retry.
 func (a *App) Start(ctx context.Context) error {
 	a.startMu.Lock()
 	defer a.startMu.Unlock()
@@ -213,7 +215,12 @@ func (a *App) Start(ctx context.Context) error {
 		a.started = true
 		return nil
 	}
-	if err := a.checkTables(ctx); err != nil {
+	checkCtx, cancel := context.WithTimeout(ctx, a.cfg.QueryTimeout)
+	defer cancel()
+	if err := a.checkTables(checkCtx); err != nil {
+		// Logged too: a caller that ignores the error would otherwise serve
+		// an app with no engine, and no clue why.
+		a.log.Error("start failed", "err", err)
 		return err
 	}
 	a.started = true

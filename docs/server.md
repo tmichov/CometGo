@@ -439,9 +439,9 @@ Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELE
 A publication whose table is never notified loads once and then never updates. To catch this early, `Start` checks every distinct table in every publication's `Tables` and returns an error, without starting anything, if:
 
 - no table has exactly that name (`schema.table`, compared as Postgres stores it). This covers a misspelled name, a name in the wrong case (`"Todos"` for `todos`), and an unqualified name for a table outside `public`, which is never `public.table` even when `search_path` would find it. When Postgres can resolve what the name most likely meant, the error suggests it.
-- the table lacks an enabled `cometgo_ins`, `cometgo_upd`, `cometgo_del` or `cometgo_trunc` trigger. The error names the missing triggers; run `InstallTriggers` for the table.
+- the table lacks a `cometgo_ins`, `cometgo_upd`, `cometgo_del` or `cometgo_trunc` trigger that fires normally (disabled and replica-only triggers count as missing), or its triggers were installed under another name and the table was renamed or moved since, so they would notify under the old name. The error names the triggers; run `InstallTriggers` for the table.
 
-All failing tables are reported in one error. Because of this check, every table must exist and have its triggers before `Start`. Run migrations and `InstallTriggers` first.
+All failing tables are reported in one error, which `Start` also logs. Because of this check, every table must exist and have its triggers before `Start`, so run migrations and `InstallTriggers` first. The check also needs the database: if it is unreachable, `Start` fails within `QueryTimeout` instead of starting and reconnecting in the background. Retry `Start`, or exit and let your supervisor restart the process.
 
 The check runs once, at `Start`. Dropping or disabling the triggers, or dropping the table, while the server runs is not detected, and the affected subscriptions silently stop updating.
 

@@ -71,9 +71,7 @@ func installTable(ctx context.Context, tx pgx.Tx, table string) error {
 
 	qtable := pgx.Identifier{schema, rel}.Sanitize()
 	wireName := schema + "." + rel
-	h := fnv.New32a()
-	h.Write([]byte(wireName))
-	prefix := fmt.Sprintf("cometgo_%08x", h.Sum32())
+	prefix := triggerFuncPrefix(wireName)
 
 	keyExpr := func(alias string) string {
 		parts := make([]string, len(pk))
@@ -156,8 +154,17 @@ $cg$`, fn("trunc"), lit("1|t|T|"+wireName))
 	return err
 }
 
-// triggerNames are the triggers installTable creates on each table.
-var triggerNames = []string{"cometgo_ins", "cometgo_upd", "cometgo_del", "cometgo_trunc"}
+// triggerFuncPrefix names the trigger functions for a table. The functions
+// embed wireName in their payloads, so the name ties them to it.
+func triggerFuncPrefix(wireName string) string {
+	h := fnv.New32a()
+	h.Write([]byte(wireName))
+	return fmt.Sprintf("cometgo_%08x", h.Sum32())
+}
+
+// triggerSuffixes are the events installTable creates a trigger for, each
+// named "cometgo_"+suffix and calling triggerFuncPrefix(wireName)+"_"+suffix.
+var triggerSuffixes = []string{"ins", "upd", "del", "trunc"}
 
 // checkTables fails if a table in any publication's Tables does not exist
 // under exactly that name, or lacks an enabled trigger from InstallTriggers.
@@ -181,17 +188,18 @@ func (a *App) checkTables(ctx context.Context) error {
 }
 
 func (a *App) checkTable(ctx context.Context, table string) error {
-	var have []string
-	var found bool
+	var fns map[string]string // trigger name -> function name
 	// Matched as the engine matches notifications: schema + "." + relname,
 	// exactly, so a miscased or unqualified non-public name fails here too.
+	// Replica-only ('R') and disabled ('D') triggers don't fire normally.
 	err := a.db.QueryRow(ctx, `
-		SELECT true, coalesce(array_agg(t.tgname::text) FILTER (WHERE t.tgname IS NOT NULL), '{}')
+		SELECT coalesce(jsonb_object_agg(t.tgname, p.proname) FILTER (WHERE t.tgname IS NOT NULL), '{}')
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		LEFT JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname LIKE 'cometgo\_%' AND t.tgenabled <> 'D'
+		LEFT JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname LIKE 'cometgo\_%' AND t.tgenabled IN ('O', 'A')
+		LEFT JOIN pg_proc p ON p.oid = t.tgfoid
 		WHERE n.nspname || '.' || c.relname = $1
-		GROUP BY c.oid`, table).Scan(&found, &have)
+		GROUP BY c.oid`, table).Scan(&fns)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// to_regclass applies case folding and search_path, so it finds
 		// what the name most likely meant. Tables entries without a schema
@@ -208,14 +216,23 @@ func (a *App) checkTable(ctx context.Context, table string) error {
 	if err != nil {
 		return err
 	}
-	var missing []string
-	for _, n := range triggerNames {
-		if !slices.Contains(have, n) {
-			missing = append(missing, n)
+	var missing, stale []string
+	for _, sfx := range triggerSuffixes {
+		fn, ok := fns["cometgo_"+sfx]
+		switch {
+		case !ok:
+			missing = append(missing, "cometgo_"+sfx)
+		case fn != triggerFuncPrefix(table)+"_"+sfx:
+			// Installed under another name (the table was renamed or moved
+			// since), so its notifications carry that name.
+			stale = append(stale, "cometgo_"+sfx)
 		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing or disabled triggers %s; run cometgo.InstallTriggers for it", strings.Join(missing, ", "))
+	}
+	if len(stale) > 0 {
+		return fmt.Errorf("triggers %s were installed for another table name (renamed or moved since?); run cometgo.InstallTriggers for it", strings.Join(stale, ", "))
 	}
 	return nil
 }
