@@ -13,7 +13,7 @@ if err := cometgo.InstallTriggers(ctx, pool, "todos"); err != nil { … }
 cometgo.Publish(app, "todos.mine", cometgo.PubOptions{Tables: []string{"todos"}}, …)
 cometgo.Method(app, "todos.add", …)
 
-app.Start(ctx)
+if err := app.Start(ctx); err != nil { … }
 http.Handle("/_comet", app)
 ```
 
@@ -24,7 +24,7 @@ Register every publication and method before `Start` and before serving requests
 | Identifier | Description |
 |---|---|
 | `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil. |
-| `(*App) Start(ctx)` | Starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. Panics if called twice. |
+| `(*App) Start(ctx) error` | Checks every publication's `Tables` (see [Table checks at Start](#table-checks-at-start)), then starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. If the check fails, it returns the error and starts nothing, and `Start` may be called again. Panics if called again after succeeding. |
 | `(*App) Shutdown(ctx) error` | Stops the server gracefully: see [Graceful shutdown](#graceful-shutdown). |
 | `(*App) ServeHTTP(w, r)` | `App` is an `http.Handler`. It upgrades the request to a CometGo WebSocket. Mount it at `/_comet`, the client's default URL. |
 | `Subprotocol` | The WebSocket subprotocol, `"cometgo.1.json"`. A request that does not offer it gets HTTP 426 with `{"supported":["cometgo.1.json"]}`. |
@@ -99,7 +99,7 @@ All observers that need re-running in one tick run inside one `REPEATABLE READ R
 
 | Field | Default | Meaning |
 |---|---|---|
-| `Tables []string` | required | Every table the query reads, as `"table"` (meaning `public.table`) or `"schema.table"`. A change to any of them re-runs the query. Each must have triggers from `InstallTriggers`. Write names exactly as Postgres stores them (normally lowercase): they are compared as strings, so `"Todos"` never matches changes to `todos`. |
+| `Tables []string` | required | Every table the query reads, as `"table"` (meaning `public.table`) or `"schema.table"`. A change to any of them re-runs the query. Each must have triggers from `InstallTriggers`. Write names exactly as Postgres stores them (normally lowercase): they are compared as strings, so `"Todos"` never matches changes to `todos`. `Start` fails if a name does not resolve or lacks triggers. |
 | `Key []string` | `["id"]` | The result columns that uniquely identify a row. They must be present in the `SELECT` list and must not be null. A missing key column fails the query with `INTERNAL`. |
 | `Unordered bool` | false | Declares that row order carries no meaning. The server then sends no positions, and the client's row order is arbitrary. Leave it false and use `ORDER BY` when order matters. |
 | `Scope Scope` | `ScopeUser` | Which connections may share one observer. See below. |
@@ -392,7 +392,9 @@ Pass `Start` a context that outlives the shutdown signal (or `context.Background
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 defer stop()
-app.Start(context.Background()) // not ctx: it must outlive the signal
+if err := app.Start(context.Background()); err != nil { // not ctx: it must outlive the signal
+	log.Fatal(err)
+}
 // ... set up srv, then:
 <-ctx.Done()
 shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -431,5 +433,16 @@ Requirements:
 - Postgres 11 or newer (the triggers use `EXECUTE FUNCTION`; the protocol spec's "PG 10+" is the minimum for transition tables, not for this code).
 
 Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. Every notification for a table re-runs the observers that read it, except observers whose query declares [`Match`](#skipping-unaffected-re-runs-querymatch), which re-run only if the changed rows can affect them.
+
+### Table checks at Start
+
+A publication whose table is never notified loads once and then never updates. To catch this early, `Start` checks every distinct table in every publication's `Tables` and returns an error, without starting anything, if:
+
+- no table has exactly that name (`schema.table`, compared as Postgres stores it). This covers a misspelled name, a name in the wrong case (`"Todos"` for `todos`), and an unqualified name for a table outside `public`, which is never `public.table` even when `search_path` would find it. When Postgres can resolve what the name most likely meant, the error suggests it.
+- the table lacks an enabled `cometgo_ins`, `cometgo_upd`, `cometgo_del` or `cometgo_trunc` trigger. The error names the missing triggers; run `InstallTriggers` for the table.
+
+All failing tables are reported in one error. Because of this check, every table must exist and have its triggers before `Start`. Run migrations and `InstallTriggers` first.
+
+The check runs once, at `Start`. Dropping or disabling the triggers, or dropping the table, while the server runs is not detected, and the affected subscriptions silently stop updating.
 
 If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.

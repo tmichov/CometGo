@@ -2,8 +2,11 @@ package cometgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -151,4 +154,68 @@ $cg$`, fn("trunc"), lit("1|t|T|"+wireName))
 	_, err = tx.Exec(ctx, fmt.Sprintf(`CREATE TRIGGER cometgo_trunc AFTER TRUNCATE ON %s FOR EACH STATEMENT EXECUTE FUNCTION %s()`,
 		qtable, fn("trunc")))
 	return err
+}
+
+// triggerNames are the triggers installTable creates on each table.
+var triggerNames = []string{"cometgo_ins", "cometgo_upd", "cometgo_del", "cometgo_trunc"}
+
+// checkTables fails if a table in any publication's Tables does not exist
+// under exactly that name, or lacks an enabled trigger from InstallTriggers.
+// Either would leave its subscriptions silently stale: the engine matches
+// notifications to Tables by exact string. It runs once, at Start.
+func (a *App) checkTables(ctx context.Context) error {
+	seen := map[string]bool{}
+	var errs []error
+	for _, name := range slices.Sorted(maps.Keys(a.pubs)) {
+		for _, t := range a.pubs[name].tables {
+			if seen[t] {
+				continue
+			}
+			seen[t] = true
+			if err := a.checkTable(ctx, t); err != nil {
+				errs = append(errs, fmt.Errorf("cometgo: publication %s: table %s: %w", name, t, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (a *App) checkTable(ctx context.Context, table string) error {
+	var have []string
+	var found bool
+	// Matched as the engine matches notifications: schema + "." + relname,
+	// exactly, so a miscased or unqualified non-public name fails here too.
+	err := a.db.QueryRow(ctx, `
+		SELECT true, coalesce(array_agg(t.tgname::text) FILTER (WHERE t.tgname IS NOT NULL), '{}')
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname LIKE 'cometgo\_%' AND t.tgenabled <> 'D'
+		WHERE n.nspname || '.' || c.relname = $1
+		GROUP BY c.oid`, table).Scan(&found, &have)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// to_regclass applies case folding and search_path, so it finds
+		// what the name most likely meant. Tables entries without a schema
+		// were qualified as public; resolve those through search_path.
+		var meant *string
+		if a.db.QueryRow(ctx, `
+			SELECT n.nspname || '.' || c.relname
+			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.oid = to_regclass($1)`, strings.TrimPrefix(table, "public.")).Scan(&meant) == nil && meant != nil {
+			return fmt.Errorf("not found; did you mean %q? Tables names must match the catalog exactly", *meant)
+		}
+		return errors.New("not found")
+	}
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for _, n := range triggerNames {
+		if !slices.Contains(have, n) {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing or disabled triggers %s; run cometgo.InstallTriggers for it", strings.Join(missing, ", "))
+	}
+	return nil
 }
