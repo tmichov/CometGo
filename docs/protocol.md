@@ -209,7 +209,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 - **`"noFence":true`** skips the read-your-writes fence (§6.2). Use it for latency-sensitive calls that do not write.
 - **`"ik":"<uuid>"` idempotency key.** Negotiated with the `ik` cap: the client offers `"caps":["ik"]` in `hello`, and a server that supports keys includes `"ik"` in `welcome.caps`.
   - The framework writes `(ik, userId, method, result)` to `comet_idempotency` inside the method's own transaction, so the record commits atomically with the method's effects.
-  - A retry with the same `ik` from the same user returns the stored result instead of executing again. Its `res` is fenced like any call's.
+  - A retry with the same `ik` from the same user returns the stored result instead of executing again. The same user under a different server-side scope (e.g. another tenant) gets `BAD_REQUEST` instead. Its `res` is fenced like any call's.
   - A duplicate that arrives while the first is still running waits for its outcome; the handler runs once.
   - A failed call stores nothing. The same `ik` for a different method is `BAD_REQUEST`. `ik` must be a non-empty string of at most 128 bytes.
   - Stored results expire after a server-configured TTL (default 24 h).
@@ -297,7 +297,7 @@ Resume makes a short drop invisible: no snapshot is re-sent, and calls in flight
 **Validity.** The resume succeeds only if all of these hold:
 - the session exists on this node and has not ended,
 - `seq` is not below the last ack or the overflow point, and not above the last `seq` sent,
-- the `hello` authenticates the same principal (same user ID and server-side scope key, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
+- the `hello` authenticates the same principal (same user ID and same server-side scope, e.g. tenant, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
 
 For an anonymous session, the session id is the only credential, as a session cookie would be. It is 72 random bits, is sent only in `welcome`, and must be kept as secret as a token.
 

@@ -19,7 +19,7 @@ func setupTenants(t *testing.T) *testEnv {
 				return Query{SQL: "SELECT id, name FROM " + env.table + " WHERE owner = $1 ORDER BY id", Args: []any{c.Identity.ScopeKey}}, nil
 			})
 	})
-	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice@acme', 'a1'), ('alice@globex', 'g1')"); err != nil {
+	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('acme', 'a1'), ('globex', 'g1')"); err != nil {
 		t.Fatal(err)
 	}
 	return e
@@ -44,7 +44,7 @@ func TestScopeKeySeparatesObservers(t *testing.T) {
 			t.Fatalf("snapshot %s, want %s", got, want)
 		}
 	}
-	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice@acme', 'a2')"); err != nil {
+	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('acme', 'a2')"); err != nil {
 		t.Fatal(err)
 	}
 	if got := names(entries(acme.next())[0]); got != "[a2]" {
@@ -93,11 +93,53 @@ func TestScopeKeyEmitTargets(t *testing.T) {
 	subscribe(t, acme, 1, "tenant.items")
 	subscribe(t, globex, 1, "tenant.items")
 	ctx := context.Background()
-	for _, scope := range []string{"alice", "alice@globex"} {
-		if err := e.app.Emit(ctx, "tenant.items", nil, scope, "for-"+scope, nil); err != nil {
+	// Neither the bare UserID nor the bare ScopeKey is a tenant's scope.
+	for i, scope := range []string{"alice", "globex", (&Identity{UserID: "alice", ScopeKey: "globex"}).Scope()} {
+		if err := e.app.Emit(ctx, "tenant.items", nil, scope, fmt.Sprint("e", i), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	expectEvt(t, globex.next(), 1, "for-alice@globex")
+	expectEvt(t, globex.next(), 1, "e2")
 	acme.quiet(200 * time.Millisecond)
+}
+
+// An idempotency key reused under another ScopeKey of the same user is
+// refused: neither run again in the new tenant nor answered with the old
+// tenant's result. The same tenant still gets its stored result.
+func TestScopeKeyIdempotency(t *testing.T) {
+	e := setupTenants(t)
+	ik := "ik-" + newID(8)
+	call := map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "once"}, "ik": ik}
+	acme, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice@acme"}})
+	acme.send(call)
+	first := okRes(t, acme.next(), 1)
+
+	globex, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice@globex"}})
+	globex.send(call)
+	if r := globex.next(); r["ok"] != false || r["err"].(map[string]any)["code"] != CodeBadRequest {
+		t.Fatalf("other tenant: %v", r)
+	}
+	acme.send(call)
+	if again := okRes(t, acme.next(), 1); again != first {
+		t.Fatalf("same tenant got %v, want stored %v", again, first)
+	}
+	if n := e.countRows(t, "SELECT count(*) FROM "+e.table+" WHERE name = 'once'"); n != 1 {
+		t.Fatalf("handler ran %d times", n)
+	}
+}
+
+// Scope never lets a ScopeKey collide with another user's UserID.
+func TestIdentityScope(t *testing.T) {
+	var none *Identity
+	cases := []*Identity{none, {UserID: "acme:bob"}, {UserID: "acme", ScopeKey: "bob"}, {UserID: "bob", ScopeKey: "acme"}, {UserID: "bob"}}
+	seen := map[string]int{}
+	for i, id := range cases {
+		if j, dup := seen[id.Scope()]; dup {
+			t.Fatalf("identities %d and %d share scope %q", j, i, id.Scope())
+		}
+		seen[id.Scope()] = i
+	}
+	if (&Identity{UserID: "bob"}).Scope() != "bob" {
+		t.Fatal("without ScopeKey, Scope must be the UserID")
+	}
 }

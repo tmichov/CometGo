@@ -641,7 +641,7 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	if pub == nil {
 		return NewError(CodeNotFound, "unknown publication "+sub.name)
 	}
-	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.scope()))
+	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.Scope()))
 	obs := e.observers[key]
 	if obs == nil {
 		q, err := pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)

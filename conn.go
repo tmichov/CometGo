@@ -335,7 +335,7 @@ func (c *conn) expire(ident *Identity) {
 // scope key (or both anonymous). A tenant switch under one UserID is a
 // different principal: its subs must be rebound.
 func samePrincipal(a, b *Identity) bool {
-	return (a == nil) == (b == nil) && a.userID() == b.userID() && a.scope() == b.scope()
+	return (a == nil) == (b == nil) && a.Scope() == b.Scope()
 }
 
 // hello authenticates the socket and attaches it to a resumed or new
@@ -737,7 +737,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	// with the handler's writes, or rolls back with them on error.
 	var stored json.RawMessage
 	if ik != nil {
-		if stored, err = claimIK(ctx, tx, *ik, ident.scope(), msg.M); err != nil {
+		if stored, err = claimIK(ctx, tx, *ik, ident.userID(), ikMethod(msg.M, ident)); err != nil {
 			return nil, false, err
 		}
 	}
@@ -769,7 +769,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 			return nil, false, err
 		}
 		if ik != nil {
-			if err := storeIK(ctx, tx, *ik, ident.scope(), val); err != nil {
+			if err := storeIK(ctx, tx, *ik, ident.userID(), val); err != nil {
 				return nil, false, err
 			}
 		}

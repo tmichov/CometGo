@@ -75,7 +75,7 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 			case "alice", "bob":
 				return &Identity{UserID: token}, nil
 			case "alice@acme", "alice@globex": // one user in two tenants
-				return &Identity{UserID: "alice", ScopeKey: token}, nil
+				return &Identity{UserID: "alice", ScopeKey: strings.TrimPrefix(token, "alice@")}, nil
 			case "alice-short":
 				return &Identity{UserID: "alice", ExpiresAt: time.Now().Add(300 * time.Millisecond)}, nil
 			}
