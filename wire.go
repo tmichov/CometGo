@@ -125,6 +125,14 @@ type authResMsg struct {
 
 func (m *authResMsg) setSeq(s uint64) { m.Seq = s }
 
+// goawayMsg announces a graceful shutdown (§7.3). It is not stateful: it
+// carries no seq and is never replayed.
+type goawayMsg struct {
+	T         string `json:"t"`
+	Reason    string `json:"reason"`
+	RetryInMs int64  `json:"retryInMs"`
+}
+
 type pongMsg struct {
 	T string          `json:"t"`
 	N json.RawMessage `json:"n,omitempty"`
