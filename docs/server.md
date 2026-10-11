@@ -91,6 +91,7 @@ Each distinct `(publication, args, scope)` combination has one server-side **obs
 - Everything the query depends on must be in `Query.SQL` and `Query.Args`, and the scope must separate callers whose queries would differ (see [Scope](#scope)).
 - `fn` runs on the engine's loop, so keep it fast. Doing an access check against the database there delays every subscription on the server.
 - Returning an error from `fn` ends the subscription with that error. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
+- A panic in `fn` is recovered: it ends only that subscription with `INTERNAL` and is logged with its stack trace. The server and every other subscription keep running.
 - Bad args (wrong types, unknown fields) end the subscription with `BAD_REQUEST`. An unknown publication name ends it with `NOT_FOUND`.
 
 All observers that need re-running in one tick run inside one `REPEATABLE READ READ ONLY` transaction, so every update a client receives comes from one consistent database snapshot.
