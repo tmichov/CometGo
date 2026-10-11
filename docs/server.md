@@ -364,6 +364,19 @@ srv.Shutdown(shutdownCtx)
 
 Sessions do not survive the shutdown: a client that comes back resyncs.
 
+## Slow clients
+
+A client that reads more slowly than its subscriptions change (a phone on a bad network, a tab in the background) does not make the server buffer every change for it. Once more than 256 KiB of diffs is queued for a connection, the server stops sending it diffs and only notes which subscriptions changed. When the client has caught up below 64 KiB, it gets one transaction that resets those subscriptions to the current data. The client applies a reset as a diff against what it holds, so rows that did not change are not re-rendered. Server memory per connection stays bounded by the size of the results, not by how fast they change.
+
+While the connection is held back:
+
+- A method call's result still arrives after the data it wrote: when its fence is released, the held subscriptions are reset in that tick, ahead of the result.
+- Events for the connection are dropped. Events are at-most-once anyway.
+- A large snapshot sitting in the queue does not count: a subscription whose result is over 256 KiB keeps getting diffs as long as the client keeps reading.
+- If the connection drops, a resumed session gets the messages it missed and then the resets.
+
+A client that makes no progress at all is still disconnected with 4429 SLOW_CONSUMER, when about 8 MiB is queued or a single write is stuck for 10 seconds. That close leaves a resumable session resumable.
+
 ## InstallTriggers
 
 ```go

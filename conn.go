@@ -24,9 +24,11 @@ const (
 )
 
 const (
-	maxQueuedBytes = 8 << 20   // §8.1 hard limit
-	frameTarget    = 256 << 10 // §4.3 split target
-	writeTimeout   = 10 * time.Second
+	maxQueuedBytes  = 8 << 20   // §8.1 hard limit
+	softQueuedBytes = 256 << 10 // §8.1 soft limit: above it the connection coalesces
+	lowWaterBytes   = 64 << 10  // §8.1 low-water mark: below it coalescing ends
+	frameTarget     = 256 << 10 // §4.3 split target
+	writeTimeout    = 10 * time.Second
 )
 
 // capResume is the welcome/hello cap for session resume (§7.2).
@@ -56,7 +58,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Accept already wrote the HTTP error (e.g. bad Origin)
 	}
-	s := &socket{ws: ws, outSig: make(chan struct{}, 1)}
+	s := &socket{ws: ws, outSig: make(chan struct{}, 1), onDrain: a.engine.signal}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	a.serve(s, cookieIdent, cookieErr)
 }
@@ -114,6 +116,9 @@ type conn struct {
 	// goawaySock is the socket goaway was sent on (guarded by mu), so each
 	// socket gets it once.
 	goawaySock *socket
+	// coalescing mirrors whether the engine holds this session's changes
+	// as resets (§8.1). The engine's own map is authoritative.
+	coalescing atomic.Bool
 }
 
 type runningCall struct {
@@ -132,10 +137,13 @@ type socket struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	outSig chan struct{}
+	// onDrain is called once the queue drops below drainAt (§8.1).
+	onDrain func()
 
 	mu       sync.Mutex // guards the fields below
 	out      [][]byte
 	outBytes int
+	drainAt  int // 0: nobody waits for a drain
 	dead     bool
 	fatal    bool // closed for a reason that also ends the session (protocol error, deliberate close)
 	// closing, once set, makes the writer close the socket with it after
@@ -773,7 +781,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	// Fence (§6.2): registered before commit, notified as the last
 	// statement, so its notification follows every row notification of
 	// this transaction.
-	token, f := c.a.engine.registerFence()
+	token, f := c.a.engine.registerFence(c)
 	if _, err := tx.Exec(ctx, "SELECT pg_notify('comet', $1)", "1|f|"+token); err != nil {
 		c.a.engine.dropFence(token)
 		return nil, false, err
@@ -899,6 +907,28 @@ func (c *conn) buffer(seq uint64, b []byte) bool {
 	return true
 }
 
+// queuedBytes reports the bytes queued on the session's socket, and whether
+// it has a live one (0, false while detached or after the socket failed).
+// With watchBelow > 0, the socket also calls onDrain once its queue drops
+// below watchBelow; arming and reading happen under one lock.
+func (c *conn) queuedBytes(watchBelow int) (int, bool) {
+	c.mu.Lock()
+	s := c.sock
+	c.mu.Unlock()
+	if s == nil {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dead {
+		return 0, false
+	}
+	if watchBelow > 0 {
+		s.drainAt = watchBelow
+	}
+	return s.outBytes, true
+}
+
 // push appends to the socket's outbound queue.
 func (s *socket) push(b []byte) {
 	s.mu.Lock()
@@ -948,7 +978,14 @@ func (s *socket) writer() {
 			cancel()
 			s.mu.Lock()
 			s.outBytes -= len(b)
+			drained := s.drainAt > 0 && s.outBytes < s.drainAt
+			if drained {
+				s.drainAt = 0
+			}
 			s.mu.Unlock()
+			if drained && s.onDrain != nil {
+				s.onDrain()
+			}
 			if err != nil {
 				if s.ctx.Err() == nil {
 					s.fail(closeSlow, "SLOW_CONSUMER", "write timed out")
