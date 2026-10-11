@@ -530,7 +530,7 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 			c.sendTx([]subEntry{{S: *msg.S, End: NewError(CodeBadRequest, "args too large")}})
 			return
 		}
-		c.a.engine.enqueue(subReq{c: c, s: *msg.S, name: msg.Name, args: msg.Args, have: msg.Have, ident: c.identity()})
+		c.a.engine.enqueue(subReq{c: c, s: *msg.S, name: msg.Name, args: msg.Args, have: msg.Have})
 	case "unsub":
 		if msg.S == nil {
 			s.fail(closeProtocol, "PROTOCOL", "unsub requires s")

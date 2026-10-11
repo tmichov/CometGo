@@ -127,12 +127,11 @@ type subscription struct {
 }
 
 type subReq struct {
-	c     *conn
-	s     uint64
-	name  string
-	args  json.RawMessage
-	have  bool
-	ident *Identity
+	c    *conn
+	s    uint64
+	name string
+	args json.RawMessage
+	have bool
 }
 
 type unsubReq struct {
@@ -589,7 +588,11 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			return
 		}
 		sub := &subscription{c: r.c, s: r.s, name: r.name, args: r.args, argsKey: argsKey, needInit: true, holds: r.have}
-		if err := e.bind(ctx, sub, r.ident); err != nil {
+		// The identity is read here, not when the sub arrived: an auth
+		// change sets it before queuing its rebind, so a sub handled
+		// before that rebind is rebound by it, and one handled after it
+		// already sees the new identity.
+		if err := e.bind(ctx, sub, r.c.identity()); err != nil {
 			end(r.c, r.s, err)
 			return
 		}

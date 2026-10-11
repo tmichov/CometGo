@@ -380,6 +380,43 @@ func TestIdentityChangeResetsSubsBeforeAuthRes(t *testing.T) {
 	}
 }
 
+// A sub that reaches the engine after an auth change's rebind must bind to
+// the new identity: the rebind has already run, so nothing would fix it later.
+func TestSubAfterRebindUsesNewIdentity(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	if _, err := e.pool.Exec(ctx, "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'a1'), ('bob', 'b1')"); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	conns := e.app.liveConns()
+	if len(conns) != 1 {
+		t.Fatalf("%d sessions", len(conns))
+	}
+	c := conns[0]
+	// The interleaving dispatch can produce: the read loop takes a sub while
+	// reauth switches to bob and queues its rebind ahead of the sub.
+	bob := &Identity{UserID: "bob"}
+	c.authMu.Lock()
+	c.setIdentity(bob)
+	e.app.engine.enqueue(rebindReq{c: c, ident: bob, after: &authResMsg{T: "authRes", OK: true, User: bob.wireUser()}})
+	c.authMu.Unlock()
+	e.app.engine.enqueue(subReq{c: c, s: 1, name: "items.mine"})
+
+	for range 3 {
+		m := a.next()
+		if m["t"] != "tx" {
+			continue
+		}
+		ops := entries(m)[0]["ops"].([]any)
+		if len(ops) != 1 || ops[0].([]any)[2].([]any)[1] != "b1" {
+			t.Fatalf("sub bound to the wrong identity: ops %v", ops)
+		}
+		return
+	}
+	t.Fatal("no tx for the sub")
+}
+
 func TestBadTokenInHelloIsAnonymous(t *testing.T) {
 	e := setup(t)
 	a, w := e.dial(t, map[string]any{"auth": map[string]any{"token": "mallory"}})
