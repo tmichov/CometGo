@@ -17,6 +17,22 @@ func setupSlowTick(t *testing.T) *testEnv {
 			err := c.Tx.QueryRow(c.Context, "SELECT count(*) FROM "+env.table).Scan(&n)
 			return n, err
 		})
+		// undoneWrite writes only inside a savepoint it rolls back.
+		Method(app, "undoneWrite", func(c *Call, _ struct{}) (struct{}, error) {
+			sp, err := c.Tx.Begin(c.Context)
+			if err != nil {
+				return struct{}{}, err
+			}
+			if _, err := sp.Exec(c.Context, "INSERT INTO "+env.table+" (owner, name) VALUES ('u', 'u')"); err != nil {
+				return struct{}{}, err
+			}
+			return struct{}{}, sp.Rollback(c.Context)
+		})
+		// emitViaCopy emits through a copy of its Call, writing nothing.
+		Method(app, "emitViaCopy", func(c *Call, _ struct{}) (struct{}, error) {
+			cc := *c
+			return struct{}{}, cc.EmitAfterCommit("items.all", nil, "", "copied", 1)
+		})
 	})
 }
 
@@ -70,11 +86,35 @@ func TestWriteCallKeepsFence(t *testing.T) {
 // EmitAfterCommit with no writes keeps the fence: its evt precedes the res.
 func TestEmitOnlyCallKeepsFence(t *testing.T) {
 	e := setupFull(t, func(c *Config) { c.MinTickInterval = slowTick }, nil)
+	e.waitListening(t) // an event emitted before LISTEN is up is dropped
 	a, _ := e.dial(t, evtCaps)
 	subscribe(t, a, 1, "items.all")
 	got, _ := timedCall(t, a, map[string]any{"t": "call", "id": 1, "m": "emitTwice"})
 	if len(got) != 3 || got[0]["t"] != "evt" || got[1]["t"] != "evt" {
 		t.Fatalf("expected evt, evt, res; got %v", got)
+	}
+}
+
+// A write undone by a rolled-back savepoint still assigned an ID: fenced.
+func TestRolledBackSavepointKeepsFence(t *testing.T) {
+	e := setupSlowTick(t)
+	a, _ := e.dial(t, nil)
+	afterTick(t, a, 1)
+	_, d := timedCall(t, a, map[string]any{"t": "call", "id": 2, "m": "undoneWrite"})
+	if d < slowTick/2 {
+		t.Fatalf("call took %v: it skipped the fence", d)
+	}
+}
+
+// Emitting through a copy of the Call still keeps the fence.
+func TestEmitViaCopiedCallKeepsFence(t *testing.T) {
+	e := setupSlowTick(t)
+	e.waitListening(t) // an event emitted before LISTEN is up is dropped
+	a, _ := e.dial(t, evtCaps)
+	subscribe(t, a, 1, "items.all")
+	got, _ := timedCall(t, a, map[string]any{"t": "call", "id": 1, "m": "emitViaCopy"})
+	if len(got) != 2 || got[0]["t"] != "evt" {
+		t.Fatalf("expected evt then res, got %v", got)
 	}
 }
 

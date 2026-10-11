@@ -206,7 +206,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 
 - **Concurrency.** Calls run concurrently, up to `limits.maxInflight`. A caller that needs ordering awaits. Calls beyond the limit get `RATE_LIMITED` with `retryAfterMs`.
 - **Exactly one `res` per `id`.**
-- **`"noFence":true`** skips the read-your-writes fence (§6.2). Use it for latency-sensitive calls that do not write.
+- **`"noFence":true`** skips the read-your-writes fence (§6.2). A call that writes nothing already skips it (§6.2); use `noFence` for latency-sensitive calls that write but need not wait for their update.
 - **`"ik":"<uuid>"` idempotency key.** Negotiated with the `ik` cap: the client offers `"caps":["ik"]` in `hello`, and a server that supports keys includes `"ik"` in `welcome.caps`.
   - The framework writes `(ik, userId, method, result)` to `comet_idempotency` inside the method's own transaction, so the record commits atomically with the method's effects.
   - A retry with the same `ik` from the same user returns the stored result instead of executing again. Its `res` is fenced like any call's.
@@ -238,7 +238,9 @@ Guarantees hold per server node. In a multi-node deployment, each connection is 
 
 **Mechanism.** Methods that use the framework transaction (`ctx.Tx`) send `pg_notify('comet', '1|f|<nodeId>:<counter>')` as the **last** statement before commit.
 
-**No effects, no fence.** A call whose transaction was assigned no transaction ID wrote nothing and has no effects, so it commits without a fence and its `res` is sent at once. Two exceptions: a call that emitted events (`EmitAfterCommit` runs `pg_notify` without assigning an ID, and its `evt` must precede the `res`), and an idempotency replay. Rolled-back savepoints keep their ID, so they keep the fence too.
+**No effects, no fence.** A call whose transaction was assigned no transaction ID wrote nothing and has no effects, so it commits without a fence and its `res` is sent at once. The check and the fence notification are one statement. An idempotency replay is always fenced. `EmitAfterCommit` assigns an ID (`pg_notify` alone does not, before commit), so a call that emitted events stays fenced and its `evt` precedes its `res`. A write undone by a rolled-back savepoint has an ID, so it is fenced too.
+
+Because such a call does not wait for a tick, its result can reflect data the client's subscriptions have not received yet: a read-only call that counts rows can return a newer count than the client's store currently holds.
 
 Postgres delivers a transaction's notifications together, after commit, in commit order. So by the time the listener receives the fence, every row notification from that transaction has already been received.
 
@@ -259,7 +261,8 @@ In v1-core, ticks are sequential and every dirty observer runs in each tick, so 
 |---|---|
 | Fence timeout (default 5 s) | `res` is sent with `"lag":true`. The promise resolves, and the client can tell the effects are not yet visible. The guarantee is never broken silently. |
 | Method failed or rolled back | The fence notify rolled back with it. The framework knows the commit failed and sends `res` immediately. |
-| Method wrote nothing watched | The fence still forces a (cheap) tick. |
+| Method wrote nothing (no transaction ID) | No fence: `res` is sent on commit, without waiting for a tick. |
+| Method wrote only to unwatched tables | The fence still forces a (cheap) tick. |
 | Listener down when the method commits (server just started, or reconnecting) | The fence notification is lost (§11). The all-dirty tick that follows the next successful LISTEN re-runs every observer on a snapshot taken after the commit. That tick releases every fence whose transaction committed before that LISTEN, and sends the `res` after the tick's `tx`. The call resolves without `lag` once the listener is back. Fenced commits wait while LISTEN itself runs, so each commit falls clearly before or after it. A fence committed after the LISTEN is left to its own notification, so its events still precede its `res`. |
 | Writes outside `ctx.Tx` (another connection or pool) | No fence guarantee. This is documented. |
 | **[later]** logical replication | The fence becomes "the replication stream has processed past the commit LSN". The wire protocol is unchanged. |

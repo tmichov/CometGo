@@ -322,8 +322,7 @@ type Call struct {
 	// the client's call resolves only after their effects reach its subs.
 	Tx pgx.Tx
 
-	app     *App
-	emitted bool // EmitAfterCommit was called: the fence must order its evt
+	app *App
 }
 
 type method struct {
