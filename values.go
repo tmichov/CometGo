@@ -51,7 +51,8 @@ func typeCode(m *pgtype.Map, oid uint32) string {
 	}
 	t, ok := m.TypeForOID(oid)
 	if !ok {
-		// Types pgx does not know (e.g. user enums) arrive in text format as strings.
+		// Types pgx does not know arrive in text format as strings. User enums
+		// are registered before this is reached (types.go).
 		return "text"
 	}
 	switch c := t.Codec.(type) {

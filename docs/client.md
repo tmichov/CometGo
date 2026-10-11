@@ -200,7 +200,7 @@ Each subscription receives its column types once, and the client decodes every v
 | `numeric` | `num` | `string` (exact decimal) |
 | `bool` | `bool` | `boolean` |
 | `text`, `varchar`, `char`, `name` | `text` | `string` |
-| enum | `enum` | `string`. Enums not registered with pgx, like any type pgx does not know, arrive as `text`. |
+| enum | `enum` | `string`. Arrays of an enum are `[]enum`, decoded to `string[]`. |
 | `uuid` | `uuid` | `string` (lowercase) |
 | `timestamptz` | `tstz` | `Date`. `Date` keeps milliseconds only; the wire value has microseconds. `infinity`/`-infinity` stay strings. |
 | `timestamp` | `ts` | `string`, `"YYYY-MM-DDTHH:MM:SS.ffffff"` with no time zone |
