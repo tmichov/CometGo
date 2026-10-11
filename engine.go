@@ -42,7 +42,13 @@ type engine struct {
 	// coalescing holds the connections in coalescing mode (§8.1): their
 	// queue went over softQueuedBytes, so their subs' changes are held as
 	// needsReset until it drains below lowWaterBytes.
-	coalescing   map[*conn]bool
+	coalescing map[*conn]bool
+	// snapshotted maps the connections sent a snapshot since their queue
+	// was last below lowWaterBytes to their queued bytes right after it.
+	// Their soft limit is that much higher: a queue full of a snapshot is
+	// not a client falling behind on diffs, and coalescing would answer it
+	// with yet another snapshot.
+	snapshotted  map[*conn]int
 	carryFences  []*fence
 	carryEvts    []*evtNote
 	carryOut     map[*conn]*connOut
@@ -87,13 +93,13 @@ type subscription struct {
 	args    json.RawMessage
 	argsKey string
 	obs     *observer
-	// needInit: send init + full snapshot next tick. reset marks that
-	// snapshot as a reset of data the client already holds.
+	// needInit: send init + full snapshot next tick. holds: the client
+	// already has data for the sub (an earlier snapshot, or have on sub), so
+	// that snapshot goes out as a reset.
 	needInit bool
-	reset    bool
+	holds    bool
 	// needsReset: a snapshot is owed but held back while the connection is
-	// coalescing (§8.1). Releasing it sets needInit; reset says whether the
-	// client already holds data for the sub.
+	// coalescing (§8.1). Releasing it sets needInit.
 	needsReset bool
 }
 
@@ -131,13 +137,14 @@ type rebindReq struct {
 
 func newEngine(a *App) *engine {
 	return &engine{
-		a:          a,
-		fences:     map[string]*fence{},
-		wake:       make(chan struct{}, 1),
-		observers:  map[string]*observer{},
-		conns:      map[*conn]map[uint64]*subscription{},
-		ended:      map[*conn]map[uint64]bool{},
-		coalescing: map[*conn]bool{},
+		a:           a,
+		fences:      map[string]*fence{},
+		wake:        make(chan struct{}, 1),
+		observers:   map[string]*observer{},
+		conns:       map[*conn]map[uint64]*subscription{},
+		ended:       map[*conn]map[uint64]bool{},
+		coalescing:  map[*conn]bool{},
+		snapshotted: map[*conn]int{},
 	}
 }
 
@@ -278,9 +285,17 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			forced[c] = true
 		}
 	}
+	// A session without a live socket stays held: releasing it would put
+	// every held snapshot into the replay buffer, which can end the session.
+	// After a resume the next tick checks the new socket.
 	for c := range e.coalescing {
-		if forced[c] || c.queuedBytes(lowWaterBytes) < lowWaterBytes {
+		if q, live := c.queuedBytes(lowWaterBytes); forced[c] || live && q < lowWaterBytes {
 			e.release(c)
+		}
+	}
+	for c := range e.snapshotted {
+		if q, _ := c.queuedBytes(lowWaterBytes); q < lowWaterBytes {
+			delete(e.snapshotted, c)
 		}
 	}
 
@@ -320,18 +335,21 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		if forced[c] {
 			return false
 		}
-		if !decided[c] && !e.coalescing[c] && c.queuedBytes(0) > softQueuedBytes {
-			e.coalescing[c] = true
-			c.coalescing.Store(true)
-			// Arm the drain signal; a queue that drained in the meantime
-			// is picked up by the next tick.
-			if c.queuedBytes(lowWaterBytes) < lowWaterBytes {
-				e.signal()
+		if !decided[c] && !e.coalescing[c] {
+			if q, _ := c.queuedBytes(0); q > softQueuedBytes+e.snapshotted[c] {
+				e.coalescing[c] = true
+				c.coalescing.Store(true)
+				// Arm the drain signal; a queue that drained in the
+				// meantime is picked up by the next tick.
+				if q, _ := c.queuedBytes(lowWaterBytes); q < lowWaterBytes {
+					e.signal()
+				}
 			}
 		}
 		decided[c] = true
 		return e.coalescing[c]
 	}
+	snapped := map[*conn]bool{}
 	for _, obs := range e.observers {
 		if obs.err != nil {
 			for sub := range obs.subs {
@@ -351,11 +369,10 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 				sub.needInit, sub.needsReset = false, true
 			case sub.needInit:
 				outFor(sub.c).entries = append(outFor(sub.c).entries, e.snapshotEntry(sub))
-				sub.needInit, sub.reset = false, false
+				sub.needInit, sub.holds = false, true
+				snapped[sub.c] = true
 			case len(obs.ops) > 0 && hold(sub.c):
-				if !sub.needsReset {
-					sub.needsReset, sub.reset = true, true
-				}
+				sub.needsReset = true
 			case len(obs.ops) > 0:
 				if opsJSON == nil {
 					opsJSON = marshalOps(obs.ops)
@@ -366,6 +383,11 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		obs.ops = nil
 	}
 	e.flush(out)
+	for c := range snapped {
+		// Arms the drain signal that ends the raised limit.
+		q, _ := c.queuedBytes(lowWaterBytes)
+		e.snapshotted[c] = q
+	}
 
 	// Events drained this tick follow the tx reflecting every change
 	// notified before them, and precede the res of the call that emitted
@@ -404,7 +426,7 @@ func (e *engine) flush(out map[*conn]*connOut) {
 }
 
 // release ends coalescing for c: every held sub gets its snapshot in this
-// tick, as a reset where the client already holds data for it. The snapshot
+// tick, as a reset where the client holds data for it. The snapshot
 // is this tick's, newer than anything c was sent, so no sub goes back.
 func (e *engine) release(c *conn) {
 	delete(e.coalescing, c)
@@ -428,7 +450,7 @@ func (e *engine) snapshotEntry(sub *subscription) subEntry {
 	return subEntry{
 		S:     sub.s,
 		Init:  init,
-		Reset: sub.reset,
+		Reset: sub.holds,
 		Ops:   marshalOps(snapshotOps(obs.res, init.Ordered)),
 		Ready: true,
 	}
@@ -471,7 +493,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			end(r.c, r.s, NewError(CodeRateLimited, "too many subscriptions"))
 			return
 		}
-		sub := &subscription{c: r.c, s: r.s, name: r.name, args: r.args, argsKey: argsKey, needInit: true, reset: r.have}
+		sub := &subscription{c: r.c, s: r.s, name: r.name, args: r.args, argsKey: argsKey, needInit: true, holds: r.have}
 		if err := e.bind(ctx, sub, r.ident); err != nil {
 			end(r.c, r.s, err)
 			return
@@ -491,6 +513,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		delete(e.conns, r.c)
 		delete(e.ended, r.c)
 		delete(e.coalescing, r.c)
+		delete(e.snapshotted, r.c)
 
 	case resumeReq:
 		for s, sub := range e.conns[r.c] {
@@ -504,7 +527,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
 		for s, sub := range e.conns[r.c] {
 			e.detach(sub)
-			sub.needInit, sub.reset, sub.needsReset = true, true, false
+			sub.needInit, sub.needsReset = true, false
 			if err := e.bind(ctx, sub, r.ident); err != nil {
 				end(r.c, s, err)
 				delete(e.conns[r.c], s)
@@ -607,7 +630,7 @@ func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
 		case !sameCols(obs.cols, r.cols):
 			// Result shape changed (e.g. migration): reset every sub.
 			for sub := range obs.subs {
-				sub.needInit, sub.reset = true, true
+				sub.needInit = true
 			}
 		default:
 			obs.ops = diffResults(obs.res, r.res, !obs.pub.opts.Unordered)

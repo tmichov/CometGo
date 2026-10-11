@@ -69,12 +69,16 @@ func (e *testEnv) dialSlow(t *testing.T, hello map[string]any) (*client, map[str
 type mirror struct {
 	rows  map[string][]any // key → cells (id, owner, name, n)
 	reset bool             // a reset entry was applied
+	seq   uint64           // of the last complete tx applied
 }
 
 func (m *mirror) apply(t *testing.T, msg map[string]any) {
 	t.Helper()
 	if msg["t"] != "tx" {
 		return
+	}
+	if msg["more"] != true {
+		m.seq = seqOf(msg)
 	}
 	for _, en := range entries(msg) {
 		if en["s"].(float64) != 1 {
@@ -182,8 +186,8 @@ func TestSlowClientCoalescesToReset(t *testing.T) {
 				return
 			case <-time.After(time.Millisecond):
 			}
-			if q := int64(c.queuedBytes(0)); q > peak.Load() {
-				peak.Store(q)
+			if q, _ := c.queuedBytes(0); int64(q) > peak.Load() {
+				peak.Store(int64(q))
 			}
 			if c.coalescing.Load() {
 				coalesced.Store(true)
@@ -298,5 +302,100 @@ func TestCoalescingHoldsNewSubAsInit(t *testing.T) {
 	if sub2[0]["init"] == nil || sub2[0]["reset"] != nil {
 		b, _ := json.Marshal(sub2[0])
 		t.Fatalf("sub 2 first entry %s", b)
+	}
+}
+
+// waitCoalescing rewrites the table until c coalesces.
+func (e *testEnv) waitCoalescing(t *testing.T, c *conn) {
+	t.Helper()
+	for i := 0; !c.coalescing.Load(); i++ {
+		if i == 200 {
+			t.Fatal("connection never coalesced")
+		}
+		e.rewrite(t, i)
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A queue full of a snapshot is not a client falling behind: the diff after
+// a big snapshot goes out as a diff, not as another full reset.
+func TestBigSnapshotDoesNotStartCoalescing(t *testing.T) {
+	e := setup(t)
+	// 300 rows of ~1000 bytes: a ~300 KiB snapshot, over the soft limit.
+	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) SELECT 'x', repeat('a', 1000) FROM generate_series(1, 300)"); err != nil {
+		t.Fatal(err)
+	}
+	a, w := e.dialSlow(t, resumeHello(nil))
+	c := e.session(t, w["session"])
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	// Not reading: the snapshot stays queued while the next change lands.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		if q, _ := c.queuedBytes(0); q > softQueuedBytes {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("snapshot never queued past the soft limit")
+		}
+	}
+	var id string
+	if err := e.pool.QueryRow(context.Background(), "SELECT min(id)::text FROM "+e.table).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(context.Background(), "UPDATE "+e.table+" SET n = n + 1 WHERE id = $1::int8", id); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if c.coalescing.Load() {
+		t.Fatal("coalescing on a queued snapshot")
+	}
+	m := &mirror{}
+	for len(m.rows) == 0 || m.matchesDB(t, e) != nil {
+		msg := a.next()
+		if m.rows != nil && msg["t"] == "tx" {
+			if en := entries(msg); en[0]["init"] != nil {
+				t.Fatalf("second snapshot after the first: %v", en[0]["reset"])
+			}
+		}
+		m.apply(t, msg)
+	}
+}
+
+// A coalescing session that loses its socket keeps its subs held: released
+// while detached, every snapshot would land in the replay buffer. The
+// resumed socket gets the replay, then the resets.
+func TestCoalescingSessionStaysHeldWhileDetached(t *testing.T) {
+	e := setup(t)
+	a, c, m := stalledClient(t, e)
+	e.waitCoalescing(t, c)
+	a.kill()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		c.mu.Lock()
+		gone := c.sock == nil
+		c.mu.Unlock()
+		if gone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("socket never detached")
+		}
+	}
+	for i := range 5 {
+		e.rewrite(t, 100+i)
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if !c.coalescing.Load() {
+		t.Fatal("released while detached")
+	}
+	b, w := e.dial(t, resumeHello(map[string]any{"resume": map[string]any{"session": c.session, "seq": m.seq, "subs": []int{1}}}))
+	if w["resumed"] != true {
+		t.Fatalf("welcome %v", w)
+	}
+	for !m.reset {
+		m.apply(t, b.next())
+	}
+	b.sync()
+	if err := m.matchesDB(t, e); err != nil {
+		t.Fatal(err)
 	}
 }

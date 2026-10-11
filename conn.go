@@ -856,23 +856,26 @@ func (c *conn) buffer(seq uint64, b []byte) bool {
 	return true
 }
 
-// queuedBytes reports the bytes queued on the session's socket, 0 while
-// detached. With watchBelow > 0, the socket also calls onDrain once its
-// queue drops below watchBelow; arming and reading happen together, so a
-// drain is never missed between them.
-func (c *conn) queuedBytes(watchBelow int) int {
+// queuedBytes reports the bytes queued on the session's socket, and whether
+// it has a live one (0, false while detached or after the socket failed).
+// With watchBelow > 0, the socket also calls onDrain once its queue drops
+// below watchBelow; arming and reading happen under one lock.
+func (c *conn) queuedBytes(watchBelow int) (int, bool) {
 	c.mu.Lock()
 	s := c.sock
 	c.mu.Unlock()
 	if s == nil {
-		return 0
+		return 0, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dead {
+		return 0, false
+	}
 	if watchBelow > 0 {
 		s.drainAt = watchBelow
 	}
-	return s.outBytes
+	return s.outBytes, true
 }
 
 // push appends to the socket's outbound queue.
