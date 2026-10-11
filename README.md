@@ -29,7 +29,7 @@ Open the page in two tabs: changes appear in both.
 
 ## Status
 
-v1-core is implemented (see [protocol §12](docs/protocol.md#12-scope)), plus session resume. Idempotency keys, coalescing backpressure, ephemeral events and optimistic UI are specified but not implemented yet.
+v1-core is implemented (see [protocol §12](docs/protocol.md#12-scope)), plus session resume, idempotency keys, ephemeral events and coalescing backpressure. Optimistic UI is specified but not implemented yet.
 
 ## License
 

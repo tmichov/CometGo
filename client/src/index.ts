@@ -149,6 +149,10 @@ export class Comet {
   #acked = 0;
   #welcomed = false; // the current socket's welcome has arrived
   #unackedBytes = 0;
+  // retryInMs of a goaway on the current socket (§7.3): the server is
+  // shutting down, so new calls wait for the next connection, which is
+  // opened after this delay instead of the usual backoff.
+  #goaway?: number;
 
   constructor(opts: ConnectOptions) {
     this.#opts = opts;
@@ -210,7 +214,7 @@ export class Comet {
       this.#calls.set(c.id, c);
       // Unsent calls wait for the next connection; they never ran, so
       // sending them later is safe.
-      if (this.#isOpen()) this.#sendCall(c);
+      if (this.#isOpen() && this.#goaway === undefined) this.#sendCall(c);
     });
   }
 
@@ -266,6 +270,7 @@ export class Comet {
       // if the session resumes (§7.2).
       this.#lastRecv = Date.now();
       this.#welcomed = false;
+      this.#goaway = undefined;
       const resume = this.#resumable() ? { resume: { session: this.#session, seq: this.#seq, subs: [...this.#subs.keys()] } } : {};
       this.#send({ t: "hello", v: 1, caps: ["resume", "evt", "ik"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}), ...resume });
       for (const sub of this.#subs.values()) this.#sendSub(sub);
@@ -322,8 +327,10 @@ export class Comet {
     this.#setStatus("disconnected");
     if (code >= 4400 && code < 4500 && reason) console.warn("cometgo: closed", code, reason);
     if (this.#closed) return;
-    // Exponential backoff with full jitter.
-    const delay = Math.random() * Math.min(30_000, 500 * 2 ** this.#attempt++);
+    // After a goaway, the server's delay spreads reconnects out; otherwise
+    // exponential backoff with full jitter.
+    const delay = this.#goaway ?? Math.random() * Math.min(30_000, 500 * 2 ** this.#attempt++);
+    this.#goaway = undefined;
     this.#reconnectTimer = setTimeout(() => void this.#open(), delay);
   }
 
@@ -484,6 +491,11 @@ export class Comet {
         else c.reject(new CometError(msg.err));
         return;
       }
+      case "goaway":
+        // Calls already sent still settle from their res, which the server
+        // sends before it closes the socket.
+        this.#goaway = Math.max(0, Number(msg.retryInMs) || 0);
+        return;
       case "evt": {
         this.#seq = msg.seq;
         // Events for unknown (unsubscribed, rekeyed) or ended subs are dropped.

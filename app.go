@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -129,6 +130,18 @@ type App struct {
 
 	sessMu   sync.Mutex
 	sessions map[string]*conn // resumable sessions, by id
+
+	// Graceful shutdown (§7.3).
+	shutting atomic.Bool
+	calls    atomic.Int64 // calls in flight on every session, ended ones too
+	liveMu   sync.Mutex
+	live     map[*conn]struct{} // every session not yet ended
+	shutOnce sync.Once
+	shutDone chan struct{}
+	shutErr  error
+	startMu  sync.Mutex         // guards started and stop
+	stop     context.CancelFunc // stops what Start runs
+	running  sync.WaitGroup
 }
 
 // New creates an App. Register publications and methods, then call Start.
@@ -174,21 +187,35 @@ func New(cfg Config) *App {
 		pubs:     map[string]*publication{},
 		methods:  map[string]*method{},
 		sessions: map[string]*conn{},
+		live:     map[*conn]struct{}{},
+		shutDone: make(chan struct{}),
 	}
 	a.engine = newEngine(a)
 	return a
 }
 
 // Start runs the Postgres listener, the tick engine and the idempotency-key
-// cleanup until ctx is done.
+// cleanup until ctx is done or Shutdown stops them. Shutdown needs them
+// running while it drains, so with Shutdown pass a ctx that outlives the
+// shutdown signal. After Shutdown, Start does nothing.
 func (a *App) Start(ctx context.Context) {
+	a.startMu.Lock()
+	defer a.startMu.Unlock()
 	if a.started {
 		panic("cometgo: Start called twice")
 	}
 	a.started = true
-	go a.engine.listen(ctx)
-	go a.engine.run(ctx)
-	go a.cleanIdempotency(ctx)
+	if a.shutting.Load() {
+		return
+	}
+	ctx, a.stop = context.WithCancel(ctx)
+	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
+		a.running.Add(1)
+		go func() {
+			defer a.running.Done()
+			run(ctx)
+		}()
+	}
 }
 
 // Scope controls which connections share one observer of a publication.
