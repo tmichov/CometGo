@@ -336,6 +336,17 @@ A token refresh for the same user is fine. A protocol error, or a deliberate clo
 
 Memory cost: each disconnected session holds its subscriptions plus at most `ResumeBuffer` bytes for up to `ResumeGrace`. Connected sessions hold the unacknowledged tail, usually about one second of output. Set `ResumeGrace` negative to turn resume off.
 
+## Slow clients
+
+A client that reads more slowly than its subscriptions change (a phone on a bad network, a tab in the background) does not make the server buffer every change for it. Once more than 256 KiB is queued for a connection, the server stops sending it diffs and only notes which subscriptions changed. When the client has caught up below 64 KiB, it gets one transaction that resets those subscriptions to the current data. The client applies a reset as a diff against what it holds, so rows that did not change are not re-rendered. Server memory per connection stays bounded by the size of the results, not by how fast they change.
+
+While the connection is held back:
+
+- A method call's result still arrives after the data it wrote: when its fence is released, the held subscriptions are reset in that tick, ahead of the result.
+- Events for a held subscription are dropped. Events are at-most-once anyway.
+
+A client that makes no progress at all is still disconnected with 4429 SLOW_CONSUMER, when about 8 MiB is queued or a single write is stuck for 10 seconds. That close leaves a resumable session resumable.
+
 ## InstallTriggers
 
 ```go

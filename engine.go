@@ -38,7 +38,11 @@ type engine struct {
 	// reaches it; re-binding such an id would leave a sub the client never
 	// tracks again. Sub ids are never reused (§4.1), so a sub for one of
 	// these is always that re-send.
-	ended        map[*conn]map[uint64]bool
+	ended map[*conn]map[uint64]bool
+	// coalescing holds the connections in coalescing mode (§8.1): their
+	// queue went over softQueuedBytes, so their subs' changes are held as
+	// needsReset until it drains below lowWaterBytes.
+	coalescing   map[*conn]bool
 	carryFences  []*fence
 	carryEvts    []*evtNote
 	carryOut     map[*conn]*connOut
@@ -55,6 +59,7 @@ type notification struct {
 
 type fence struct {
 	released chan struct{}
+	c        *conn // the connection whose res waits on it
 }
 
 type observer struct {
@@ -86,6 +91,10 @@ type subscription struct {
 	// snapshot as a reset of data the client already holds.
 	needInit bool
 	reset    bool
+	// needsReset: a snapshot is owed but held back while the connection is
+	// coalescing (§8.1). Releasing it sets needInit; reset says whether the
+	// client already holds data for the sub.
+	needsReset bool
 }
 
 type subReq struct {
@@ -122,12 +131,13 @@ type rebindReq struct {
 
 func newEngine(a *App) *engine {
 	return &engine{
-		a:         a,
-		fences:    map[string]*fence{},
-		wake:      make(chan struct{}, 1),
-		observers: map[string]*observer{},
-		conns:     map[*conn]map[uint64]*subscription{},
-		ended:     map[*conn]map[uint64]bool{},
+		a:          a,
+		fences:     map[string]*fence{},
+		wake:       make(chan struct{}, 1),
+		observers:  map[string]*observer{},
+		conns:      map[*conn]map[uint64]*subscription{},
+		ended:      map[*conn]map[uint64]bool{},
+		coalescing: map[*conn]bool{},
 	}
 }
 
@@ -156,12 +166,12 @@ func (e *engine) notify(n notification) {
 
 // registerFence must be called before the method's transaction commits, so
 // the fence is known by the time its notification can be drained.
-func (e *engine) registerFence() (string, *fence) {
+func (e *engine) registerFence(c *conn) (string, *fence) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.fenceN++
 	token := e.a.nodeID + ":" + strconv.FormatUint(e.fenceN, 10)
-	f := &fence{released: make(chan struct{})}
+	f := &fence{released: make(chan struct{}), c: c}
 	e.fences[token] = f
 	return token, f
 }
@@ -252,6 +262,28 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		e.handleReq(ctx, r, outFor)
 	}
 
+	// Coalescing connections (§8.1) get their held resets once their queue
+	// has drained, and right away when this tick releases one of their
+	// fences or sends them an after message: a res or authRes must follow a
+	// tx reflecting current data for every sub (§3.2, §6.2). Both happen
+	// before the snapshot, so the resets are built from it.
+	forced := map[*conn]bool{}
+	for _, f := range fences {
+		if f.c != nil {
+			forced[f.c] = true
+		}
+	}
+	for c, o := range out {
+		if len(o.after) > 0 {
+			forced[c] = true
+		}
+	}
+	for c := range e.coalescing {
+		if forced[c] || c.queuedBytes(lowWaterBytes) < lowWaterBytes {
+			e.release(c)
+		}
+	}
+
 	for _, obs := range e.observers {
 		if allDirty || slices.ContainsFunc(obs.tables, func(t string) bool { return dirtyTables[t] }) {
 			obs.dirty = true
@@ -279,7 +311,27 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		}
 	}
 
-	// 4. Assemble one tx per connection.
+	// 4. Assemble one tx per connection. A connection over the soft limit
+	// starts coalescing: its subs' changes are held, not serialized.
+	// Decided once per connection, so the queue draining mid-assembly
+	// cannot split one connection's subs between the two modes.
+	decided := map[*conn]bool{}
+	hold := func(c *conn) bool {
+		if forced[c] {
+			return false
+		}
+		if !decided[c] && !e.coalescing[c] && c.queuedBytes(0) > softQueuedBytes {
+			e.coalescing[c] = true
+			c.coalescing.Store(true)
+			// Arm the drain signal; a queue that drained in the meantime
+			// is picked up by the next tick.
+			if c.queuedBytes(lowWaterBytes) < lowWaterBytes {
+				e.signal()
+			}
+		}
+		decided[c] = true
+		return e.coalescing[c]
+	}
 	for _, obs := range e.observers {
 		if obs.err != nil {
 			for sub := range obs.subs {
@@ -295,9 +347,15 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		var opsJSON []json.RawMessage
 		for sub := range obs.subs {
 			switch {
+			case sub.needInit && hold(sub.c):
+				sub.needInit, sub.needsReset = false, true
 			case sub.needInit:
 				outFor(sub.c).entries = append(outFor(sub.c).entries, e.snapshotEntry(sub))
 				sub.needInit, sub.reset = false, false
+			case len(obs.ops) > 0 && hold(sub.c):
+				if !sub.needsReset {
+					sub.needsReset, sub.reset = true, true
+				}
 			case len(obs.ops) > 0:
 				if opsJSON == nil {
 					opsJSON = marshalOps(obs.ops)
@@ -341,6 +399,19 @@ func (e *engine) flush(out map[*conn]*connOut) {
 		}
 		for _, m := range o.after {
 			c.send(m)
+		}
+	}
+}
+
+// release ends coalescing for c: every held sub gets its snapshot in this
+// tick, as a reset where the client already holds data for it. The snapshot
+// is this tick's, newer than anything c was sent, so no sub goes back.
+func (e *engine) release(c *conn) {
+	delete(e.coalescing, c)
+	c.coalescing.Store(false)
+	for _, sub := range e.conns[c] {
+		if sub.needsReset {
+			sub.needsReset, sub.needInit = false, true
 		}
 	}
 }
@@ -419,6 +490,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		}
 		delete(e.conns, r.c)
 		delete(e.ended, r.c)
+		delete(e.coalescing, r.c)
 
 	case resumeReq:
 		for s, sub := range e.conns[r.c] {
@@ -432,7 +504,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
 		for s, sub := range e.conns[r.c] {
 			e.detach(sub)
-			sub.needInit, sub.reset = true, true
+			sub.needInit, sub.reset, sub.needsReset = true, true, false
 			if err := e.bind(ctx, sub, r.ident); err != nil {
 				end(r.c, s, err)
 				delete(e.conns[r.c], s)

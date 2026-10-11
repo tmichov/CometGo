@@ -177,7 +177,7 @@ On a SubEntry with `reset:true`:
 
 Rows that did not change keep their object identity, so the UI does not re-render them. While a reset is in progress, `sub.status` is `"resyncing"`, so the UI can dim stale data if it wants to.
 
-Resets are used for reconnect resync, identity change and **[later]** slow-consumer recovery.
+Resets are used for reconnect resync, identity change and slow-consumer recovery (§8.1).
 
 ### 4.5 Events (`evt`)
 
@@ -189,7 +189,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 
 - **Negotiation.** The client offers `"evt"` in `hello.caps`; the server advertises `"evt"` in `welcome.caps`. The server sends `evt` only to clients that offered the cap.
 - **Scope.** An event is addressed to one observer, `(pub, args, scope)`, and delivered once to every sub bound to it, each with its own `s`. The publication must enable events on the server.
-- **At-most-once.** An event reaches the subs bound when the server processes it, on sessions with an open socket. It is not stored: events sent while a client is away are never delivered, whether it resyncs (§7.1) or resumes (§7.2). An `evt` that was already sent when the socket dropped is in the replay buffer like any stateful message, so a resume can deliver it, once. A session whose `evt` cap differs from the resuming `hello`'s cannot be resumed.
+- **At-most-once.** An event reaches the subs bound when the server processes it, on sessions with an open socket, except subs held back by coalescing (§8.1). It is not stored: events sent while a client is away are never delivered, whether it resyncs (§7.1) or resumes (§7.2). An `evt` that was already sent when the socket dropped is in the replay buffer like any stateful message, so a resume can deliver it, once. A session whose `evt` cap differs from the resuming `hello`'s cannot be resumed.
 - **Ordering.** `evt` is stateful and carries `seq`. An event follows the `tx` reflecting every change committed before it was emitted. An event emitted inside a method's transaction is sent only if it commits, after the `tx` with the method's writes and before the method's `res` (unless the call used `noFence`).
 - **Size.** The encoded event is limited to 7,500 bytes; the server API rejects a larger one.
 - **Multi-node.** Events travel through `pg_notify` on the channel `comet_evt`, so an emit on any node reaches subscribers on every node.
@@ -335,11 +335,14 @@ An identity change during the gap is part of the replay. For example, a token th
 
 Each connection has a single writer goroutine with a 10 s write deadline.
 
-- **v1-core: hard limit.** About 8 MiB queued, or no drain progress for 30 s, closes the connection with 4429 SLOW_CONSUMER. The client reconnects and resyncs.
-- **[later] Coalescing mode.** Above a 256 KiB soft limit:
-  - New diffs for the connection are not serialized. Instead its affected subs are marked `needsReset`.
-  - When the queue drains below the low-water mark, the server sends one `tx` with `reset:true` for all marked subs, built from a single tick.
+- **Coalescing mode.** Above a 256 KiB soft limit:
+  - New diffs for the connection are not serialized. Instead its affected subs are marked `needsReset`. A sub made while coalescing is held the same way, and later gets its first snapshot (`init` without `reset`).
+  - When the queue drains below the 64 KiB low-water mark, the server sends one `tx` with `reset:true` for all marked subs, built from a single tick. That snapshot is newer than anything the connection was sent, so no sub goes back in time.
+  - A `res` whose fence is released while the connection is coalescing (§6.2), and an `authRes` after a rebind (§3.2), do not wait for the drain: the marked subs' resets go out in that tick's `tx`, ahead of the message.
+  - `evt` messages for a marked sub are dropped (§4.5, at-most-once): they would otherwise arrive ahead of the data they follow.
   - Server memory stays bounded by result size, not by change rate.
+  - No cap is needed: clients already handle `reset:true` for resync.
+- **Hard limit.** As a last resort, about 8 MiB queued, or a write making no progress for the 10 s deadline, closes the connection with 4429 SLOW_CONSUMER. The client reconnects and resyncs.
 
 ### 8.2 Heartbeats
 
@@ -474,11 +477,11 @@ Every node receives every fence and ignores the tokens it does not own.
 - **Events:** `evt` (ephemeral, at-most-once, sub-scoped, §4.5), behind `caps`.
 - **Methods:** `cancel` (§5). It needs no cap: a server without it ignores the message, and the call settles from its normal `res`.
 - **Methods:** `ik` idempotency keys (§5), behind `caps`.
+- **Backpressure:** coalesce→reset for slow clients (§8.1). It needs no cap: it only sends `reset` entries, which every client handles.
 
 **[later]**, all additive and behind `caps`:
 - **Reconnect:** `goaway`.
 - **Engine and transport:**
-  - coalesce→reset backpressure
   - slow-observer detachment and parallel ticks with an exported snapshot
   - minimal-diff identity rebind
   - Go-side predicate filtering
@@ -503,5 +506,5 @@ Every node receives every fence and ignores the tokens it does not own.
 6. EJSON per-value tagging, which had no int64 or decimal story, is replaced by column type descriptors.
 7. Client-side re-sorting with the wrong collation is replaced by server positions.
 8. Login as a method with non-atomic sub reruns is replaced by first-class `auth` with an atomic rebind.
-9. No backpressure is replaced by hard limits and **[later]** coalesce→reset.
+9. No backpressure is replaced by coalesce→reset, with a hard limit as the last resort.
 10. In-payload version negotiation is replaced by the WebSocket subprotocol.
