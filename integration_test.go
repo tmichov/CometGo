@@ -28,13 +28,20 @@ type testEnv struct {
 	slowRuns atomic.Int32
 }
 
-func setup(t *testing.T) *testEnv {
+func setup(t testing.TB) *testEnv {
 	t.Helper()
 	return setupWith(t, nil)
 }
 
 // setupWith is setup with Config overrides applied before New.
-func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
+func setupWith(t testing.TB, tweak func(*Config)) *testEnv {
+	t.Helper()
+	return setupFull(t, tweak, nil)
+}
+
+// setupFull is setupWith plus extra, which registers more publications
+// and methods before Start.
+func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *testEnv {
 	t.Helper()
 	dsn := os.Getenv("COMETGO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -153,6 +160,9 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 		_, err := c.Tx.Exec(c.Context, "SELECT pg_sleep($1::float8 / 1000)", a.SleepMs)
 		return id, err
 	})
+	if extra != nil {
+		extra(env, app)
+	}
 	app.Start(ctx)
 	// LISTEN comes up asynchronously; a fence notified before it would be
 	// lost and its call would wait FenceTimeout. The listener signals
@@ -175,11 +185,11 @@ func setupWith(t *testing.T, tweak func(*Config)) *testEnv {
 }
 
 type client struct {
-	t  *testing.T
+	t  testing.TB
 	ws *websocket.Conn
 }
 
-func (e *testEnv) dial(t *testing.T, hello map[string]any) (*client, map[string]any) {
+func (e *testEnv) dial(t testing.TB, hello map[string]any) (*client, map[string]any) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -120,8 +120,9 @@ const (
 
 ```go
 type Query struct {
-	SQL  string
-	Args []any
+	SQL   string
+	Args  []any
+	Match map[string]any // optional, see below
 }
 
 type SubCtx struct {
@@ -130,9 +131,45 @@ type SubCtx struct {
 }
 ```
 
-The query is re-run in full on every change, so it must be deterministic for a given snapshot: add `ORDER BY` to any publication that is not `Unordered`. `Args` are passed to pgx as query parameters.
+The query is re-run in full when a table it reads changes, so it must be deterministic for a given snapshot: add `ORDER BY` to any publication that is not `Unordered`. `Args` are passed to pgx as query parameters.
 
 `SubCtx.Context` is the engine's context, not the client's.
+
+#### Skipping unaffected re-runs: `Query.Match`
+
+By default, every write to a table re-runs every observer that reads it. With 1,000 users each subscribed to their own rows of `todos` (`ScopeUser`), one insert costs 1,000 queries. `Match` declares which rows the query returns, so the engine can tell which observers a write can affect and re-run only those:
+
+```go
+cometgo.Publish(app, "todos.mine", cometgo.PubOptions{Tables: []string{"todos"}},
+	func(c *cometgo.SubCtx, _ struct{}) (cometgo.Query, error) {
+		return cometgo.Query{
+			SQL:   `SELECT id, title, done FROM todos WHERE owner = $1 ORDER BY id`,
+			Args:  []any{c.Identity.UserID},
+			Match: map[string]any{"owner": c.Identity.UserID},
+		}, nil
+	})
+```
+
+For each write, the engine reads the changed rows once, by primary key, inside the tick's snapshot. It then re-runs an observer only if a changed row matches its `Match`, or its current result holds one of the changed keys (a delete, or a row that stopped matching). The re-run is the normal full query, so what clients receive is unchanged.
+
+`Match` is a promise about the query, and the engine trusts it. It must describe the query's rows exactly:
+
+- The publication reads one table, and `Key` is that table's primary key, with the same columns in the same order.
+- The result is every row of the table where each `Match` column equals its value. There is no `LIMIT`, `OFFSET`, join, subquery or other condition. `ORDER BY` is fine. An empty map means every row.
+- Values are compared the way pgx decodes the column:
+  - `string` for text, varchar and enums (deterministic collations only)
+  - any Go integer type for integer columns
+  - `bool`
+  - `[16]byte` or the usual string form for `uuid`
+
+If the engine can't decide, it re-runs the observer, exactly as without `Match`. That happens for:
+- a `nil` value, another type, or a column the table lacks
+- a primary key that isn't `int2`/`int4`/`int8`, `text` or `uuid`
+- a statement that changed more than 1,000 rows (the change feed then only reports the table)
+- the listener reconnecting
+- notifications for the table still arriving when the snapshot is taken
+
+The last case narrows a window it cannot close. A transaction's notifications can be split across two ticks while the first tick's snapshot already holds the whole transaction. Then an observer skipped on the first tick catches up on the next, as observers of other tables already do. A call's result still waits for all of its writes (§6.2).
 
 ## Methods
 
