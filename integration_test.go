@@ -170,8 +170,8 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 	return env
 }
 
-// listenGen reports how many times the listener has established LISTEN.
-func (e *testEnv) listenGen() uint64 {
+// listened reports how many LISTENs have succeeded.
+func (e *testEnv) listened() uint64 {
 	e.app.engine.mu.Lock()
 	defer e.app.engine.mu.Unlock()
 	return e.app.engine.listenGen
@@ -182,7 +182,7 @@ func (e *testEnv) listenGen() uint64 {
 // re-runs every observer.
 func (e *testEnv) waitListening(t testing.TB) {
 	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); e.listenGen() == 0; time.Sleep(5 * time.Millisecond) {
+	for deadline := time.Now().Add(5 * time.Second); e.listened() == 0; time.Sleep(5 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("listener did not start")
 		}

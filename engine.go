@@ -30,9 +30,13 @@ type engine struct {
 	fences  map[string]*fence
 	fenceN  uint64
 	wake    chan struct{}
-	// listenGen counts successful LISTENs. A fence registered under an
-	// older generation may have had its notification lost (fenceCommitted).
+	// listenGen counts successful LISTENs (listening).
 	listenGen uint64
+	// listenMu orders fenced commits against LISTEN: commitFenced holds it
+	// for reading, the listener for writing from LISTEN until its all-dirty
+	// notification is queued. So a commit, together with its fence's mark,
+	// lands wholly before or wholly after each LISTEN.
+	listenMu sync.RWMutex
 
 	// Owned by the run goroutine.
 	observers map[string]*observer
@@ -67,23 +71,24 @@ type engine struct {
 }
 
 type notification struct {
-	n     uint64
-	all   bool   // listener (re)connected or unparseable: everything is dirty
-	table string // r/t notifications
-	keys  string // r notifications: JSON array of PK arrays
-	token string // fence
-	evt   *evtNote
+	n   uint64
+	all bool // listener (re)connected or unparseable: everything is dirty
+	// listen is the listener generation whose LISTEN just succeeded; 0 for
+	// every other notification.
+	listen uint64
+	table  string // r/t notifications
+	keys   string // r notifications: JSON array of PK arrays
+	token  string // fence
+	evt    *evtNote
 }
 
 type fence struct {
 	released chan struct{}
 	c        *conn // the connection whose res waits on it
-	// gen is listenGen at registration. committed is set once the method's
-	// transaction has committed; from then on an all-dirty tick drained
-	// later re-runs every observer on a snapshot holding its writes, so that
-	// tick releases it whether or not its own notification ever arrives.
-	gen       uint64
+	// committed is set once the method's transaction has committed, and gen
+	// is listenGen at that moment (commitFenced).
 	committed bool
+	gen       uint64
 }
 
 type observer struct {
@@ -198,44 +203,44 @@ func (e *engine) registerFence(c *conn) (string, *fence) {
 	defer e.mu.Unlock()
 	e.fenceN++
 	token := e.a.nodeID + ":" + strconv.FormatUint(e.fenceN, 10)
-	f := &fence{released: make(chan struct{}), c: c, gen: e.listenGen}
+	f := &fence{released: make(chan struct{}), c: c}
 	e.fences[token] = f
 	return token, f
 }
 
-// fenceCommitted marks token's fence committed; call it once the method's
-// transaction has committed. Postgres drops notifications for a channel
-// nobody listens on, so a fence notified while the listener was down is
-// released by the all-dirty tick that follows the reconnect (tick). If a
-// reconnect happened since the fence was registered, that tick may already
-// have drained without it, so another all-dirty tick is queued: its drain
-// follows the commit.
-func (e *engine) fenceCommitted(token string) {
+// commitFenced commits a method's transaction whose last statement
+// notified token's fence, and marks the fence committed. Postgres drops
+// notifications for a channel nobody listens on, so the fence of a method
+// that committed while the listener was down never arrives; the all-dirty
+// tick of the next successful LISTEN releases it instead (tick).
+func (e *engine) commitFenced(ctx context.Context, tx pgx.Tx, token string) error {
+	e.listenMu.RLock()
+	defer e.listenMu.RUnlock()
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	e.markCommitted(token)
+	return nil
+}
+
+func (e *engine) markCommitted(token string) {
 	e.mu.Lock()
-	f := e.fences[token]
-	if f == nil {
-		e.mu.Unlock()
-		return // already released by its notification
-	}
-	f.committed = true
-	lost := f.gen != e.listenGen
-	if lost {
-		e.nextN++
-		e.pending = append(e.pending, notification{n: e.nextN, all: true})
-	}
-	e.mu.Unlock()
-	if lost {
-		e.signal()
+	defer e.mu.Unlock()
+	if f := e.fences[token]; f != nil { // nil: already released
+		f.committed, f.gen = true, e.listenGen
 	}
 }
 
-// listening records a successful LISTEN and marks everything dirty:
-// notifications sent while nobody listened are lost.
+// listening records a successful LISTEN, with listenMu held for writing,
+// and marks everything dirty: notifications sent while nobody listened are
+// lost.
 func (e *engine) listening() {
 	e.mu.Lock()
 	e.listenGen++
+	e.nextN++
+	e.pending = append(e.pending, notification{n: e.nextN, all: true, listen: e.listenGen})
 	e.mu.Unlock()
-	e.notify(notification{all: true})
+	e.signal()
 }
 
 func (e *engine) dropFence(token string) {
@@ -282,6 +287,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	fences, evts := e.carryFences, e.carryEvts
 	e.carryFences, e.carryEvts = nil, nil
 	allDirty := false
+	var listened uint64
 	for _, n := range notes {
 		if n.evt != nil {
 			evts = append(evts, n.evt)
@@ -293,14 +299,19 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			}
 		}
 		allDirty = allDirty || n.all
+		listened = max(listened, n.listen)
 	}
-	// An all-dirty tick re-runs every observer on a snapshot taken after
-	// this drain, so it covers the writes of every fence already committed,
-	// including those whose notification was lost while the listener was
-	// down. Their res still follows this tick's tx (step 5).
-	if allDirty {
+	// A fence committed before listener generation `listened` issued LISTEN
+	// (listenMu) never reaches that connection: its notifications were
+	// either received earlier, and so are in this drain or an earlier one,
+	// or lost. This all-dirty tick re-runs every observer on a snapshot
+	// taken after this drain, so it covers the fence's writes, and the
+	// fence's events, if received, go out before its res (step 5). A fence
+	// committed later is left to its own notification: releasing it here
+	// could send its res ahead of its events.
+	if listened > 0 {
 		for token, f := range e.fences {
-			if f.committed {
+			if f.committed && f.gen < listened {
 				delete(e.fences, token)
 				fences = append(fences, f)
 			}
@@ -848,13 +859,17 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close(context.Background())
+	// Fenced commits wait while LISTEN runs (listenMu).
+	e.listenMu.Lock()
 	for _, ch := range []string{"comet", evtChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
+			e.listenMu.Unlock()
 			return err
 		}
 	}
 	// Notifications sent while we were not listening are lost.
 	e.listening()
+	e.listenMu.Unlock()
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {

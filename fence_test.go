@@ -23,17 +23,20 @@ func released(f *fence) bool {
 // and needs no database.
 func fenceEngine() *engine { return newEngine(&App{nodeID: "n"}) }
 
+// reconnect runs one listener connection attempt that succeeds.
+func reconnect(e *engine) { e.listening() }
+
 // A fence whose notification was lost while nobody listened (here: before
 // the first LISTEN) is released by the all-dirty tick after LISTEN.
 func TestFenceCommittedBeforeListenReleasedByReconnectTick(t *testing.T) {
 	e := fenceEngine()
 	token, f := e.registerFence(nil)
-	e.fenceCommitted(token)
+	e.markCommitted(token)
 	e.tick(context.Background())
 	if released(f) {
-		t.Fatal("released with no notification and no all-dirty tick")
+		t.Fatal("released with no notification and no reconnect")
 	}
-	e.listening()
+	reconnect(e)
 	e.tick(context.Background())
 	if !released(f) {
 		t.Fatal("committed fence not released by the reconnect tick")
@@ -43,21 +46,38 @@ func TestFenceCommittedBeforeListenReleasedByReconnectTick(t *testing.T) {
 	}
 }
 
-// An uncommitted fence is not released by an all-dirty tick: the tick's
+// An uncommitted fence is not released by a reconnect tick: the tick's
 // snapshot could miss its writes (§6.2).
-func TestUncommittedFenceSurvivesAllDirtyTick(t *testing.T) {
+func TestUncommittedFenceSurvivesReconnectTick(t *testing.T) {
 	e := fenceEngine()
 	token, f := e.registerFence(nil)
-	e.notify(parseNotification("garbage")) // unparseable: all-dirty
+	reconnect(e)
 	e.tick(context.Background())
 	if released(f) {
-		t.Fatal("uncommitted fence released by an all-dirty tick")
+		t.Fatal("uncommitted fence released by a reconnect tick")
 	}
-	// Committed with the listener generation unchanged: its notification
-	// is on its way, so no extra tick is queued.
-	e.fenceCommitted(token)
-	if len(e.pending) != 0 {
-		t.Fatalf("pending %v, want none", e.pending)
+	e.markCommitted(token)
+	e.notify(parseNotification("1|f|" + token))
+	e.tick(context.Background())
+	if !released(f) {
+		t.Fatal("fence not released by its notification")
+	}
+}
+
+// Only a reconnect releases committed fences. Any other all-dirty tick
+// (here an unparseable payload) leaves them to their own notification,
+// which follows their events: releasing them early would send res ahead
+// of evt.
+func TestOtherAllDirtyTickKeepsCommittedFence(t *testing.T) {
+	e := fenceEngine()
+	reconnect(e)
+	e.tick(context.Background())
+	token, f := e.registerFence(nil)
+	e.markCommitted(token)
+	e.notify(parseNotification("garbage"))
+	e.tick(context.Background())
+	if released(f) {
+		t.Fatal("committed fence released by a non-reconnect all-dirty tick")
 	}
 	e.notify(parseNotification("1|f|" + token))
 	e.tick(context.Background())
@@ -66,38 +86,39 @@ func TestUncommittedFenceSurvivesAllDirtyTick(t *testing.T) {
 	}
 }
 
-// A fence whose transaction commits after a reconnect tick already drained
-// may have lost its notification to that reconnect; committing it queues
-// another all-dirty tick, which releases it.
-func TestFenceCommittedAfterReconnectTickQueuesAnother(t *testing.T) {
+// A fence committed after a LISTEN is not released by that LISTEN's tick,
+// even when the tick drains after the commit: its notifications reach the
+// new connection after the reconnect's, so releasing it there could send
+// its res ahead of its events.
+func TestFenceCommittedAfterListenIsNotSwept(t *testing.T) {
 	e := fenceEngine()
-	e.listening()
-	e.tick(context.Background())
 	token, f := e.registerFence(nil)
-	e.listening() // the listener dropped and came back before the commit
+	reconnect(e)
+	e.markCommitted(token)
 	e.tick(context.Background())
 	if released(f) {
-		t.Fatal("uncommitted fence released")
+		t.Fatal("fence committed after LISTEN was swept by its tick")
 	}
-	e.fenceCommitted(token)
+	// Lost to a later reconnect after all: that one releases it.
+	reconnect(e)
 	e.tick(context.Background())
 	if !released(f) {
-		t.Fatal("fence not released after commit following a reconnect")
+		t.Fatal("fence not released by the next reconnect")
 	}
 }
 
-// A fence released by its own notification before runCall marks it
+// A fence released by its own notification before commitFenced marks it
 // committed is left alone.
 func TestFenceCommittedAfterReleaseIsNoop(t *testing.T) {
 	e := fenceEngine()
 	token, f := e.registerFence(nil)
-	e.listening()
+	reconnect(e)
 	e.notify(parseNotification("1|f|" + token))
 	e.tick(context.Background())
 	if !released(f) {
 		t.Fatal("not released")
 	}
-	e.fenceCommitted(token)
+	e.markCommitted(token)
 	if len(e.pending) != 0 || len(e.fences) != 0 {
 		t.Fatalf("pending %v fences %v", e.pending, e.fences)
 	}
@@ -141,12 +162,29 @@ func TestCallDuringListenerReconnectHasNoLag(t *testing.T) {
 
 	ctx := context.Background()
 	e.waitListening(t)
-	before := e.listenGen()
-	var killed int
-	err := e.pool.QueryRow(ctx, `SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
-		WHERE application_name = $1 AND query LIKE 'LISTEN %'`, appName).Scan(&killed)
-	if err != nil || killed != 1 {
-		t.Fatalf("terminate listener: killed %d, err %v", killed, err)
+	before := e.listened()
+	var pid int32
+	err := e.pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
+		WHERE application_name = $1 AND query LIKE 'LISTEN %'`, appName).Scan(&pid)
+	if err != nil {
+		t.Fatalf("find listener: %v", err)
+	}
+	if _, err := e.pool.Exec(ctx, "SELECT pg_terminate_backend($1)", pid); err != nil {
+		t.Fatal(err)
+	}
+	// pg_terminate_backend only signals; wait until the backend is gone so
+	// nothing committed from here on can reach it.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		var alive bool
+		if err := e.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)", pid).Scan(&alive); err != nil {
+			t.Fatal(err)
+		}
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("listener backend did not exit")
+		}
 	}
 
 	// The listener reconnects after a 500ms backoff; this call commits
@@ -167,7 +205,7 @@ func TestCallDuringListenerReconnectHasNoLag(t *testing.T) {
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("call took %v, want well under FenceTimeout", d)
 	}
-	if e.listenGen() == before {
+	if e.listened() == before {
 		t.Fatal("listener did not reconnect")
 	}
 }
