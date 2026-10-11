@@ -258,6 +258,7 @@ In v1-core, ticks are sequential and every dirty observer runs in each tick, so 
 | Fence timeout (default 5 s) | `res` is sent with `"lag":true`. The promise resolves, and the client can tell the effects are not yet visible. The guarantee is never broken silently. |
 | Method failed or rolled back | The fence notify rolled back with it. The framework knows the commit failed and sends `res` immediately. |
 | Method wrote nothing watched | The fence still forces a (cheap) tick. |
+| Listener down when the method commits (server just started, or reconnecting) | The fence notification is lost (§11). The all-dirty tick that follows the next successful LISTEN re-runs every observer on a snapshot taken after the commit. That tick releases every fence whose transaction committed before that LISTEN, and sends the `res` after the tick's `tx`. The call resolves without `lag` once the listener is back. Fenced commits wait while LISTEN itself runs, so each commit falls clearly before or after it. A fence committed after the LISTEN is left to its own notification, so its events still precede its `res`. |
 | Writes outside `ctx.Tx` (another connection or pool) | No fence guarantee. This is documented. |
 | **[later]** logical replication | The fence becomes "the replication stream has processed past the commit LSN". The wire protocol is unchanged. |
 
@@ -453,7 +454,7 @@ All notifications use channel `comet`. Payload fields are separated by `|`, and 
 - A dirty observer re-runs its full query. An observer whose query declares a single-table equality predicate (`Query.Match` on the server) is dirtied by a row notification only if a changed row, read once per tick by PK inside the snapshot, matches the predicate, or its current result holds a changed PK. Table-dirty notifications and anything the server cannot evaluate re-run it as before.
 - A minimum interval between ticks (default 20 ms, `Config.MinTickInterval`) coalesces bursts.
 
-**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty.
+**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped.
 
 Every node receives every fence and ignores the tokens it does not own.
 

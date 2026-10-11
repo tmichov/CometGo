@@ -12,6 +12,16 @@ import (
 
 var evtCaps = map[string]any{"caps": []string{"evt"}}
 
+// setupEvents is setup once LISTEN is up. Events are at-most-once: one
+// emitted before the listener runs is dropped, and unlike a fence nothing
+// re-delivers it.
+func setupEvents(t *testing.T) *testEnv {
+	t.Helper()
+	e := setup(t)
+	e.waitListening(t)
+	return e
+}
+
 func evtHello(token string) map[string]any {
 	h := map[string]any{"caps": []string{"evt"}}
 	if token != "" {
@@ -36,14 +46,14 @@ func expectEvt(t *testing.T, m map[string]any, s int, topic string) {
 }
 
 func TestWelcomeAdvertisesEvtCap(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	if _, w := e.dial(t, nil); !slices.Contains(w["caps"].([]any), any("evt")) {
 		t.Fatalf("caps %v lack evt", w["caps"])
 	}
 }
 
 func TestEmitAfterCommitArrivesBetweenTxAndRes(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	a, _ := e.dial(t, evtCaps)
 	subscribe(t, a, 1, "items.all")
 
@@ -68,7 +78,7 @@ func TestEmitAfterCommitArrivesBetweenTxAndRes(t *testing.T) {
 }
 
 func TestEmitAfterCommitRollsBackWithMethod(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	a, _ := e.dial(t, evtCaps)
 	subscribe(t, a, 1, "items.all")
 	a.send(map[string]any{"t": "call", "id": 1, "m": "addAndEmit", "args": map[string]any{"Owner": "x", "Name": ""}})
@@ -82,7 +92,7 @@ func TestEmitAfterCommitRollsBackWithMethod(t *testing.T) {
 }
 
 func TestEvtOnlyForClientsWithCap(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	a, _ := e.dial(t, nil)
 	subscribe(t, a, 1, "items.all")
 	a.send(map[string]any{"t": "call", "id": 1, "m": "addAndEmit", "args": map[string]any{"Owner": "x", "Name": "n"}})
@@ -95,7 +105,7 @@ func TestEvtOnlyForClientsWithCap(t *testing.T) {
 }
 
 func TestEmitTargetsMatchingObserver(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	ctx := context.Background()
 	alice, _ := e.dial(t, evtHello("alice"))
 	bob, _ := e.dial(t, evtHello("bob"))
@@ -130,7 +140,7 @@ func TestEmitTargetsMatchingObserver(t *testing.T) {
 }
 
 func TestEventsAreNotReplayedAfterReconnect(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	ctx := context.Background()
 	a, _ := e.dial(t, evtCaps)
 	// watcher stays connected; seeing an event on it means the engine has
@@ -162,7 +172,7 @@ func TestEventsAreNotReplayedAfterReconnect(t *testing.T) {
 }
 
 func TestEmitErrors(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	ctx := context.Background()
 	big := strings.Repeat("x", maxEvtPayload)
 	if err := e.app.Emit(ctx, "items.all", nil, "", "big", big); !errors.Is(err, ErrEventTooLarge) {
@@ -180,7 +190,7 @@ func TestEmitErrors(t *testing.T) {
 }
 
 func TestIdenticalEventsInOneTransactionAreAllDelivered(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	a, _ := e.dial(t, evtCaps)
 	subscribe(t, a, 1, "items.all")
 	a.send(map[string]any{"t": "call", "id": 1, "m": "emitTwice"})
@@ -192,7 +202,7 @@ func TestIdenticalEventsInOneTransactionAreAllDelivered(t *testing.T) {
 }
 
 func TestEmitToUserScopeNeedsUserID(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	if err := e.app.Emit(context.Background(), "items.mine", nil, "", "t", nil); err == nil || !strings.Contains(err.Error(), "ScopeUser") {
 		t.Fatalf("err %v, want ScopeUser error", err)
 	}
@@ -202,7 +212,7 @@ func TestEmitToUserScopeNeedsUserID(t *testing.T) {
 }
 
 func TestResumeWithDifferentEvtCapResyncs(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	a, w := e.dial(t, map[string]any{"caps": []string{capResume, capEvt}})
 	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
 	snap := a.next()
@@ -214,7 +224,7 @@ func TestResumeWithDifferentEvtCapResyncs(t *testing.T) {
 }
 
 func TestEventsWhileDetachedAreDroppedNotReplayed(t *testing.T) {
-	e := setup(t)
+	e := setupEvents(t)
 	ctx := context.Background()
 	caps := map[string]any{"caps": []string{capResume, capEvt}}
 	a, w := e.dial(t, caps)

@@ -30,6 +30,13 @@ type engine struct {
 	fences  map[string]*fence
 	fenceN  uint64
 	wake    chan struct{}
+	// listenGen counts successful LISTENs (listening).
+	listenGen uint64
+	// listenMu orders fenced commits against LISTEN: commitFenced holds it
+	// for reading, the listener for writing from LISTEN until its all-dirty
+	// notification is queued. So a commit, together with its fence's mark,
+	// lands wholly before or wholly after each LISTEN.
+	listenMu sync.RWMutex
 
 	// Owned by the run goroutine.
 	observers map[string]*observer
@@ -64,17 +71,24 @@ type engine struct {
 }
 
 type notification struct {
-	n     uint64
-	all   bool   // listener (re)connected or unparseable: everything is dirty
-	table string // r/t notifications
-	keys  string // r notifications: JSON array of PK arrays
-	token string // fence
-	evt   *evtNote
+	n   uint64
+	all bool // listener (re)connected or unparseable: everything is dirty
+	// listen is the listener generation whose LISTEN just succeeded; 0 for
+	// every other notification.
+	listen uint64
+	table  string // r/t notifications
+	keys   string // r notifications: JSON array of PK arrays
+	token  string // fence
+	evt    *evtNote
 }
 
 type fence struct {
 	released chan struct{}
 	c        *conn // the connection whose res waits on it
+	// committed is set once the method's transaction has committed, and gen
+	// is listenGen at that moment (commitFenced).
+	committed bool
+	gen       uint64
 }
 
 type observer struct {
@@ -194,6 +208,41 @@ func (e *engine) registerFence(c *conn) (string, *fence) {
 	return token, f
 }
 
+// commitFenced commits a method's transaction whose last statement
+// notified token's fence, and marks the fence committed. Postgres drops
+// notifications for a channel nobody listens on, so the fence of a method
+// that committed while the listener was down never arrives; the all-dirty
+// tick of the next successful LISTEN releases it instead (tick).
+func (e *engine) commitFenced(ctx context.Context, tx pgx.Tx, token string) error {
+	e.listenMu.RLock()
+	defer e.listenMu.RUnlock()
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	e.markCommitted(token)
+	return nil
+}
+
+func (e *engine) markCommitted(token string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if f := e.fences[token]; f != nil { // nil: already released
+		f.committed, f.gen = true, e.listenGen
+	}
+}
+
+// listening records a successful LISTEN, with listenMu held for writing,
+// and marks everything dirty: notifications sent while nobody listened are
+// lost.
+func (e *engine) listening() {
+	e.mu.Lock()
+	e.listenGen++
+	e.nextN++
+	e.pending = append(e.pending, notification{n: e.nextN, all: true, listen: e.listenGen})
+	e.mu.Unlock()
+	e.signal()
+}
+
 func (e *engine) dropFence(token string) {
 	e.mu.Lock()
 	delete(e.fences, token)
@@ -237,6 +286,8 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	e.pending, e.reqs = nil, nil
 	fences, evts := e.carryFences, e.carryEvts
 	e.carryFences, e.carryEvts = nil, nil
+	allDirty := false
+	var listened uint64
 	for _, n := range notes {
 		if n.evt != nil {
 			evts = append(evts, n.evt)
@@ -247,16 +298,30 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 				fences = append(fences, f)
 			}
 		}
+		allDirty = allDirty || n.all
+		listened = max(listened, n.listen)
+	}
+	// A fence committed before listener generation `listened` issued LISTEN
+	// (listenMu) never reaches that connection: its notifications were
+	// either received earlier, and so are in this drain or an earlier one,
+	// or lost. This all-dirty tick re-runs every observer on a snapshot
+	// taken after this drain, so it covers the fence's writes, and the
+	// fence's events, if received, go out before its res (step 5). A fence
+	// committed later is left to its own notification: releasing it here
+	// could send its res ahead of its events.
+	if listened > 0 {
+		for token, f := range e.fences {
+			if f.committed && f.gen < listened {
+				delete(e.fences, token)
+				fences = append(fences, f)
+			}
+		}
 	}
 	e.mu.Unlock()
 
 	changes := map[string]*tableChange{}
-	allDirty := false
 	for _, n := range notes {
-		switch {
-		case n.all:
-			allDirty = true
-		case n.table != "":
+		if n.table != "" {
 			tc := changes[n.table]
 			if tc == nil {
 				tc = &tableChange{}
@@ -794,13 +859,17 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close(context.Background())
+	// Fenced commits wait while LISTEN runs (listenMu).
+	e.listenMu.Lock()
 	for _, ch := range []string{"comet", evtChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
+			e.listenMu.Unlock()
 			return err
 		}
 	}
 	// Notifications sent while we were not listening are lost.
-	e.notify(notification{all: true})
+	e.listening()
+	e.listenMu.Unlock()
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {

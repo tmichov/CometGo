@@ -786,7 +786,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := c.a.engine.commitFenced(ctx, tx, token); err != nil {
 		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
