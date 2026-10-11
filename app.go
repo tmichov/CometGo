@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -129,6 +130,18 @@ type App struct {
 
 	sessMu   sync.Mutex
 	sessions map[string]*conn // resumable sessions, by id
+
+	// Graceful shutdown (§7.3).
+	shutting atomic.Bool
+	calls    atomic.Int64 // calls in flight on every session, ended ones too
+	liveMu   sync.Mutex
+	live     map[*conn]struct{} // every session not yet ended
+	shutOnce sync.Once
+	shutDone chan struct{}
+	shutErr  error
+	startMu  sync.Mutex         // guards started and stop
+	stop     context.CancelFunc // stops what Start runs
+	running  sync.WaitGroup
 }
 
 // New creates an App. Register publications and methods, then call Start.
@@ -174,21 +187,35 @@ func New(cfg Config) *App {
 		pubs:     map[string]*publication{},
 		methods:  map[string]*method{},
 		sessions: map[string]*conn{},
+		live:     map[*conn]struct{}{},
+		shutDone: make(chan struct{}),
 	}
 	a.engine = newEngine(a)
 	return a
 }
 
 // Start runs the Postgres listener, the tick engine and the idempotency-key
-// cleanup until ctx is done.
+// cleanup until ctx is done or Shutdown stops them. Shutdown needs them
+// running while it drains, so with Shutdown pass a ctx that outlives the
+// shutdown signal. After Shutdown, Start does nothing.
 func (a *App) Start(ctx context.Context) {
+	a.startMu.Lock()
+	defer a.startMu.Unlock()
 	if a.started {
 		panic("cometgo: Start called twice")
 	}
 	a.started = true
-	go a.engine.listen(ctx)
-	go a.engine.run(ctx)
-	go a.cleanIdempotency(ctx)
+	if a.shutting.Load() {
+		return
+	}
+	ctx, a.stop = context.WithCancel(ctx)
+	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
+		a.running.Add(1)
+		go func() {
+			defer a.running.Done()
+			run(ctx)
+		}()
+	}
 }
 
 // Scope controls which connections share one observer of a publication.
@@ -226,6 +253,19 @@ type PubOptions struct {
 type Query struct {
 	SQL  string
 	Args []any
+
+	// Match, if set, lets the engine skip re-running this query for writes
+	// that cannot affect it (PROTOCOL.md §11). It must describe the query's
+	// row set exactly: the publication reads one table, Key is that table's
+	// primary key (same columns, same order), and the result is every row
+	// of the table where each column equals its value, with no LIMIT,
+	// OFFSET, join, subquery or other condition. An empty map means every
+	// row. Values are compared as pgx decodes the column: string for text
+	// and enums (deterministic collations only), int types for integers,
+	// bool, and [16]byte or its string form for uuid. Anything else, a nil
+	// value, or a column the table lacks, makes every change re-run the
+	// query, as without Match.
+	Match map[string]any
 }
 
 // SubCtx is passed to publication query builders.

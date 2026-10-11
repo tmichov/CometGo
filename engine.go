@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -39,6 +40,20 @@ type engine struct {
 	// tracks again. Sub ids are never reused (§4.1), so a sub for one of
 	// these is always that re-send.
 	ended map[*conn]map[uint64]bool
+	// tables caches table metadata for changed-key filtering.
+	tables map[string]*tableInfo
+	// runs counts observer query executions (tests and benchmarks).
+	runs atomic.Int64
+	// coalescing holds the connections in coalescing mode (§8.1): their
+	// queue went over softQueuedBytes, so their subs' changes are held as
+	// needsReset until it drains below lowWaterBytes.
+	coalescing map[*conn]bool
+	// snapshotted maps the connections sent a snapshot since their queue
+	// was last below lowWaterBytes to their queued bytes right after it.
+	// Their soft limit is that much higher: a queue full of a snapshot is
+	// not a client falling behind on diffs, and coalescing would answer it
+	// with yet another snapshot.
+	snapshotted map[*conn]int
 	// pgTypes caches the wire code the catalog gives types pgx does not
 	// know, by OID: "enum", "[]enum", or "" for the default (types.go).
 	pgTypes      map[uint32]string
@@ -52,12 +67,14 @@ type notification struct {
 	n     uint64
 	all   bool   // listener (re)connected or unparseable: everything is dirty
 	table string // r/t notifications
+	keys  string // r notifications: JSON array of PK arrays
 	token string // fence
 	evt   *evtNote
 }
 
 type fence struct {
 	released chan struct{}
+	c        *conn // the connection whose res waits on it
 }
 
 type observer struct {
@@ -85,10 +102,14 @@ type subscription struct {
 	args    json.RawMessage
 	argsKey string
 	obs     *observer
-	// needInit: send init + full snapshot next tick. reset marks that
-	// snapshot as a reset of data the client already holds.
+	// needInit: send init + full snapshot next tick. holds: the client
+	// already has data for the sub (an earlier snapshot, or have on sub), so
+	// that snapshot goes out as a reset.
 	needInit bool
-	reset    bool
+	holds    bool
+	// needsReset: a snapshot is owed but held back while the connection is
+	// coalescing (§8.1). Releasing it sets needInit.
+	needsReset bool
 }
 
 type subReq struct {
@@ -125,13 +146,16 @@ type rebindReq struct {
 
 func newEngine(a *App) *engine {
 	return &engine{
-		a:         a,
-		fences:    map[string]*fence{},
-		wake:      make(chan struct{}, 1),
-		observers: map[string]*observer{},
-		conns:     map[*conn]map[uint64]*subscription{},
-		ended:     map[*conn]map[uint64]bool{},
-		pgTypes:   map[uint32]string{},
+		a:           a,
+		fences:      map[string]*fence{},
+		wake:        make(chan struct{}, 1),
+		observers:   map[string]*observer{},
+		conns:       map[*conn]map[uint64]*subscription{},
+		ended:       map[*conn]map[uint64]bool{},
+		tables:      map[string]*tableInfo{},
+		coalescing:  map[*conn]bool{},
+		snapshotted: map[*conn]int{},
+		pgTypes:     map[uint32]string{},
 	}
 }
 
@@ -160,12 +184,12 @@ func (e *engine) notify(n notification) {
 
 // registerFence must be called before the method's transaction commits, so
 // the fence is known by the time its notification can be drained.
-func (e *engine) registerFence() (string, *fence) {
+func (e *engine) registerFence(c *conn) (string, *fence) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.fenceN++
 	token := e.a.nodeID + ":" + strconv.FormatUint(e.fenceN, 10)
-	f := &fence{released: make(chan struct{})}
+	f := &fence{released: make(chan struct{}), c: c}
 	e.fences[token] = f
 	return token, f
 }
@@ -226,14 +250,19 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	}
 	e.mu.Unlock()
 
-	dirtyTables := map[string]bool{}
+	changes := map[string]*tableChange{}
 	allDirty := false
 	for _, n := range notes {
 		switch {
 		case n.all:
 			allDirty = true
 		case n.table != "":
-			dirtyTables[n.table] = true
+			tc := changes[n.table]
+			if tc == nil {
+				tc = &tableChange{}
+				changes[n.table] = tc
+			}
+			tc.add(n)
 		}
 	}
 
@@ -256,8 +285,47 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		e.handleReq(ctx, r, outFor)
 	}
 
+	// Coalescing connections (§8.1) get their held resets once their queue
+	// has drained, and right away when this tick releases one of their
+	// fences or sends them an after message: a res or authRes must follow a
+	// tx reflecting current data for every sub (§3.2, §6.2). Both happen
+	// before the snapshot, so the resets are built from it.
+	forced := map[*conn]bool{}
+	for _, f := range fences {
+		if f.c != nil {
+			forced[f.c] = true
+		}
+	}
+	for c, o := range out {
+		if len(o.after) > 0 {
+			forced[c] = true
+		}
+	}
+	// A session without a live socket stays held: releasing it would put
+	// every held snapshot into the replay buffer, which can end the session.
+	// After a resume the next tick checks the new socket.
+	for c := range e.coalescing {
+		if q, live := c.queuedBytes(lowWaterBytes); forced[c] || live && q < lowWaterBytes {
+			e.release(c)
+		}
+	}
+	for c := range e.snapshotted {
+		if q, _ := c.queuedBytes(lowWaterBytes); q < lowWaterBytes {
+			delete(e.snapshotted, c)
+		}
+	}
+
+	// Observers whose query declares Match and whose table only reported
+	// changed keys are candidates: they run only if those keys can affect
+	// them, decided inside the snapshot (pkfilter.go).
+	var cands []*observer
 	for _, obs := range e.observers {
-		if allDirty || slices.ContainsFunc(obs.tables, func(t string) bool { return dirtyTables[t] }) {
+		if !allDirty && !slices.ContainsFunc(obs.tables, func(t string) bool { return changes[t] != nil }) {
+			continue
+		}
+		if !allDirty && !obs.dirty && !obs.awaitsInit() && obs.filterable(changes[obs.tables[0]]) {
+			cands = append(cands, obs)
+		} else {
 			obs.dirty = true
 		}
 	}
@@ -271,11 +339,16 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			toRun = append(toRun, obs)
 		}
 	}
-	if len(toRun) > 0 {
-		if err := e.runObservers(ctx, toRun); err != nil {
+	if len(toRun) > 0 || len(cands) > 0 {
+		if err := e.runObservers(ctx, toRun, cands, changes); err != nil {
 			e.a.log.Warn("tick snapshot failed, retrying", "err", err)
 			// Observers stay dirty; fences wait for a tick that actually
 			// reflects their writes. Requests already applied stay applied.
+			// Candidates lose the keys that made them candidates, so they
+			// re-run in full.
+			for _, obs := range cands {
+				obs.dirty = true
+			}
 			e.carryFences = fences
 			e.carryEvts = evts
 			e.carryOut = out
@@ -283,7 +356,30 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		}
 	}
 
-	// 4. Assemble one tx per connection.
+	// 4. Assemble one tx per connection. A connection over the soft limit
+	// starts coalescing: its subs' changes are held, not serialized.
+	// Decided once per connection, so the queue draining mid-assembly
+	// cannot split one connection's subs between the two modes.
+	decided := map[*conn]bool{}
+	hold := func(c *conn) bool {
+		if forced[c] {
+			return false
+		}
+		if !decided[c] && !e.coalescing[c] {
+			if q, _ := c.queuedBytes(0); q > softQueuedBytes+e.snapshotted[c] {
+				e.coalescing[c] = true
+				c.coalescing.Store(true)
+				// Arm the drain signal; a queue that drained in the
+				// meantime is picked up by the next tick.
+				if q, _ := c.queuedBytes(lowWaterBytes); q < lowWaterBytes {
+					e.signal()
+				}
+			}
+		}
+		decided[c] = true
+		return e.coalescing[c]
+	}
+	snapped := map[*conn]bool{}
 	for _, obs := range e.observers {
 		if obs.err != nil {
 			for sub := range obs.subs {
@@ -299,9 +395,14 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		var opsJSON []json.RawMessage
 		for sub := range obs.subs {
 			switch {
+			case sub.needInit && hold(sub.c):
+				sub.needInit, sub.needsReset = false, true
 			case sub.needInit:
 				outFor(sub.c).entries = append(outFor(sub.c).entries, e.snapshotEntry(sub))
-				sub.needInit, sub.reset = false, false
+				sub.needInit, sub.holds = false, true
+				snapped[sub.c] = true
+			case len(obs.ops) > 0 && hold(sub.c):
+				sub.needsReset = true
 			case len(obs.ops) > 0:
 				if opsJSON == nil {
 					opsJSON = marshalOps(obs.ops)
@@ -312,6 +413,11 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		obs.ops = nil
 	}
 	e.flush(out)
+	for c := range snapped {
+		// Arms the drain signal that ends the raised limit.
+		q, _ := c.queuedBytes(lowWaterBytes)
+		e.snapshotted[c] = q
+	}
 
 	// Events drained this tick follow the tx reflecting every change
 	// notified before them, and precede the res of the call that emitted
@@ -349,6 +455,19 @@ func (e *engine) flush(out map[*conn]*connOut) {
 	}
 }
 
+// release ends coalescing for c: every held sub gets its snapshot in this
+// tick, as a reset where the client holds data for it. The snapshot
+// is this tick's, newer than anything c was sent, so no sub goes back.
+func (e *engine) release(c *conn) {
+	delete(e.coalescing, c)
+	c.coalescing.Store(false)
+	for _, sub := range e.conns[c] {
+		if sub.needsReset {
+			sub.needsReset, sub.needInit = false, true
+		}
+	}
+}
+
 func (e *engine) snapshotEntry(sub *subscription) subEntry {
 	obs := sub.obs
 	init := &subInit{Key: obs.keyIdx, Ordered: !obs.pub.opts.Unordered}
@@ -361,7 +480,7 @@ func (e *engine) snapshotEntry(sub *subscription) subEntry {
 	return subEntry{
 		S:     sub.s,
 		Init:  init,
-		Reset: sub.reset,
+		Reset: sub.holds,
 		Ops:   marshalOps(snapshotOps(obs.res, init.Ordered)),
 		Ready: true,
 	}
@@ -404,7 +523,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			end(r.c, r.s, NewError(CodeRateLimited, "too many subscriptions"))
 			return
 		}
-		sub := &subscription{c: r.c, s: r.s, name: r.name, args: r.args, argsKey: argsKey, needInit: true, reset: r.have}
+		sub := &subscription{c: r.c, s: r.s, name: r.name, args: r.args, argsKey: argsKey, needInit: true, holds: r.have}
 		if err := e.bind(ctx, sub, r.ident); err != nil {
 			end(r.c, r.s, err)
 			return
@@ -423,6 +542,8 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		}
 		delete(e.conns, r.c)
 		delete(e.ended, r.c)
+		delete(e.coalescing, r.c)
+		delete(e.snapshotted, r.c)
 
 	case resumeReq:
 		for s, sub := range e.conns[r.c] {
@@ -436,7 +557,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
 		for s, sub := range e.conns[r.c] {
 			e.detach(sub)
-			sub.needInit, sub.reset = true, true
+			sub.needInit, sub.needsReset = true, false
 			if err := e.bind(ctx, sub, r.ident); err != nil {
 				end(r.c, s, err)
 				delete(e.conns[r.c], s)
@@ -490,10 +611,11 @@ type runResult struct {
 	err    *Error
 }
 
-// runObservers re-runs toRun inside one REPEATABLE READ snapshot. Results are
-// staged and applied only once the snapshot transaction has committed, so a
-// failure leaves every observer exactly as it was, still dirty.
-func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
+// runObservers re-runs toRun inside one REPEATABLE READ snapshot, plus each
+// candidate the changed rows can affect. Results are staged and applied only
+// once the snapshot transaction has committed, so a failure leaves every
+// observer exactly as it was.
+func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange) error {
 	tx, err := e.a.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
@@ -502,8 +624,16 @@ func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", e.a.cfg.QueryTimeout.Milliseconds())); err != nil {
 		return err
 	}
+	if len(cands) > 0 {
+		affected, err := e.filterCandidates(ctx, tx, cands, changes)
+		if err != nil {
+			return err
+		}
+		toRun = append(toRun, affected...)
+	}
 	staged := make([]runResult, 0, len(toRun))
 	for _, obs := range toRun {
+		e.runs.Add(1)
 		// A savepoint per observer keeps one failing query from poisoning
 		// the snapshot for the rest.
 		sp, err := tx.Begin(ctx)
@@ -539,7 +669,7 @@ func (e *engine) runObservers(ctx context.Context, toRun []*observer) error {
 		case !sameCols(obs.cols, r.cols):
 			// Result shape changed (e.g. migration): reset every sub.
 			for sub := range obs.subs {
-				sub.needInit, sub.reset = true, true
+				sub.needInit = true
 			}
 		default:
 			obs.ops = diffResults(obs.res, r.res, !obs.pub.opts.Unordered)
@@ -694,7 +824,7 @@ func parseNotification(p string) notification {
 		switch parts[1] {
 		case "r":
 			if len(parts) == 5 {
-				return notification{table: parts[3]}
+				return notification{table: parts[3], keys: parts[4]}
 			}
 		case "t":
 			if len(parts) == 4 {

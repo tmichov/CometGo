@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tmichov/cometgo"
@@ -40,7 +42,7 @@ type added struct {
 }
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	dsn := env("DATABASE_URL", "postgres://comet:comet@localhost:54329/comet")
@@ -91,7 +93,8 @@ func main() {
 		return tag.RowsAffected(), err
 	})
 
-	app.Start(ctx)
+	// The app outlives ctx: Shutdown stops it once the signal arrives.
+	app.Start(context.Background())
 
 	public, err := fs.Sub(webFS, "web/public")
 	if err != nil {
@@ -103,14 +106,26 @@ func main() {
 
 	addr := env("ADDR", ":8080")
 	srv := &http.Server{Addr: addr, Handler: mux}
+	shut := make(chan struct{})
 	go func() {
+		defer close(shut)
 		<-ctx.Done()
-		srv.Close()
+		// Graceful: in-flight calls finish, and clients reconnect spread
+		// over the next few seconds instead of all at once.
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := app.Shutdown(sctx); err != nil {
+			log.Printf("todo: cometgo shutdown: %v", err)
+		}
+		if err := srv.Shutdown(sctx); err != nil {
+			log.Printf("todo: http shutdown: %v", err)
+		}
 	}()
 	log.Printf("todo: listening on http://localhost%s", addr)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	<-shut
 }
 
 func env(k, def string) string {

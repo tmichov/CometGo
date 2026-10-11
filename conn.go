@@ -24,9 +24,11 @@ const (
 )
 
 const (
-	maxQueuedBytes = 8 << 20   // §8.1 hard limit
-	frameTarget    = 256 << 10 // §4.3 split target
-	writeTimeout   = 10 * time.Second
+	maxQueuedBytes  = 8 << 20   // §8.1 hard limit
+	softQueuedBytes = 256 << 10 // §8.1 soft limit: above it the connection coalesces
+	lowWaterBytes   = 64 << 10  // §8.1 low-water mark: below it coalescing ends
+	frameTarget     = 256 << 10 // §4.3 split target
+	writeTimeout    = 10 * time.Second
 )
 
 // capResume is the welcome/hello cap for session resume (§7.2).
@@ -34,6 +36,10 @@ const capResume = "resume"
 
 // ServeHTTP upgrades the request to a CometGo WebSocket connection.
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if a.shutting.Load() {
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	if !offersSubprotocol(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUpgradeRequired)
@@ -52,7 +58,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Accept already wrote the HTTP error (e.g. bad Origin)
 	}
-	s := &socket{ws: ws, outSig: make(chan struct{}, 1)}
+	s := &socket{ws: ws, outSig: make(chan struct{}, 1), onDrain: a.engine.signal}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	a.serve(s, cookieIdent, cookieErr)
 }
@@ -104,6 +110,15 @@ type conn struct {
 
 	authMu   sync.Mutex // serializes identity changes
 	inflight atomic.Int32
+	// retryIn is the retryInMs of the goaway sent to this session; calls
+	// refused during shutdown carry it as retryAfterMs.
+	retryIn atomic.Int64
+	// goawaySock is the socket goaway was sent on (guarded by mu), so each
+	// socket gets it once.
+	goawaySock *socket
+	// coalescing mirrors whether the engine holds this session's changes
+	// as resets (§8.1). The engine's own map is authoritative.
+	coalescing atomic.Bool
 }
 
 type runningCall struct {
@@ -122,12 +137,23 @@ type socket struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	outSig chan struct{}
+	// onDrain is called once the queue drops below drainAt (§8.1).
+	onDrain func()
 
 	mu       sync.Mutex // guards the fields below
 	out      [][]byte
 	outBytes int
+	drainAt  int // 0: nobody waits for a drain
 	dead     bool
 	fatal    bool // closed for a reason that also ends the session (protocol error, deliberate close)
+	// closing, once set, makes the writer close the socket with it after
+	// writing everything queued (graceful shutdown, §7.3).
+	closing *closeFrame
+}
+
+type closeFrame struct {
+	code   websocket.StatusCode
+	reason string
 }
 
 func (a *App) serve(s *socket, cookieIdent *Identity, cookieErr error) {
@@ -256,6 +282,7 @@ func (c *conn) endLocked() {
 	c.cancel()
 	c.a.engine.enqueue(closeReq{c: c})
 	c.a.dropSession(c)
+	c.a.dropLive(c)
 }
 
 func (c *conn) end() {
@@ -337,6 +364,14 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 
 	c := &conn{a: a, session: "s_" + newID(9), resume: resume, evt: evt}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	// Registered before checking shutting, which Shutdown sets before
+	// listing sessions: a hello racing it is either listed or refused here.
+	a.addLive(c)
+	if a.shutting.Load() {
+		a.dropLive(c)
+		s.fail(closeGoingAway, CodeUnavailable, "shutting down")
+		return nil
+	}
 	if resume {
 		c.ids = map[uint64]uint64{}
 		a.addSession(c)
@@ -350,6 +385,11 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 	c.send(a.welcome(c, ident, false))
 	if authErr != nil {
 		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
+	}
+	// The socket is attached before checking shutting, which Shutdown sets
+	// before it sends goaway: the socket gets it from one side or the other.
+	if a.shutting.Load() {
+		c.goaway()
 	}
 	return c
 }
@@ -433,6 +473,9 @@ func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr 
 	if authErr != nil {
 		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
 	}
+	if a.shutting.Load() {
+		c.goaway() // as in hello
+	}
 	return c
 }
 
@@ -499,10 +542,23 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 			s.fail(closeProtocol, "PROTOCOL", "call requires id and m")
 			return
 		}
-		if int(c.inflight.Add(1)) > c.a.cfg.MaxInflight {
+		// Counted before checking shutting, which Shutdown sets before it
+		// waits for the app's count to reach zero: a call is either waited
+		// for or refused.
+		n := c.inflight.Add(1)
+		c.a.calls.Add(1)
+		var refuse *Error
+		switch {
+		case c.a.shutting.Load():
+			refuse = &Error{Code: CodeUnavailable, Msg: "server is shutting down", RetryAfterMs: c.retryIn.Load()}
+		case int(n) > c.a.cfg.MaxInflight:
+			refuse = &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}
+		}
+		if refuse != nil {
 			c.inflight.Add(-1)
+			c.a.calls.Add(-1)
 			if c.firstSeen(*msg.ID) {
-				c.send(&resMsg{T: "res", ID: *msg.ID, Err: &Error{Code: CodeRateLimited, Msg: "too many calls in flight", RetryAfterMs: 100}})
+				c.send(&resMsg{T: "res", ID: *msg.ID, Err: refuse})
 			}
 			return
 		}
@@ -524,6 +580,7 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 		c.mu.Unlock()
 		if !first {
 			c.inflight.Add(-1)
+			c.a.calls.Add(-1)
 			return
 		}
 		go c.call(msg, c.identity(), hctx, r)
@@ -630,6 +687,8 @@ func (c *conn) reauth(id uint64, rawToken json.RawMessage) {
 }
 
 func (c *conn) call(msg *clientMsg, ident *Identity, hctx context.Context, r *runningCall) {
+	// Last: Shutdown waits for calls to reach zero, by then the res is queued.
+	defer c.a.calls.Add(-1)
 	defer c.inflight.Add(-1)
 	id := *msg.ID
 	defer func() {
@@ -722,7 +781,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	// Fence (§6.2): registered before commit, notified as the last
 	// statement, so its notification follows every row notification of
 	// this transaction.
-	token, f := c.a.engine.registerFence()
+	token, f := c.a.engine.registerFence(c)
 	if _, err := tx.Exec(ctx, "SELECT pg_notify('comet', $1)", "1|f|"+token); err != nil {
 		c.a.engine.dropFence(token)
 		return nil, false, err
@@ -848,10 +907,34 @@ func (c *conn) buffer(seq uint64, b []byte) bool {
 	return true
 }
 
+// queuedBytes reports the bytes queued on the session's socket, and whether
+// it has a live one (0, false while detached or after the socket failed).
+// With watchBelow > 0, the socket also calls onDrain once its queue drops
+// below watchBelow; arming and reading happen under one lock.
+func (c *conn) queuedBytes(watchBelow int) (int, bool) {
+	c.mu.Lock()
+	s := c.sock
+	c.mu.Unlock()
+	if s == nil {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dead {
+		return 0, false
+	}
+	if watchBelow > 0 {
+		s.drainAt = watchBelow
+	}
+	return s.outBytes, true
+}
+
 // push appends to the socket's outbound queue.
 func (s *socket) push(b []byte) {
 	s.mu.Lock()
-	if s.dead {
+	// Once a close is requested, the writer finishes what is queued and
+	// closes; later messages would only keep it from getting there.
+	if s.dead || s.closing != nil {
 		s.mu.Unlock()
 		return
 	}
@@ -879,14 +962,30 @@ func (s *socket) writer() {
 		s.mu.Lock()
 		batch := s.out
 		s.out = nil
+		cf := s.closing
+		if len(batch) == 0 && cf != nil {
+			s.dead = true
+		}
 		s.mu.Unlock()
+		if len(batch) == 0 && cf != nil {
+			_ = s.ws.Close(cf.code, cf.reason)
+			s.cancel()
+			return
+		}
 		for _, b := range batch {
 			ctx, cancel := context.WithTimeout(s.ctx, writeTimeout)
 			err := s.ws.Write(ctx, websocket.MessageText, b)
 			cancel()
 			s.mu.Lock()
 			s.outBytes -= len(b)
+			drained := s.drainAt > 0 && s.outBytes < s.drainAt
+			if drained {
+				s.drainAt = 0
+			}
 			s.mu.Unlock()
+			if drained && s.onDrain != nil {
+				s.onDrain()
+			}
 			if err != nil {
 				if s.ctx.Err() == nil {
 					s.fail(closeSlow, "SLOW_CONSUMER", "write timed out")
@@ -894,6 +993,31 @@ func (s *socket) writer() {
 				return
 			}
 		}
+		// Another round: more may have been queued, or a close requested.
+		s.mu.Lock()
+		more := len(s.out) > 0 || s.closing != nil
+		s.mu.Unlock()
+		if more {
+			select {
+			case s.outSig <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// closeAfterDrain closes the socket with code once everything queued has
+// been written. It does not block.
+func (s *socket) closeAfterDrain(code websocket.StatusCode, name, msg string) {
+	reason, _ := json.Marshal(map[string]string{"code": name, "msg": msg})
+	s.mu.Lock()
+	if s.closing == nil {
+		s.closing = &closeFrame{code: code, reason: string(reason)}
+	}
+	s.mu.Unlock()
+	select {
+	case s.outSig <- struct{}{}:
+	default:
 	}
 }
 

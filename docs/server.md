@@ -24,7 +24,8 @@ Register every publication and method before `Start` and before serving requests
 | Identifier | Description |
 |---|---|
 | `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil. |
-| `(*App) Start(ctx)` | Starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done. Panics if called twice. |
+| `(*App) Start(ctx)` | Starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. Panics if called twice. |
+| `(*App) Shutdown(ctx) error` | Stops the server gracefully: see [Graceful shutdown](#graceful-shutdown). |
 | `(*App) ServeHTTP(w, r)` | `App` is an `http.Handler`. It upgrades the request to a CometGo WebSocket. Mount it at `/_comet`, the client's default URL. |
 | `Subprotocol` | The WebSocket subprotocol, `"cometgo.1.json"`. A request that does not offer it gets HTTP 426 with `{"supported":["cometgo.1.json"]}`. |
 
@@ -120,8 +121,9 @@ const (
 
 ```go
 type Query struct {
-	SQL  string
-	Args []any
+	SQL   string
+	Args  []any
+	Match map[string]any // optional, see below
 }
 
 type SubCtx struct {
@@ -130,9 +132,46 @@ type SubCtx struct {
 }
 ```
 
-The query is re-run in full on every change, so it must be deterministic for a given snapshot: add `ORDER BY` to any publication that is not `Unordered`. `Args` are passed to pgx as query parameters.
+The query is re-run in full when a table it reads changes, so it must be deterministic for a given snapshot: add `ORDER BY` to any publication that is not `Unordered`. `Args` are passed to pgx as query parameters.
 
 `SubCtx.Context` is the engine's context, not the client's.
+
+#### Skipping unaffected re-runs: `Query.Match`
+
+By default, every write to a table re-runs every observer that reads it. With 1,000 users each subscribed to their own rows of `todos` (`ScopeUser`), one insert costs 1,000 queries. `Match` declares which rows the query returns, so the engine can tell which observers a write can affect and re-run only those:
+
+```go
+cometgo.Publish(app, "todos.mine", cometgo.PubOptions{Tables: []string{"todos"}},
+	func(c *cometgo.SubCtx, _ struct{}) (cometgo.Query, error) {
+		return cometgo.Query{
+			SQL:   `SELECT id, title, done FROM todos WHERE owner = $1 ORDER BY id`,
+			Args:  []any{c.Identity.UserID},
+			Match: map[string]any{"owner": c.Identity.UserID},
+		}, nil
+	})
+```
+
+For each write, the engine reads the changed rows once, by primary key, inside the tick's snapshot. It then re-runs an observer only if a changed row matches its `Match`, or its current result holds one of the changed keys (a delete, or a row that stopped matching). The re-run is the normal full query, so what clients receive is unchanged.
+
+`Match` is a promise about the query, and the engine trusts it. It must describe the query's rows exactly:
+
+- The publication reads one table, and `Key` is that table's primary key, with the same columns in the same order.
+- The result is every row of the table where each `Match` column equals its value. There is no `LIMIT`, `OFFSET`, join, subquery or other condition. `ORDER BY` is fine. An empty map means every row.
+- Values are compared the way pgx decodes the column:
+  - `string` for `text` and `varchar` (with a deterministic collation)
+  - Go integer types (`int`, `int8`–`int64`, `uint8`–`uint32`, and `uint`/`uint64` up to `math.MaxInt64`) for `int2`, `int4` and `int8`
+  - `bool`
+  - `[16]byte` or the usual string form for `uuid`
+
+  Other column types are never compared in Go: `char(n)` (its padding), `citext`, enums, floats, numerics, and `text` with a nondeterministic collation all re-run, as without `Match`.
+
+If the engine can't decide, it re-runs the observer, exactly as without `Match`. That happens for:
+- a `nil` value, a value of another Go type, or a column the table lacks
+- a primary key that isn't `int2`/`int4`/`int8`, `text` or `uuid`, or a result key column whose type differs from the table's (e.g. `id::text AS id`)
+- a statement whose change list the triggers could not send: more than 1,000 rows, or keys that do not fit in one notification (about 7,500 bytes), so only the table is reported
+- the listener reconnecting
+
+Notifications that arrive between the start of a tick and its snapshot are folded into that tick's checks: their keys are checked too. One that is still on its way from Postgres when the snapshot is taken can slip through. A transaction's notifications can thus be split across two ticks while the first tick's snapshot already holds the whole transaction. An observer skipped on the first tick then catches up on the next, as observers of other tables already do. A call's result still waits for all of its writes (§6.2).
 
 ## Methods
 
@@ -336,6 +375,46 @@ A token refresh for the same user is fine. A protocol error, or a deliberate clo
 
 Memory cost: each disconnected session holds its subscriptions plus at most `ResumeBuffer` bytes for up to `ResumeGrace`. Connected sessions hold the unacknowledged tail, usually about one second of output. Set `ResumeGrace` negative to turn resume off.
 
+## Graceful shutdown
+
+`App.Shutdown(ctx)` lets a deploy restart the server without failing calls or making every client reconnect at the same moment:
+
+1. Every connection gets a `goaway` with a random delay of 0–5 s. New WebSocket connections are refused with HTTP 503.
+2. New calls are refused with `UNAVAILABLE` (with `retryAfterMs`). The TypeScript client does not send them: it holds calls made after `goaway` for the next connection. Calls already running finish, and their results are delivered.
+3. Once no call is running, every socket is closed with code 4503 after its queued messages are written.
+4. The engine, the Postgres listener and the idempotency cleanup stop.
+
+Each client reconnects after its own delay, so a rolling restart spreads the reconnects (and their resyncs) over five seconds. If `ctx` ends first, `Shutdown` closes the remaining sockets at once and returns `ctx.Err()`. Calls still running then finish on their own, and their clients see `CONNECTION_LOST`.
+
+Pass `Start` a context that outlives the shutdown signal (or `context.Background()`): the engine and the listener must keep running while `Shutdown` drains, or in-flight calls wait out `FenceTimeout` and subscriptions stop updating. Call `Shutdown` before `http.Server.Shutdown`, which does not wait for WebSocket connections. Calling `Shutdown` again, or concurrently, waits for the first one.
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+app.Start(context.Background()) // not ctx: it must outlive the signal
+// ... set up srv, then:
+<-ctx.Done()
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+app.Shutdown(shutdownCtx)
+srv.Shutdown(shutdownCtx)
+```
+
+Sessions do not survive the shutdown: a client that comes back resyncs.
+
+## Slow clients
+
+A client that reads more slowly than its subscriptions change (a phone on a bad network, a tab in the background) does not make the server buffer every change for it. Once more than 256 KiB of diffs is queued for a connection, the server stops sending it diffs and only notes which subscriptions changed. When the client has caught up below 64 KiB, it gets one transaction that resets those subscriptions to the current data. The client applies a reset as a diff against what it holds, so rows that did not change are not re-rendered. Server memory per connection stays bounded by the size of the results, not by how fast they change.
+
+While the connection is held back:
+
+- A method call's result still arrives after the data it wrote: when its fence is released, the held subscriptions are reset in that tick, ahead of the result.
+- Events for the connection are dropped. Events are at-most-once anyway.
+- A large snapshot sitting in the queue does not count: a subscription whose result is over 256 KiB keeps getting diffs as long as the client keeps reading.
+- If the connection drops, a resumed session gets the messages it missed and then the resets.
+
+A client that makes no progress at all is still disconnected with 4429 SLOW_CONSUMER, when about 8 MiB is queued or a single write is stuck for 10 seconds. That close leaves a resumable session resumable.
+
 ## InstallTriggers
 
 ```go
@@ -350,6 +429,6 @@ Requirements:
 - Tables are named `"table"` (meaning `public.table`) or `"schema.table"`.
 - Postgres 11 or newer (the triggers use `EXECUTE FUNCTION`; the protocol spec's "PG 10+" is the minimum for transition tables, not for this code).
 
-Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. In v1-core any notification for a table re-runs every observer that reads it.
+Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. Every notification for a table re-runs the observers that read it, except observers whose query declares [`Match`](#skipping-unaffected-re-runs-querymatch), which re-run only if the changed rows can affect them.
 
 If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.
