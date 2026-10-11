@@ -295,6 +295,9 @@ export class Comet {
     } catch (e) {
       console.warn("cometgo: token source failed", e);
     }
+    // While the token resolved, close() may have run, or #reconnectNow may
+    // have started another #open that already has its socket.
+    if (this.#closed || this.#ws) return;
     const WS = this.#opts.WebSocket ?? WebSocket;
     const ws = new WS(this.#opts.url ?? defaultUrl(), [SUBPROTOCOL]);
     this.#ws = ws;
