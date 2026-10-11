@@ -90,7 +90,8 @@ Each distinct `(publication, args, scope)` combination has one server-side **obs
 
 - Everything the query depends on must be in `Query.SQL` and `Query.Args`, and the scope must separate callers whose queries would differ (see [Scope](#scope)).
 - `fn` runs on the engine's loop, so keep it fast. Doing an access check against the database there delays every subscription on the server.
-- `fn` is the access check for a subscription when it starts, and also when the connection's identity changes, because every subscription is re-bound then. It is not re-run later, so revoking access in the database does not end a live subscription.
+- `fn` is the access check for a subscription when it starts, and when the connection's `UserID` changes (log in, log out, switch user, or an expired identity), because every subscription is re-bound then. It is **not** re-run when a token refresh or session resume keeps the same `UserID`, even if `Identity.Data` (a role, say) changed, and not when access changes in the database, so neither ends a live subscription.
+- `fn` runs once per subscription, and again for each of a connection's subscriptions when its user changes. An access check that queries the database therefore costs one round trip per subscriber on the engine's loop. Keep it cheap or cached, especially for a `ScopeShared` publication with many subscribers.
 - Returning an error from `fn` ends that subscription only, with that error. Other subscriptions to the same observer keep streaming. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
 - Bad args (wrong types, unknown fields) end the subscription with `BAD_REQUEST`. An unknown publication name ends it with `NOT_FOUND`.
 
