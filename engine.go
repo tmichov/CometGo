@@ -30,6 +30,9 @@ type engine struct {
 	fences  map[string]*fence
 	fenceN  uint64
 	wake    chan struct{}
+	// listenGen counts successful LISTENs. A fence registered under an
+	// older generation may have had its notification lost (fenceCommitted).
+	listenGen uint64
 
 	// Owned by the run goroutine.
 	observers map[string]*observer
@@ -75,6 +78,12 @@ type notification struct {
 type fence struct {
 	released chan struct{}
 	c        *conn // the connection whose res waits on it
+	// gen is listenGen at registration. committed is set once the method's
+	// transaction has committed; from then on an all-dirty tick drained
+	// later re-runs every observer on a snapshot holding its writes, so that
+	// tick releases it whether or not its own notification ever arrives.
+	gen       uint64
+	committed bool
 }
 
 type observer struct {
@@ -189,9 +198,44 @@ func (e *engine) registerFence(c *conn) (string, *fence) {
 	defer e.mu.Unlock()
 	e.fenceN++
 	token := e.a.nodeID + ":" + strconv.FormatUint(e.fenceN, 10)
-	f := &fence{released: make(chan struct{}), c: c}
+	f := &fence{released: make(chan struct{}), c: c, gen: e.listenGen}
 	e.fences[token] = f
 	return token, f
+}
+
+// fenceCommitted marks token's fence committed; call it once the method's
+// transaction has committed. Postgres drops notifications for a channel
+// nobody listens on, so a fence notified while the listener was down is
+// released by the all-dirty tick that follows the reconnect (tick). If a
+// reconnect happened since the fence was registered, that tick may already
+// have drained without it, so another all-dirty tick is queued: its drain
+// follows the commit.
+func (e *engine) fenceCommitted(token string) {
+	e.mu.Lock()
+	f := e.fences[token]
+	if f == nil {
+		e.mu.Unlock()
+		return // already released by its notification
+	}
+	f.committed = true
+	lost := f.gen != e.listenGen
+	if lost {
+		e.nextN++
+		e.pending = append(e.pending, notification{n: e.nextN, all: true})
+	}
+	e.mu.Unlock()
+	if lost {
+		e.signal()
+	}
+}
+
+// listening records a successful LISTEN and marks everything dirty:
+// notifications sent while nobody listened are lost.
+func (e *engine) listening() {
+	e.mu.Lock()
+	e.listenGen++
+	e.mu.Unlock()
+	e.notify(notification{all: true})
 }
 
 func (e *engine) dropFence(token string) {
@@ -237,6 +281,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	e.pending, e.reqs = nil, nil
 	fences, evts := e.carryFences, e.carryEvts
 	e.carryFences, e.carryEvts = nil, nil
+	allDirty := false
 	for _, n := range notes {
 		if n.evt != nil {
 			evts = append(evts, n.evt)
@@ -247,16 +292,25 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 				fences = append(fences, f)
 			}
 		}
+		allDirty = allDirty || n.all
+	}
+	// An all-dirty tick re-runs every observer on a snapshot taken after
+	// this drain, so it covers the writes of every fence already committed,
+	// including those whose notification was lost while the listener was
+	// down. Their res still follows this tick's tx (step 5).
+	if allDirty {
+		for token, f := range e.fences {
+			if f.committed {
+				delete(e.fences, token)
+				fences = append(fences, f)
+			}
+		}
 	}
 	e.mu.Unlock()
 
 	changes := map[string]*tableChange{}
-	allDirty := false
 	for _, n := range notes {
-		switch {
-		case n.all:
-			allDirty = true
-		case n.table != "":
+		if n.table != "" {
 			tc := changes[n.table]
 			if tc == nil {
 				tc = &tableChange{}
@@ -800,7 +854,7 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		}
 	}
 	// Notifications sent while we were not listening are lost.
-	e.notify(notification{all: true})
+	e.listening()
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {

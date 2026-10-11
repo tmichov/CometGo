@@ -790,6 +790,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
+	c.a.engine.fenceCommitted(token)
 	select {
 	case <-f.released:
 		return val, false, nil

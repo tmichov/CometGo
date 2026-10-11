@@ -164,24 +164,29 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 		extra(env, app)
 	}
 	app.Start(ctx)
-	// LISTEN comes up asynchronously; a fence notified before it would be
-	// lost and its call would wait FenceTimeout. The listener signals
-	// readiness with its first notification.
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		app.engine.mu.Lock()
-		up := app.engine.nextN > 0
-		app.engine.mu.Unlock()
-		if up {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("listener did not start")
-		}
-	}
 	srv := httptest.NewServer(app)
 	t.Cleanup(srv.Close)
 	env.app, env.srv = app, srv
 	return env
+}
+
+// listenGen reports how many times the listener has established LISTEN.
+func (e *testEnv) listenGen() uint64 {
+	e.app.engine.mu.Lock()
+	defer e.app.engine.mu.Unlock()
+	return e.app.engine.listenGen
+}
+
+// waitListening waits for the first LISTEN. Calls do not need it; tests
+// that count observer runs do, since the all-dirty tick that follows LISTEN
+// re-runs every observer.
+func (e *testEnv) waitListening(t testing.TB) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); e.listenGen() == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("listener did not start")
+		}
+	}
 }
 
 type client struct {

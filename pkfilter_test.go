@@ -337,6 +337,7 @@ func TestChangedKeyFilterMatchesFullRerun(t *testing.T) {
 // reports how many observer queries the write runs.
 func countRuns(t testing.TB, e *testEnv, pub string, n int, owner func(int) string, write string) int64 {
 	t.Helper()
+	e.waitListening(t)
 	a, _ := e.dial(t, nil)
 	for i := range n {
 		a.send(map[string]any{"t": "sub", "s": i + 1, "name": pub, "args": map[string]any{"Owner": owner(i)}})
@@ -380,6 +381,7 @@ func BenchmarkChangedKeyFilter(b *testing.B) {
 		for _, pub := range []string{"f.owner", "u.owner"} {
 			b.Run(fmt.Sprintf("%s/N=%d", pub, n), func(b *testing.B) {
 				e := setupFilter(b, func(c *Config) { c.MaxSubs = n })
+				e.waitListening(b)
 				a, _ := e.dial(b, nil)
 				for i := range n {
 					a.send(map[string]any{"t": "sub", "s": i + 1, "name": pub, "args": map[string]any{"Owner": fmt.Sprintf("o%d", i)}})
