@@ -81,9 +81,10 @@ func (id *Identity) Scope() string {
 }
 
 // ikMethod is the method recorded with an idempotency key. Keys are stored
-// per UserID (so rows written before ScopeKey was set still match); the
-// ScopeKey rides along so a key reused under another scope is refused rather
-// than run again or answered with the other scope's result.
+// per UserID; the ScopeKey rides along so a key reused under another scope
+// is refused rather than run again or answered with the other scope's
+// result. A row stored without a ScopeKey (e.g. before the app set one)
+// counts as another scope too: it matches only identities with no ScopeKey.
 func ikMethod(method string, id *Identity) string {
 	if id == nil || id.ScopeKey == "" {
 		return method
