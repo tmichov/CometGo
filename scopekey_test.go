@@ -22,6 +22,7 @@ func setupTenants(t *testing.T) *testEnv {
 	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('acme', 'a1'), ('globex', 'g1')"); err != nil {
 		t.Fatal(err)
 	}
+	e.waitListening(t) // an Emit sent before LISTEN is lost
 	return e
 }
 
