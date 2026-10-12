@@ -144,3 +144,29 @@ func TestIdentityScope(t *testing.T) {
 		t.Fatal("without ScopeKey, Scope must be the UserID")
 	}
 }
+
+// A key stored before the app set ScopeKey (bare method name) is refused for
+// a scoped retry rather than answered across tenants or run again.
+func TestScopeKeyLegacyIdempotencyRow(t *testing.T) {
+	e := setupTenants(t)
+	ik := "ik-" + newID(8)
+	if _, err := e.pool.Exec(context.Background(),
+		`INSERT INTO comet_idempotency (ik, user_id, method, result) VALUES ($1, 'alice', 'add', '"legacy"')`, ik); err != nil {
+		t.Fatal(err)
+	}
+	acme, _ := e.dial(t, evtHello("alice@acme"))
+	acme.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "legacy-retry"}, "ik": ik})
+	r := acme.next()
+	if r["ok"] != false || r["err"].(map[string]any)["code"] != CodeBadRequest {
+		t.Fatalf("scoped retry of a legacy key: %v", r)
+	}
+	if n := e.countRows(t, "SELECT count(*) FROM "+e.table+" WHERE name = 'legacy-retry'"); n != 0 {
+		t.Fatalf("handler ran %d times", n)
+	}
+	// The same key without a ScopeKey still gets its stored result.
+	alice, _ := e.dial(t, evtHello("alice"))
+	alice.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "legacy-retry"}, "ik": ik})
+	if got := okRes(t, alice.next(), 1); got != "legacy" {
+		t.Fatalf("unscoped retry got %v, want stored result", got)
+	}
+}
