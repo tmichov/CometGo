@@ -139,21 +139,28 @@ func TestCallRightAfterStartHasNoLag(t *testing.T) {
 	}
 }
 
-// A call made while the listener is reconnecting resolves after the
-// reconnect's full re-run, with its tx ahead of its res, not after
-// FenceTimeout.
-func TestCallDuringListenerReconnectHasNoLag(t *testing.T) {
-	appName := "cometgo_test_" + newID(4)
-	e := setupWith(t, func(c *Config) {
+// withAppName gives the app its own pool whose connections, the
+// listener's included, carry application_name name, so a test can find
+// them in pg_stat_activity.
+func withAppName(t testing.TB, name string) func(*Config) {
+	return func(c *Config) {
 		cfg := c.DB.Config()
-		cfg.ConnConfig.RuntimeParams["application_name"] = appName
+		cfg.ConnConfig.RuntimeParams["application_name"] = name
 		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(pool.Close)
 		c.DB = pool
-	})
+	}
+}
+
+// A call made while the listener is reconnecting resolves after the
+// reconnect's full re-run, with its tx ahead of its res, not after
+// FenceTimeout.
+func TestCallDuringListenerReconnectHasNoLag(t *testing.T) {
+	appName := "cometgo_test_" + newID(4)
+	e := setupWith(t, withAppName(t, appName))
 	a, _ := e.dial(t, nil)
 	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
 	if tx := a.next(); tx["t"] != "tx" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -46,6 +47,15 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"supported": []string{Subprotocol}})
 		return
 	}
+	if a.cfg.MaxConns > 0 || a.cfg.MaxConnsPerIP > 0 {
+		ip, ok := a.acquireConn(r)
+		if !ok {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "too many connections", http.StatusServiceUnavailable)
+			return
+		}
+		defer a.releaseConn(ip)
+	}
 	var cookieIdent *Identity
 	var cookieErr error
 	if a.cfg.AuthenticateRequest != nil {
@@ -59,8 +69,55 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return // Accept already wrote the HTTP error (e.g. bad Origin)
 	}
 	s := &socket{ws: ws, outSig: make(chan struct{}, 1), onDrain: a.engine.signal}
+	if a.cfg.Metrics != nil {
+		s.onSlow = func() { a.metric(MetricSlowClose, "", 1) }
+	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	a.serve(s, cookieIdent, cookieErr)
+}
+
+// acquireConn counts a new connection against MaxConns and MaxConnsPerIP,
+// reporting false (and counting nothing) if either is full.
+func (a *App) acquireConn(r *http.Request) (string, bool) {
+	var ip string
+	if a.cfg.MaxConnsPerIP > 0 {
+		if a.cfg.ClientIP != nil {
+			ip = a.cfg.ClientIP(r)
+		}
+		// An empty ClientIP (e.g. a missing forwarded header) falls back to
+		// the peer address rather than one bucket shared by all such clients.
+		if ip == "" {
+			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				ip = host
+			} else {
+				ip = r.RemoteAddr
+			}
+		}
+	}
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	if a.cfg.MaxConns > 0 && a.conns >= a.cfg.MaxConns {
+		return "", false
+	}
+	if a.cfg.MaxConnsPerIP > 0 && a.ipConns[ip] >= a.cfg.MaxConnsPerIP {
+		return "", false
+	}
+	a.conns++
+	if a.cfg.MaxConnsPerIP > 0 {
+		a.ipConns[ip]++
+	}
+	return ip, true
+}
+
+func (a *App) releaseConn(ip string) {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	a.conns--
+	if a.cfg.MaxConnsPerIP > 0 {
+		if a.ipConns[ip]--; a.ipConns[ip] == 0 {
+			delete(a.ipConns, ip)
+		}
+	}
 }
 
 func offersSubprotocol(r *http.Request) bool {
@@ -139,6 +196,9 @@ type socket struct {
 	outSig chan struct{}
 	// onDrain is called once the queue drops below drainAt (§8.1).
 	onDrain func()
+	// onSlow, if set, is called once if the socket is closed as a slow
+	// consumer (queue over its limit, or a write timeout).
+	onSlow func()
 
 	mu       sync.Mutex // guards the fields below
 	out      [][]byte
@@ -223,6 +283,18 @@ func (s *socket) fail(code websocket.StatusCode, name, msg string) {
 		_ = s.ws.Close(code, string(reason))
 		s.cancel()
 	}()
+}
+
+// slow closes the socket as a slow consumer, reporting it once per socket.
+// The hook runs on its own goroutine: callers may hold c.mu.
+func (s *socket) slow(msg string) {
+	s.mu.Lock()
+	first := !s.dead
+	s.mu.Unlock()
+	s.fail(closeSlow, "SLOW_CONSUMER", msg)
+	if first && s.onSlow != nil {
+		go s.onSlow()
+	}
 }
 
 func (s *socket) isFatal() bool {
@@ -782,23 +854,46 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	}
 	// Fence (§6.2): registered before commit, notified as the last
 	// statement, so its notification follows every row notification of
-	// this transaction.
+	// this transaction. A transaction with no ID wrote nothing and has no
+	// effects to wait for, so it is not fenced; EmitAfterCommit assigns one.
+	// A replay is always fenced: the original may still be running.
 	token, f := c.a.engine.registerFence(c)
-	if _, err := tx.Exec(ctx, "SELECT pg_notify('comet', $1)", "1|f|"+token); err != nil {
+	fenceSQL := "SELECT pg_notify('comet', $1) WHERE txid_current_if_assigned() IS NOT NULL"
+	if stored != nil {
+		fenceSQL = "SELECT pg_notify('comet', $1)"
+	}
+	tag, err := tx.Exec(ctx, fenceSQL, "1|f|"+token)
+	if err != nil {
 		c.a.engine.dropFence(token)
 		return nil, false, err
+	}
+	if tag.RowsAffected() == 0 {
+		c.a.engine.dropFence(token)
+		return val, false, tx.Commit(ctx)
 	}
 	if err := c.a.engine.commitFenced(ctx, tx, token); err != nil {
 		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
+	var committed time.Time
+	if c.a.cfg.Metrics != nil {
+		committed = time.Now()
+	}
 	select {
 	case <-f.released:
-		return val, false, nil
+		lag = false
 	case <-time.After(c.a.cfg.FenceTimeout):
 		c.a.engine.dropFence(token)
-		return val, true, nil
+		lag = true
 	}
+	if c.a.cfg.Metrics != nil {
+		// A lagged call's wait is observed too, so slow fences show.
+		c.a.metric(MetricFenceWait, "", time.Since(committed).Seconds())
+		if lag {
+			c.a.metric(MetricFenceLag, "", 1)
+		}
+	}
+	return val, lag, nil
 }
 
 // send enqueues one message, assigning seq to stateful messages.
@@ -945,7 +1040,7 @@ func (s *socket) push(b []byte) {
 	over := s.outBytes > maxQueuedBytes
 	s.mu.Unlock()
 	if over {
-		s.fail(closeSlow, "SLOW_CONSUMER", "client is not keeping up")
+		s.slow("client is not keeping up")
 		return
 	}
 	select {
@@ -977,6 +1072,7 @@ func (s *socket) writer() {
 		for _, b := range batch {
 			ctx, cancel := context.WithTimeout(s.ctx, writeTimeout)
 			err := s.ws.Write(ctx, websocket.MessageText, b)
+			timedOut := ctx.Err() == context.DeadlineExceeded
 			cancel()
 			s.mu.Lock()
 			s.outBytes -= len(b)
@@ -989,8 +1085,12 @@ func (s *socket) writer() {
 				s.onDrain()
 			}
 			if err != nil {
-				if s.ctx.Err() == nil {
-					s.fail(closeSlow, "SLOW_CONSUMER", "write timed out")
+				switch {
+				case s.ctx.Err() != nil:
+				case timedOut:
+					s.slow("write timed out")
+				default: // the peer went away; same close, but not slowness
+					s.fail(closeSlow, "SLOW_CONSUMER", "write failed")
 				}
 				return
 			}

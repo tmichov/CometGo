@@ -206,7 +206,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 
 - **Concurrency.** Calls run concurrently, up to `limits.maxInflight`. A caller that needs ordering awaits. Calls beyond the limit get `RATE_LIMITED` with `retryAfterMs`.
 - **Exactly one `res` per `id`.**
-- **`"noFence":true`** skips the read-your-writes fence (§6.2). Use it for latency-sensitive calls that do not write.
+- **`"noFence":true`** skips the read-your-writes fence (§6.2). A call that writes nothing already skips it (§6.2); use `noFence` for latency-sensitive calls that write but need not wait for their update.
 - **`"ik":"<uuid>"` idempotency key.** Negotiated with the `ik` cap: the client offers `"caps":["ik"]` in `hello`, and a server that supports keys includes `"ik"` in `welcome.caps`.
   - The framework writes `(ik, userId, method, result)` to `comet_idempotency` inside the method's own transaction, so the record commits atomically with the method's effects.
   - A retry with the same `ik` from the same user returns the stored result instead of executing again. The same user under a different server-side scope (e.g. another tenant) gets `BAD_REQUEST` instead. Its `res` is fenced like any call's.
@@ -238,6 +238,10 @@ Guarantees hold per server node. In a multi-node deployment, each connection is 
 
 **Mechanism.** Methods that use the framework transaction (`ctx.Tx`) send `pg_notify('comet', '1|f|<nodeId>:<counter>')` as the **last** statement before commit.
 
+**No effects, no fence.** A call whose transaction was assigned no transaction ID wrote nothing and has no effects, so it commits without a fence and its `res` is sent at once. The check and the fence notification are one statement. An idempotency replay is always fenced. `EmitAfterCommit` assigns an ID (`pg_notify` alone does not, before commit), so a call that emitted events stays fenced and its `evt` precedes its `res`. A write undone by a rolled-back savepoint has an ID, so it is fenced too.
+
+Because such a call does not wait for a tick, its result can reflect data the client's subscriptions have not received yet: a read-only call that counts rows can return a newer count than the client's store currently holds.
+
 Postgres delivers a transaction's notifications together, after commit, in commit order. So by the time the listener receives the fence, every row notification from that transaction has already been received.
 
 **Release rule.**
@@ -257,7 +261,8 @@ In v1-core, ticks are sequential and every dirty observer runs in each tick, so 
 |---|---|
 | Fence timeout (default 5 s) | `res` is sent with `"lag":true`. The promise resolves, and the client can tell the effects are not yet visible. The guarantee is never broken silently. |
 | Method failed or rolled back | The fence notify rolled back with it. The framework knows the commit failed and sends `res` immediately. |
-| Method wrote nothing watched | The fence still forces a (cheap) tick. |
+| Method wrote nothing (no transaction ID) | No fence: `res` is sent on commit, without waiting for a tick. |
+| Method wrote only to unwatched tables | The fence still forces a (cheap) tick. |
 | Listener down when the method commits (server just started, or reconnecting) | The fence notification is lost (§11). The all-dirty tick that follows the next successful LISTEN re-runs every observer on a snapshot taken after the commit. That tick releases every fence whose transaction committed before that LISTEN, and sends the `res` after the tick's `tx`. The call resolves without `lag` once the listener is back. Fenced commits wait while LISTEN itself runs, so each commit falls clearly before or after it. A fence committed after the LISTEN is left to its own notification, so its events still precede its `res`. |
 | Writes outside `ctx.Tx` (another connection or pool) | No fence guarantee. This is documented. |
 | **[later]** logical replication | The fence becomes "the replication stream has processed past the commit LSN". The wire protocol is unchanged. |
@@ -365,6 +370,8 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 | `maxMsg` | 1 MiB | |
 | Per-observer row cap | 10,000 | Sub ends with `RESULT_TOO_LARGE`. |
 | Observer query hard timeout | 30 s | Sub ends with `TIMEOUT`. |
+| Server-wide observers | no limit | A sub that needs a new observer ends with `OVERLOADED`; a sub that joins an existing observer (same publication, args and scope) is unaffected. Not advertised: it depends on other clients. |
+| Open connections, total and per client IP | no limit | The upgrade is refused with HTTP 503 before any `welcome`; the client treats it as a failed connect and retries with backoff. Not advertised. |
 | **[later]** per-method rate limits | | Token bucket. |
 
 ### 8.4 [later] Slow observers
@@ -388,7 +395,7 @@ Cancel-and-retry is rejected because a query that always exceeds the deadline wo
 |---|---|
 | Request and auth | `BAD_REQUEST`, `VALIDATION` (`details.fields`), `UNAUTHENTICATED`, `AUTH_EXPIRED`, `FORBIDDEN` |
 | Data | `NOT_FOUND`, `CONFLICT` |
-| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE` |
+| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE`, `OVERLOADED` (server-wide capacity; retrying later may succeed) |
 | Server and connection | `UNAVAILABLE`, `INTERNAL` (`details.ref` is a log correlation ID; internals are never leaked), `CONNECTION_LOST` (synthesized by the client) |
 
 Application-defined codes are namespaced `app.<name>`.
@@ -433,7 +440,7 @@ Types are described once per sub in `init.cols`, and values are plain JSON. Ther
 
 Not part of the wire protocol. Specified here because the consistency guarantees depend on it.
 
-All notifications use channel `comet`. Payload fields are separated by `|`, and the JSON part is always last.
+Change and fence notifications use channel `comet`. Events (§4.5) use `comet_evt`, and `App.Revalidate` re-checks use `comet_reval` (the payload is the user ID); both are delivered to every node's listener. On `comet`, payload fields are separated by `|`, and the JSON part is always last.
 
 | Kind | Payload | Example |
 |---|---|---|
@@ -454,7 +461,7 @@ All notifications use channel `comet`. Payload fields are separated by `|`, and 
 - A dirty observer re-runs its full query. An observer whose query declares a single-table equality predicate (`Query.Match` on the server) is dirtied by a row notification only if a changed row, read once per tick by PK inside the snapshot, matches the predicate, or its current result holds a changed PK. Table-dirty notifications and anything the server cannot evaluate re-run it as before.
 - A minimum interval between ticks (default 20 ms, `Config.MinTickInterval`) coalesces bursts.
 
-**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped.
+**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped. `comet_reval` re-checks are lost too, so the same tick re-runs the publication fn of every subscription, before it releases fences.
 
 Every node receives every fence and ignores the tokens it does not own.
 

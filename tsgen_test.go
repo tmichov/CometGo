@@ -266,6 +266,9 @@ func TestDescribe(t *testing.T) {
 			}
 		}
 		t.Cleanup(func() { e.pool.Exec(context.Background(), "DROP TABLE "+e.table+"_d") })
+		if err := InstallTriggers(ctx, e.pool, e.table+"_d"); err != nil {
+			t.Fatal(err)
+		}
 		Publish(app, "d.one", PubOptions{Tables: []string{e.table + "_d"}},
 			func(c *SubCtx, a struct {
 				Mood string `json:"mood"`
@@ -299,8 +302,8 @@ func TestDescribe(t *testing.T) {
 	if _, err := Describe(ctx, e.app, DescribeOptions{}); err == nil || !strings.Contains(err.Error(), "items.mine") {
 		t.Fatalf("anonymous describe of items.mine: %v", err)
 	}
-	panicky := setupFull(t, nil, func(_ *testEnv, app *App) {
-		Publish(app, "p", PubOptions{Tables: []string{"x"}}, func(c *SubCtx, _ struct{}) (Query, error) {
+	panicky := setupFull(t, nil, func(pe *testEnv, app *App) {
+		Publish(app, "p", PubOptions{Tables: []string{pe.table}}, func(c *SubCtx, _ struct{}) (Query, error) {
 			return Query{SQL: "SELECT " + c.Identity.UserID}, nil // nil Identity
 		})
 	})

@@ -134,6 +134,21 @@ type Config struct {
 	MaxMsg      int // default 1 MiB
 	MaxRows     int // per-observer row cap, default 10,000
 
+	// MaxObservers caps live queries (observers) on the server. A sub that
+	// would create one more ends with OVERLOADED; a sub joining an existing
+	// observer is unaffected. 0 means no limit.
+	MaxObservers int
+	// MaxConns caps open WebSocket connections; MaxConnsPerIP caps them per
+	// ClientIP. Over either, the upgrade is refused with HTTP 503. 0 means
+	// no limit.
+	MaxConns      int
+	MaxConnsPerIP int
+	// ClientIP returns the address MaxConnsPerIP counts against. Default,
+	// and when it returns "": the host of r.RemoteAddr. Behind a proxy,
+	// return the client address the proxy forwards, or every client shares
+	// the proxy's limit.
+	ClientIP func(r *http.Request) string
+
 	// ResumeGrace is how long a session outlives a lost socket, waiting for
 	// the client to resume it (§7.2). Default 60s; negative disables resume.
 	// Resume needs sticky routing when several nodes serve one endpoint.
@@ -145,6 +160,12 @@ type Config struct {
 	ResumeBuffer int
 
 	Logger *slog.Logger
+
+	// Metrics, if set, receives engine and connection health measurements
+	// (see the Metric* constants). It is called synchronously from the
+	// engine and connection goroutines, so it must be fast and safe for
+	// concurrent use. Nil reports nothing.
+	Metrics func(Metric)
 }
 
 // App is a CometGo server. It implements http.Handler for the WebSocket
@@ -171,6 +192,9 @@ type App struct {
 	shutOnce sync.Once
 	shutDone chan struct{}
 	shutErr  error
+	connMu   sync.Mutex         // guards conns and ipConns
+	conns    int                // open WebSocket connections
+	ipConns  map[string]int     // open connections by ClientIP
 	startMu  sync.Mutex         // guards started and stop
 	stop     context.CancelFunc // stops what Start runs
 	running  sync.WaitGroup
@@ -220,6 +244,7 @@ func New(cfg Config) *App {
 		methods:  map[string]*method{},
 		sessions: map[string]*conn{},
 		live:     map[*conn]struct{}{},
+		ipConns:  map[string]int{},
 		shutDone: make(chan struct{}),
 	}
 	a.engine = newEngine(a)
@@ -230,16 +255,31 @@ func New(cfg Config) *App {
 // cleanup until ctx is done or Shutdown stops them. Shutdown needs them
 // running while it drains, so with Shutdown pass a ctx that outlives the
 // shutdown signal. After Shutdown, Start does nothing.
-func (a *App) Start(ctx context.Context) {
+//
+// Start first checks that every table in a publication's Tables exists under
+// exactly that name and has the triggers InstallTriggers creates, and returns
+// an error without starting anything if not. The check needs the database:
+// if it is unreachable, Start fails after at most Config.QueryTimeout. A
+// later Start may retry.
+func (a *App) Start(ctx context.Context) error {
 	a.startMu.Lock()
 	defer a.startMu.Unlock()
 	if a.started {
 		panic("cometgo: Start called twice")
 	}
-	a.started = true
 	if a.shutting.Load() {
-		return
+		a.started = true
+		return nil
 	}
+	checkCtx, cancel := context.WithTimeout(ctx, a.cfg.QueryTimeout)
+	defer cancel()
+	if err := a.checkTables(checkCtx); err != nil {
+		// Logged too: a caller that ignores the error would otherwise serve
+		// an app with no engine, and no clue why.
+		a.log.Error("start failed", "err", err)
+		return err
+	}
+	a.started = true
 	ctx, a.stop = context.WithCancel(ctx)
 	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
 		a.running.Add(1)
@@ -248,6 +288,7 @@ func (a *App) Start(ctx context.Context) {
 			run(ctx)
 		}()
 	}
+	return nil
 }
 
 // Scope controls which connections share one observer of a publication.

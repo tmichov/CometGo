@@ -92,7 +92,7 @@ type SubStatus = "loading" | "ready" | "resyncing" | "ended";
 - **`loading`**: waiting for the first snapshot; `rows` is empty.
 - **`ready`**: `rows` is the server's current result.
 - **`resyncing`**: the connection dropped or is being re-established. `rows` keeps the last known data, which may be stale; dim it if you like.
-- **`ended`**: the subscription is over. Either you called `stop()`, which leaves `rows` as it was, or the server ended it, which empties `rows` and sets `error` when it was a failure (e.g. `FORBIDDEN`, `NOT_FOUND`, `RESULT_TOO_LARGE`, `TIMEOUT`).
+- **`ended`**: the subscription is over. Either you called `stop()`, which leaves `rows` as it was, or the server ended it, which empties `rows` and sets `error` when it was a failure (e.g. `FORBIDDEN`, `NOT_FOUND`, `RESULT_TOO_LARGE`, `TIMEOUT`, `OVERLOADED`).
 
 Every update from the server is applied as one transaction: all subscriptions it touches change together, and each notifies its listeners once.
 
@@ -116,7 +116,7 @@ const { value, lag } = await comet.callWithStatus("todos.add", { title: "Ship v1
 
 - **Read-your-writes.** The promise resolves only after the method's writes are reflected in this client's subscriptions, so the UI is already up to date when `await` returns.
 - **`lag`.** If the writes did not arrive within the server's `FenceTimeout` (5 s by default), the call still resolves, with `lag: true` from `callWithStatus`. `call` resolves the same way but does not report it.
-- **`{ noFence: true }`** skips that wait. Use it for calls that do not write.
+- **`{ noFence: true }`** skips that wait. A call whose method writes nothing already returns without it, so use `noFence` for calls that write but don't need to wait for their update.
 - **`{ signal }`** takes an `AbortSignal` to cancel the call. If the call has not been sent yet, it is rejected at once with `CANCELED` and never sent. Otherwise the client asks the server to cancel, and the promise settles from the server's answer: `CANCELED` if the method had not committed (nothing was written), or its real result if the cancel came too late. Aborting does not settle the promise by itself, because only the server knows whether the method committed.
 
   ```ts
