@@ -30,3 +30,5 @@ promise resolves ◄────────── res ──────  (sent
 - [Client](client.md): the TypeScript API (`connect`, subscriptions, calls, auth, reconnects, type decoding).
 - [Typed clients](codegen.md): generate TypeScript types for methods and publications from the Go server.
 - [Wire protocol](protocol.md): the full protocol specification, including planned features.
+- [Known limitations](limitations.md): what the current engine does not do well, and when that matters.
+- [Stability policy](stability.md): versioning, and what may change before 1.0.
