@@ -13,7 +13,7 @@ if err := cometgo.InstallTriggers(ctx, pool, "todos"); err != nil { … }
 cometgo.Publish(app, "todos.mine", cometgo.PubOptions{Tables: []string{"todos"}}, …)
 cometgo.Method(app, "todos.add", …)
 
-app.Start(ctx)
+if err := app.Start(ctx); err != nil { … }
 http.Handle("/_comet", app)
 ```
 
@@ -24,7 +24,7 @@ Register every publication and method before `Start` and before serving requests
 | Identifier | Description |
 |---|---|
 | `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil. |
-| `(*App) Start(ctx)` | Starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. Panics if called twice. |
+| `(*App) Start(ctx) error` | Checks every publication's `Tables` (see [Table checks at Start](#table-checks-at-start)), then starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. If the check fails, it returns the error and starts nothing, and `Start` may be called again. Panics if called again after succeeding. |
 | `(*App) Shutdown(ctx) error` | Stops the server gracefully: see [Graceful shutdown](#graceful-shutdown). |
 | `(*App) ServeHTTP(w, r)` | `App` is an `http.Handler`. It upgrades the request to a CometGo WebSocket. Mount it at `/_comet`, the client's default URL. |
 | `Subprotocol` | The WebSocket subprotocol, `"cometgo.1.json"`. A request that does not offer it gets HTTP 426 with `{"supported":["cometgo.1.json"]}`. |
@@ -49,6 +49,10 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `MaxInflight int` | 32 | Concurrent method calls per connection. A call over the limit gets `RATE_LIMITED` with `retryAfterMs: 100`. |
 | `MaxMsg int` | 1 MiB | Largest message the server accepts from a client. A larger message closes the connection. |
 | `MaxRows int` | 10,000 | Row cap per publication result. A larger result ends its subscriptions with `RESULT_TOO_LARGE`. |
+| `MaxObservers int` | 0 (no limit) | Live queries (observers) on the whole server. One observer serves every subscription with the same publication, args and scope. A subscription that would create one more is ended with `OVERLOADED` (after the publication's `fn` runs, so its own `FORBIDDEN` or `VALIDATION` comes first). Subscriptions that join an existing observer are not limited. The pool is shared, so one client with many distinct args can fill it for everyone. `MaxSubs` bounds each connection's share, so set `MaxObservers` well above the observers you expect, as a backstop rather than a quota. |
+| `MaxConns int` | 0 (no limit) | Open WebSocket connections. Over the limit, the upgrade is refused with HTTP 503 and `Retry-After: 5`. Browsers don't expose that header, so the TypeScript client retries with its normal jittered reconnect backoff. |
+| `MaxConnsPerIP int` | 0 (no limit) | Open WebSocket connections per `ClientIP`, refused the same way. Users behind one NAT share the limit. A connection that dropped without the server noticing (e.g. a network blip) keeps its slot until the heartbeat times it out, so a limit of 1 or 2 can refuse that user's own reconnect for up to three times `Heartbeat` (75 s by default). |
+| `ClientIP func(*http.Request) string` | host of `r.RemoteAddr`, also used when it returns `""` | The address `MaxConnsPerIP` counts against. Behind a reverse proxy, every connection comes from the proxy, so return the client address it forwards (e.g. from `X-Forwarded-For`, trusting only what your proxy sets), or leave `MaxConnsPerIP` at 0. |
 | `ResumeGrace` | 60s | How long a session outlives a lost connection, waiting for the client to resume it ([protocol §7.2](protocol.md#72-session-resume)). Unlike the other durations, a **negative** value disables resume, and clients then resync on every reconnect. See [Session resume](#session-resume). |
 | `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay, at most 4 MiB (half the outbound queue limit, since a resume sends the whole replay at once). A disconnected session that outgrows it ends, and its client resyncs. |
 | `Logger *slog.Logger` | `slog.Default()` | Where the framework logs, including the details of `INTERNAL` errors. |
@@ -93,6 +97,8 @@ Each distinct `(publication, args, scope)` combination has one server-side **obs
 - `fn` is the access check for a subscription when it starts, and when the connection's `UserID` changes (log in, log out, switch user, or an expired identity), because every subscription is re-bound then. It is **not** re-run when a token refresh or session resume keeps the same `UserID`, even if `Identity.Data` (a role, say) changed, and not when access changes in the database, so neither ends a live subscription.
 - `fn` runs once per subscription, and again for each of a connection's subscriptions when its user changes. An access check that queries the database therefore costs one round trip per subscriber on the engine's loop. Keep it cheap or cached, especially for a `ScopeShared` publication with many subscribers.
 - Returning an error from `fn` ends that subscription only, with that error. Other subscriptions to the same observer keep streaming. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
+- A panic in `fn` is recovered: it ends only that subscription with `INTERNAL` and is logged with its stack trace. The server and every other subscription keep running.
+- A panic while encoding `Query.Args` (from a `driver.Valuer` or a pgx encoder) is recovered too, each time the query runs: it ends every subscription on that observer with `INTERNAL` and is logged with its stack trace. Other observers re-run in the same tick are not affected.
 - Bad args (wrong types, unknown fields) end the subscription with `BAD_REQUEST`. An unknown publication name ends it with `NOT_FOUND`.
 
 All observers that need re-running in one tick run inside one `REPEATABLE READ READ ONLY` transaction, so every update a client receives comes from one consistent database snapshot.
@@ -101,7 +107,7 @@ All observers that need re-running in one tick run inside one `REPEATABLE READ R
 
 | Field | Default | Meaning |
 |---|---|---|
-| `Tables []string` | required | Every table the query reads, as `"table"` (meaning `public.table`) or `"schema.table"`. A change to any of them re-runs the query. Each must have triggers from `InstallTriggers`. Write names exactly as Postgres stores them (normally lowercase): they are compared as strings, so `"Todos"` never matches changes to `todos`. |
+| `Tables []string` | required | Every table the query reads, as `"table"` (meaning `public.table`) or `"schema.table"`. A change to any of them re-runs the query. Each must have triggers from `InstallTriggers`. Write names exactly as Postgres stores them (normally lowercase): they are compared as strings, so `"Todos"` never matches changes to `todos`. `Start` fails if a name does not resolve or lacks triggers. |
 | `Key []string` | `["id"]` | The result columns that uniquely identify a row. They must be present in the `SELECT` list and must not be null. A missing key column fails the query with `INTERNAL`. |
 | `Unordered bool` | false | Declares that row order carries no meaning. The server then sends no positions, and the client's row order is arbitrary. Leave it false and use `ORDER BY` when order matters. |
 | `Scope Scope` | `ScopeUser` | Which connections may share one observer. See below. |
@@ -295,6 +301,7 @@ Return a `*cometgo.Error` from a method, a publication or `Authenticate` to cont
 | `CodeTimeout` | `TIMEOUT` | a publication query exceeds `QueryTimeout` |
 | `CodeCanceled` | `CANCELED` | The client cancelled the call before it committed; nothing was written. |
 | `CodeResultTooLarge` | `RESULT_TOO_LARGE` | a publication result exceeds `MaxRows` |
+| `CodeOverloaded` | `OVERLOADED` | a subscription would create a live query over `MaxObservers` |
 | `CodeUnavailable` | `UNAVAILABLE` | never |
 | `CodeInternal` | `INTERNAL` | any error that is not a `*cometgo.Error` |
 
@@ -394,7 +401,9 @@ Pass `Start` a context that outlives the shutdown signal (or `context.Background
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 defer stop()
-app.Start(context.Background()) // not ctx: it must outlive the signal
+if err := app.Start(context.Background()); err != nil { // not ctx: it must outlive the signal
+	log.Fatal(err)
+}
 // ... set up srv, then:
 <-ctx.Done()
 shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -434,4 +443,15 @@ Requirements:
 
 Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. Every notification for a table re-runs the observers that read it, except observers whose query declares [`Match`](#skipping-unaffected-re-runs-querymatch), which re-run only if the changed rows can affect them.
 
-If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.
+### Table checks at Start
+
+A publication whose table is never notified loads once and then never updates. To catch this early, `Start` checks every distinct table in every publication's `Tables` and returns an error, without starting anything, if:
+
+- no table has exactly that name (`schema.table`, compared as Postgres stores it). This covers a misspelled name, a name in the wrong case (`"Todos"` for `todos`), and an unqualified name for a table outside `public`, which is never `public.table` even when `search_path` would find it. When Postgres can resolve what the name most likely meant, the error suggests it.
+- the table lacks a `cometgo_ins`, `cometgo_upd`, `cometgo_del` or `cometgo_trunc` trigger that fires normally (disabled and replica-only triggers count as missing), or its triggers were installed under another name and the table was renamed or moved since, so they would notify under the old name. The error names the triggers; run `InstallTriggers` for the table.
+
+All failing tables are reported in one error, which `Start` also logs. Because of this check, every table must exist and have its triggers before `Start`, so run migrations and `InstallTriggers` first. The check also needs the database: if it is unreachable, `Start` fails within `QueryTimeout` instead of starting and reconnecting in the background. Retry `Start`, or exit and let your supervisor restart the process.
+
+The check runs once, at `Start`. Dropping or disabling the triggers, or dropping the table, while the server runs is not detected, and the affected subscriptions silently stop updating.
+
+If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. It reconnects after 500 ms, doubling the wait after each attempt that fails or drops soon, up to 2 s. Calls committed while it is down wait for the reconnect, so the cap keeps them under the default `FenceTimeout`. After a connection that stayed up for 30 s, the wait starts again at 500 ms. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.

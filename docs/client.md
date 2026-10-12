@@ -92,7 +92,7 @@ type SubStatus = "loading" | "ready" | "resyncing" | "ended";
 - **`loading`**: waiting for the first snapshot; `rows` is empty.
 - **`ready`**: `rows` is the server's current result.
 - **`resyncing`**: the connection dropped or is being re-established. `rows` keeps the last known data, which may be stale; dim it if you like.
-- **`ended`**: the subscription is over. Either you called `stop()`, which leaves `rows` as it was, or the server ended it, which empties `rows` and sets `error` when it was a failure (e.g. `FORBIDDEN`, `NOT_FOUND`, `RESULT_TOO_LARGE`, `TIMEOUT`).
+- **`ended`**: the subscription is over. Either you called `stop()`, which leaves `rows` as it was, or the server ended it, which empties `rows` and sets `error` when it was a failure (e.g. `FORBIDDEN`, `NOT_FOUND`, `RESULT_TOO_LARGE`, `TIMEOUT`, `OVERLOADED`).
 
 Every update from the server is applied as one transaction: all subscriptions it touches change together, and each notifies its listeners once.
 
