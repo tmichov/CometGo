@@ -1,4 +1,4 @@
-.PHONY: db todo test build gen gen-check
+.PHONY: db todo test chaos build gen gen-check
 
 db:
 	docker compose up -d
@@ -22,3 +22,7 @@ test:
 	go test ./...
 	npm run typecheck
 	npm test
+
+# Fault-injection tests, as CI runs them (needs the db and COMETGO_TEST_DATABASE_URL).
+chaos:
+	COMETGO_TEST_PG_RESTART="docker compose restart postgres" go test -race -count=3 -run TestChaos .

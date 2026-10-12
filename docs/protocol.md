@@ -365,6 +365,8 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 | `maxMsg` | 1 MiB | |
 | Per-observer row cap | 10,000 | Sub ends with `RESULT_TOO_LARGE`. |
 | Observer query hard timeout | 30 s | Sub ends with `TIMEOUT`. |
+| Server-wide observers | no limit | A sub that needs a new observer ends with `OVERLOADED`; a sub that joins an existing observer (same publication, args and scope) is unaffected. Not advertised: it depends on other clients. |
+| Open connections, total and per client IP | no limit | The upgrade is refused with HTTP 503 before any `welcome`; the client treats it as a failed connect and retries with backoff. Not advertised. |
 | **[later]** per-method rate limits | | Token bucket. |
 
 ### 8.4 [later] Slow observers
@@ -388,7 +390,7 @@ Cancel-and-retry is rejected because a query that always exceeds the deadline wo
 |---|---|
 | Request and auth | `BAD_REQUEST`, `VALIDATION` (`details.fields`), `UNAUTHENTICATED`, `AUTH_EXPIRED`, `FORBIDDEN` |
 | Data | `NOT_FOUND`, `CONFLICT` |
-| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE` |
+| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE`, `OVERLOADED` (server-wide capacity; retrying later may succeed) |
 | Server and connection | `UNAVAILABLE`, `INTERNAL` (`details.ref` is a log correlation ID; internals are never leaked), `CONNECTION_LOST` (synthesized by the client) |
 
 Application-defined codes are namespaced `app.<name>`.
@@ -433,7 +435,7 @@ Types are described once per sub in `init.cols`, and values are plain JSON. Ther
 
 Not part of the wire protocol. Specified here because the consistency guarantees depend on it.
 
-All notifications use channel `comet`. Payload fields are separated by `|`, and the JSON part is always last.
+Change and fence notifications use channel `comet`. Events (§4.5) use `comet_evt`, and `App.Revalidate` re-checks use `comet_reval` (the payload is the user ID); both are delivered to every node's listener. On `comet`, payload fields are separated by `|`, and the JSON part is always last.
 
 | Kind | Payload | Example |
 |---|---|---|
@@ -454,7 +456,7 @@ All notifications use channel `comet`. Payload fields are separated by `|`, and 
 - A dirty observer re-runs its full query. An observer whose query declares a single-table equality predicate (`Query.Match` on the server) is dirtied by a row notification only if a changed row, read once per tick by PK inside the snapshot, matches the predicate, or its current result holds a changed PK. Table-dirty notifications and anything the server cannot evaluate re-run it as before.
 - A minimum interval between ticks (default 20 ms, `Config.MinTickInterval`) coalesces bursts.
 
-**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped.
+**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped. `comet_reval` re-checks are lost too, so the same tick re-runs the publication fn of every subscription, before it releases fences.
 
 Every node receives every fence and ignores the tokens it does not own.
 

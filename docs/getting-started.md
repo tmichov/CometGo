@@ -87,7 +87,9 @@ cometgo.Method(app, "todos.add", func(c *cometgo.Call, a addArgs) (added, error)
 ### 5. Serving
 
 ```go
-app.Start(ctx)
+if err := app.Start(ctx); err != nil {
+	log.Fatal(err)
+}
 
 mux := http.NewServeMux()
 mux.Handle("/_comet", app)               // the WebSocket endpoint
