@@ -725,7 +725,9 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 			// Encoding Query.Args runs user code (driver.Valuer, pgx
 			// encoders) on the engine goroutine; a panic there fails only
 			// this observer. pgx encodes before sending, so sp is still
-			// usable for the rollback.
+			// usable for the rollback. A panic after sending (decoding
+			// rows) is caught too; rows.Close drains the result first, and
+			// if the rollback fails anyway the tick retries.
 			defer func() {
 				if p := recover(); p != nil {
 					qerr = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
