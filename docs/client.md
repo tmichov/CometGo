@@ -2,11 +2,10 @@
 
 The TypeScript client lives in [`client/`](../client) as the package `@cometgo/client`. It has no runtime dependencies. It is built to ES modules with type declarations in `client/dist`, and has two entry points: `@cometgo/client` (this page) and `@cometgo/client/react` (the [React bindings](react.md)). Only the second one imports React, which is an optional peer dependency.
 
-The package is not on npm yet. To use it from another app, build a tarball and install that:
+Install it from npm:
 
 ```sh
-cd path/to/cometgo/client && npm pack   # builds dist/, writes cometgo-client-0.1.0.tgz here
-cd path/to/my-app && npm install path/to/cometgo/client/cometgo-client-0.1.0.tgz
+npm install @cometgo/client
 ```
 
 Inside this repository, `client` is an npm workspace, so `npm install` at the root links it into `node_modules/@cometgo/client` and the todo example imports it by name. The link points at the built `dist/`, so run `npm run build:client` (or `npm run build` / `npm run typecheck`, which do it first) after changing `client/src`.
