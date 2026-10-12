@@ -1,4 +1,4 @@
-import { type CallRest, CometError, connect, type MethodArgs, type MethodName } from "../../../../client/src/index.ts";
+import { type CallRest, CometError, connect, type MethodArgs, type MethodName } from "@cometgo/client";
 // Generated from the Go server: go run ./examples/todo -gen
 import type { Schema } from "./schema.ts";
 

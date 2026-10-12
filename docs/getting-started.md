@@ -10,7 +10,7 @@
 
 ```sh
 make db       # starts Postgres 17 on localhost:54329 (user, password and database: comet)
-npm install   # esbuild and TypeScript
+npm install   # esbuild and TypeScript; links the client workspace
 make todo     # bundles the UI, then runs go run ./examples/todo
 ```
 
@@ -25,7 +25,7 @@ The example reads two environment variables:
 
 ## How the example is built
 
-The server is [`examples/todo/main.go`](../examples/todo/main.go). The browser code is [`examples/todo/web/src/main.ts`](../examples/todo/web/src/main.ts), which `npm run build` bundles into `web/public/app.js`. The Go binary embeds `web/public` and serves it.
+The server is [`examples/todo/main.go`](../examples/todo/main.go). The browser code is [`examples/todo/web/src/main.ts`](../examples/todo/web/src/main.ts), which imports the client as `@cometgo/client`. `npm run build` builds the client to `client/dist`, then bundles the example into `web/public/app.js`. The Go binary embeds `web/public` and serves it.
 
 ### 1. Schema and change feed
 
