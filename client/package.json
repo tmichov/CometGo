@@ -10,11 +10,11 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "default": "./dist/index.js"
     },
     "./react": {
       "types": "./dist/react.d.ts",
-      "import": "./dist/react.js"
+      "default": "./dist/react.js"
     },
     "./package.json": "./package.json"
   },
@@ -24,7 +24,7 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && node build-dts.mjs",
     "prepack": "npm run build"
   },
   "peerDependencies": {
