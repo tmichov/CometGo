@@ -1,9 +1,13 @@
 {
   "private": true,
   "type": "module",
+  "workspaces": [
+    "client"
+  ],
   "scripts": {
-    "build": "esbuild app=examples/todo/web/src/main.ts react=examples/todo/web/src/react-main.tsx --bundle --format=esm --target=es2022 --jsx=automatic --define:process.env.NODE_ENV='\"production\"' --outdir=examples/todo/web/public",
-    "typecheck": "tsc -p client",
+    "build": "npm run build:client && esbuild app=examples/todo/web/src/main.ts react=examples/todo/web/src/react-main.tsx --bundle --format=esm --target=es2022 --jsx=automatic --define:process.env.NODE_ENV='\"production\"' --outdir=examples/todo/web/public",
+    "build:client": "npm run build -w @cometgo/client",
+    "typecheck": "npm run build:client && tsc -p client",
     "test": "node --test \"client/test/*.test.ts\""
   },
   "devDependencies": {

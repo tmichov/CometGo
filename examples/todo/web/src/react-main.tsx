@@ -3,8 +3,8 @@
 
 import { type FormEvent, StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { type CallRest, CometError, connect, type MethodArgs, type MethodName } from "../../../../client/src/index.ts";
-import { CometProvider, hooksFor, useConnection } from "../../../../client/src/react.ts";
+import { type CallRest, CometError, connect, type MethodArgs, type MethodName } from "@cometgo/client";
+import { CometProvider, hooksFor, useConnection } from "@cometgo/client/react";
 // Generated from the Go server: go run ./examples/todo -gen
 import type { Schema } from "./schema.ts";
 

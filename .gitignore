@@ -22,3 +22,6 @@ examples/*/web/public/react.js
 
 # Local Claude Code settings
 .claude/
+
+# npm pack output
+*.tgz

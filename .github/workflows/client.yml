@@ -1,0 +1,24 @@
+name: client
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # typecheck builds client/dist first, then checks the client, its tests and the todo example against it.
+      - run: npm run typecheck
+      - run: npm test
+      - name: Bundle the todo example
+        run: npm run build
+      - name: Pack
+        run: npm pack -w @cometgo/client --dry-run
