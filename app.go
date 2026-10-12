@@ -225,6 +225,11 @@ func New(cfg Config) *App {
 	if cfg.DB == nil {
 		panic("cometgo: Config.DB is required")
 	}
+	// A tick holds one connection for its snapshot while resolveTypes acquires
+	// a second; with one connection that Acquire waits forever.
+	if cfg.DB.Config().MaxConns < 2 {
+		panic("cometgo: Config.DB needs MaxConns >= 2 (pool_max_conns)")
+	}
 	def := func(d *time.Duration, v time.Duration) {
 		if *d <= 0 {
 			*d = v
