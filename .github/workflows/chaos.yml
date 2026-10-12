@@ -8,11 +8,23 @@ on:
 jobs:
   chaos:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor go.mod declares (pgx v5.11 needs 1.25), and the newest release.
+        go: [floor, stable]
+    name: chaos (go ${{ matrix.go }})
+    env:
+      # Never switch to a newer toolchain behind our back: the floor job must build with the floor.
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ matrix.go == 'floor' && 'go.mod' || '' }}
+          go-version: ${{ matrix.go == 'stable' && 'stable' || '' }}
+      - name: Vet
+        run: go vet ./...
       # A plain container rather than a service, so the tests can restart it.
       - name: Start Postgres
         run: |

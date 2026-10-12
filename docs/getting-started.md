@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Go 1.26 or newer
+- Go 1.25 or newer
 - Node 22.18 or newer (to build the example UI and run the client tests; the tests run `.ts` files directly, which needs Node's built-in type stripping)
 - Docker (for the local Postgres)
 
