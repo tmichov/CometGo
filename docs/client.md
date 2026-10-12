@@ -138,7 +138,7 @@ await comet.setToken(accessToken); // log in, or refresh; resolves with comet.us
 await comet.setToken(null);        // log out
 ```
 
-`setToken` resolves with the new `comet.user`, or rejects with a `CometError` such as `UNAUTHENTICATED`. A rejected token leaves the connection anonymous, logging out any previous user. If the client is not connected, `setToken` only stores the token for the next connection and resolves with the current `user`.
+`setToken` resolves with the new `comet.user`, or rejects with a `CometError` such as `UNAUTHENTICATED`. A rejected token changes nothing on the connection: the current user stays logged in, with the same subscriptions, until their identity expires or you call `setToken(null)`. The rejected token is still stored for the next connection, so if the connection drops before you set a working token, it reconnects with the rejected one (anonymous for a bad token). If the client is not connected, `setToken` only stores the token for the next connection and resolves with the current `user`.
 
 When the user changes, the server resets every subscription to the new user's data in one update; subscriptions the new user may not read end with an error.
 

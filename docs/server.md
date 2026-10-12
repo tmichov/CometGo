@@ -375,7 +375,7 @@ Called with the token the client sends when it connects and every time it calls 
 
 - Return an identity to accept the token.
 - Return a `*cometgo.Error` (typically `UNAUTHENTICATED`) to reject it with that error, or `(nil, nil)` to reject it as `UNAUTHENTICATED`.
-- An invalid token never closes the connection: the connection continues as anonymous and the client is told the token was rejected.
+- An invalid token never closes the connection. At connect, the connection continues as anonymous and the client is told the token was rejected. On `setToken`, any error (a rejection, or a failure such as a timeout reaching your auth store) leaves the current identity and its subscriptions in place until it expires; only the client's `setToken(null)` logs out.
 
 When the identity changes (login, logout, a different user), every subscription on the connection is re-bound to the new identity and reset in one atomic update. Subscriptions the new identity may not read end with the error their publication returns. Calls already running keep the identity they started with. A refresh that keeps the same `UserID` and `ScopeKey` changes nothing on the connection's subscriptions; a change of `ScopeKey` alone (another tenant) counts as a different identity.
 

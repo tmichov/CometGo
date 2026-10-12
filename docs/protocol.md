@@ -95,6 +95,7 @@ The handshake is **pipelined**: the client may send `sub`/`call` immediately aft
   - ends subs the new identity may not access (`end:{code:"FORBIDDEN"}`).
 
   `authRes` is sent **after** that `tx`. The UI moves from user A's world to user B's world in one render. **[later]**: minimal diff rebind instead of resets.
+- **Failed auth** (the token is rejected with `UNAUTHENTICATED`, is not a string, or `Authenticate` fails, e.g. with `INTERNAL`) changes nothing: the server answers `{"t":"authRes","seq":…,"id":3,"ok":false,"err":{…}}` and keeps the current identity, its subscriptions and its expiry. A rejected new token says nothing about the old one, so a definitive `UNAUTHENTICATED` is treated the same as a transient error. The session is downgraded only when the old identity expires (`AUTH_EXPIRED`, below) or the client logs out with `token:null`. The client keeps its current user.
 - **In-flight calls** keep running under the identity they were received with.
 - **Expiry without refresh** is treated like logout. The server pushes an `authRes` with no `id`: `{"t":"authRes","seq":…,"ok":false,"err":{"code":"AUTH_EXPIRED"}}`. The client library refreshes proactively at about 80% of the token lifetime.
 - **Token refresh flow.** The access token is short-lived. A refresh token lives in an httpOnly cookie and is used only by the HTTP endpoint `/_comet/auth/refresh`.

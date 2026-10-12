@@ -543,15 +543,15 @@ export class Comet {
       }
       case "authRes": {
         this.#seq = msg.seq;
-        if (msg.ok || msg.id === undefined) this.user = msg.ok ? (msg.user ?? null) : null;
+        // A failed setToken keeps the current user; only an unsolicited
+        // failure (expiry) downgrades to anonymous (§3.2).
+        if (msg.ok) this.user = msg.user ?? null;
+        else if (msg.id === undefined) this.user = null;
         if (msg.id !== undefined) {
           const a = this.#auths.get(msg.id);
           this.#auths.delete(msg.id);
           if (msg.ok) a?.resolve(this.user);
-          else {
-            this.user = null;
-            a?.reject(new CometError(msg.err));
-          }
+          else a?.reject(new CometError(msg.err));
         }
         this.#emit();
         return;
