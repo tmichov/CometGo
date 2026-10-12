@@ -92,7 +92,10 @@ func (c *Call) RevalidateAfterCommit(userID string) error {
 	if userID == "" {
 		return nil
 	}
-	_, err := c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2)", revalChannel, userID)
+	// txid_current gives the transaction an ID even if the method writes
+	// nothing else, so a server that skips the fence for ID-less calls
+	// still sends the end before the res. pg_notify alone assigns none.
+	_, err := c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2), txid_current()", revalChannel, userID)
 	return err
 }
 
