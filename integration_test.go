@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +29,34 @@ type testEnv struct {
 	table string
 	// slowRuns counts executions of the "slowAdd" method.
 	slowRuns atomic.Int32
+}
+
+// testLog is the server's log output in tests. It writes to t.Output(), so
+// the logs show only for a failing test or under -v, and drops writes once
+// the test has finished: the engine's goroutines can outlive it, and a write
+// to t.Output() after that panics.
+type testLog struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func newTestLog(t testing.TB) *testLog {
+	l := &testLog{w: t.Output()}
+	t.Cleanup(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.w = nil
+	})
+	return l
+}
+
+func (l *testLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.w == nil {
+		return len(p), nil
+	}
+	return l.w.Write(p)
 }
 
 func setup(t testing.TB) *testEnv {
@@ -47,6 +78,7 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 	if dsn == "" {
 		t.Skip("COMETGO_TEST_DATABASE_URL not set")
 	}
+	logs := newTestLog(t) // first, so its cleanup runs last and shutdown logs still show
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	pool, err := pgxpool.New(ctx, dsn)
@@ -70,6 +102,7 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 	cfg := Config{
 		DB:              pool,
 		MinTickInterval: 5 * time.Millisecond,
+		Logger:          slog.New(slog.NewTextHandler(logs, nil)),
 		Authenticate: func(ctx context.Context, token string) (*Identity, error) {
 			switch token {
 			case "alice", "bob":
