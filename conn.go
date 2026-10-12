@@ -817,11 +817,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		val = stored
 	} else {
 		result, err := func() (r any, err error) {
-			defer func() {
-				if p := recover(); p != nil {
-					err = fmt.Errorf("panic: %v", p)
-				}
-			}()
+			defer recoverErr(&err)
 			return m.run(&Call{Context: hctx, Identity: ident, Tx: tx, app: c.a}, msg.Args)
 		}()
 		// A cancel that arrived before this point rolls back, whatever the

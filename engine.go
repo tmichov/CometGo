@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -697,11 +696,7 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	// joining sub's Query is discarded. fn runs on the engine goroutine, so
 	// a panic would take down the process; end only this sub instead.
 	q, err := func() (q Query, err error) {
-		defer func() {
-			if p := recover(); p != nil {
-				err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
-			}
-		}()
+		defer recoverErr(&err)
 		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
 	}()
 	if err != nil {
@@ -727,11 +722,7 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 func (e *engine) recheck(ctx context.Context, sub *subscription, ident *Identity) *Error {
 	pub := e.a.pubs[sub.name]
 	_, err := func() (q Query, err error) {
-		defer func() {
-			if p := recover(); p != nil {
-				err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
-			}
-		}()
+		defer recoverErr(&err)
 		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
 	}()
 	if err != nil {
@@ -768,7 +759,12 @@ type runResult struct {
 // candidate the changed rows can affect. Results are staged and applied only
 // once the snapshot transaction has committed, so a failure leaves every
 // observer exactly as it was.
-func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange) error {
+func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange) (err error) {
+	// Pool hooks and tracers (BeforeAcquire, PrepareConn, ConnConfig.Tracer)
+	// run user code in BeginTx, the SET LOCAL and the candidate filter. A
+	// panic there fails the tick, which tick retries like a lost snapshot.
+	// The per-observer recover below still isolates one observer's query.
+	defer recoverErr(&err)
 	tx, err := e.a.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
@@ -806,11 +802,7 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 			// usable for the rollback. A panic after sending (decoding
 			// rows) is caught too; rows.Close drains the result first, and
 			// if the rollback fails anyway the tick retries.
-			defer func() {
-				if p := recover(); p != nil {
-					qerr = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
-				}
-			}()
+			defer recoverErr(&qerr)
 			r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
 		}()
 		if e.a.cfg.Metrics != nil {

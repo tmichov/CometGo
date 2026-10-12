@@ -83,13 +83,12 @@ func Describe(ctx context.Context, a *App, opts DescribeOptions) (*Schema, error
 	return s, nil
 }
 
-func (e *engine) describeQuery(ctx context.Context, p *publication, ident *Identity) ([]ColSchema, error) {
+func (e *engine) describeQuery(ctx context.Context, p *publication, ident *Identity) (_ []ColSchema, err error) {
+	// Query.Args encoding (driver.Valuer, pgx encoders) and pool hooks run
+	// user code in the queries below.
+	defer recoverErr(&err)
 	q, err := func() (q Query, err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("panic: %v", r)
-			}
-		}()
+		defer recoverErr(&err)
 		return p.build(&SubCtx{Context: ctx, Identity: ident}, json.RawMessage("null"))
 	}()
 	if err != nil {

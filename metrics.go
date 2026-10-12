@@ -1,6 +1,9 @@
 package cometgo
 
-import "time"
+import (
+	"runtime/debug"
+	"time"
+)
 
 // Metric is one measurement passed to Config.Metrics. Durations are in
 // seconds; counts and gauges are plain numbers.
@@ -36,7 +39,7 @@ func (a *App) metric(name, pub string, v float64) {
 	}
 	defer func() {
 		if p := recover(); p != nil {
-			a.log.Error("metrics hook panicked", "metric", name, "panic", p)
+			a.log.Error("metrics hook panicked", "metric", name, "panic", p, "stack", string(debug.Stack()))
 		}
 	}()
 	m(Metric{Name: name, Pub: pub, Value: v})
