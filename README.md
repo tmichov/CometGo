@@ -26,10 +26,12 @@ Open the page in two tabs: changes appear in both.
 - [Server](docs/server.md): the Go API
 - [Client](docs/client.md): the TypeScript API
 - [Wire protocol](docs/protocol.md)
+- [Known limitations](docs/limitations.md)
+- [Stability policy](docs/stability.md)
 
 ## Status
 
-v1-core is implemented (see [protocol §12](docs/protocol.md#12-scope)), plus session resume, idempotency keys, ephemeral events and coalescing backpressure. Optimistic UI is specified but not implemented yet.
+v1-core is implemented (see [protocol §12](docs/protocol.md#12-scope)), plus session resume, idempotency keys, ephemeral events and coalescing backpressure. Optimistic UI is specified but not implemented yet. Before using it, read the [known limitations](docs/limitations.md); the API may still change before 1.0 ([stability policy](docs/stability.md)).
 
 ## License
 
