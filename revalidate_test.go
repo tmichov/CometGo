@@ -2,8 +2,10 @@ package cometgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http/httptest"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"sync"
@@ -321,5 +323,70 @@ func TestRevalidateAfterCommitLostWhileListenerDown(t *testing.T) {
 	}
 	if e.listened() == before {
 		t.Fatal("listener did not reconnect")
+	}
+}
+
+// Revalidate requests drained in one tick are merged: fn runs once per sub
+// however many requests name the user.
+func TestRevalidateDedupesPerTick(t *testing.T) {
+	var calls atomic.Int64
+	e := setupFull(t, nil, func(env *testEnv, app *App) {
+		Publish(app, "counted", PubOptions{Tables: []string{env.table}, Scope: ScopeShared},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				calls.Add(1)
+				return Query{SQL: "SELECT id FROM " + env.table + " ORDER BY id"}, nil
+			})
+	})
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	subscribe(t, a, 1, "counted")
+	subscribe(t, a, 2, "counted")
+	calls.Store(0)
+
+	// Queued under one lock, so a single tick drains all of them.
+	eng := e.app.engine
+	eng.mu.Lock()
+	for range 50 {
+		eng.reqs = append(eng.reqs, revalidateReq{users: map[string]bool{"alice": true}})
+	}
+	eng.reqs = append(eng.reqs, revalidateReq{users: map[string]bool{"bob": true}})
+	eng.mu.Unlock()
+	eng.signal()
+	// The call's fence is released by a tick that drained the requests.
+	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "n"}})
+	for m := a.next(); m["t"] != "res"; m = a.next() {
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("fn ran %d times for 2 subs, want 2", n)
+	}
+}
+
+// An over-long user ID is refused with ErrUserIDTooLong before anything is
+// sent, so the method's transaction stays usable and its writes commit.
+func TestRevalidateUserIDTooLong(t *testing.T) {
+	long := strings.Repeat("u", maxNotifyPayload+1)
+	e := setupFull(t, nil, func(env *testEnv, app *App) {
+		Method(app, "revalLong", func(c *Call, _ struct{}) (string, error) {
+			if err := c.RevalidateAfterCommit(long); !errors.Is(err, ErrUserIDTooLong) {
+				return "", fmt.Errorf("RevalidateAfterCommit: %v", err)
+			}
+			if _, err := c.Tx.Exec(c.Context, "INSERT INTO "+env.table+" (owner, name) VALUES ('x', 'after-long')"); err != nil {
+				return "", err
+			}
+			return "ok", nil
+		})
+	})
+	if err := e.app.Revalidate(context.Background(), long); !errors.Is(err, ErrUserIDTooLong) {
+		t.Fatalf("Revalidate: %v", err)
+	}
+	if err := e.app.Revalidate(context.Background(), strings.Repeat("u", maxNotifyPayload)); err != nil {
+		t.Fatalf("Revalidate at the limit: %v", err)
+	}
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "call", "id": 1, "m": "revalLong", "noFence": true})
+	if got := okRes(t, a.next(), 1); got != "ok" {
+		t.Fatalf("res %v", got)
+	}
+	if n := e.countRows(t, "SELECT count(*) FROM "+e.table+" WHERE name = 'after-long'"); n != 1 {
+		t.Fatalf("method's write: %d rows", n)
 	}
 }

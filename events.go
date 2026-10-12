@@ -23,6 +23,14 @@ const maxEvtPayload = 7500
 // event exceeds the 7,500-byte notification limit. Nothing is sent.
 var ErrEventTooLarge = errors.New("cometgo: event too large")
 
+// ErrUserIDTooLong is returned by Revalidate and RevalidateAfterCommit for a
+// userID of 8,000 bytes or more, which a Postgres notification cannot carry.
+// Nothing is sent, and the method's transaction is not touched.
+var ErrUserIDTooLong = errors.New("cometgo: revalidate: user ID too long")
+
+// maxNotifyPayload is the longest pg_notify payload Postgres accepts.
+const maxNotifyPayload = 7999
+
 type evtMsg struct {
 	T     string          `json:"t"`
 	Seq   uint64          `json:"seq"`
@@ -77,6 +85,9 @@ func (a *App) Revalidate(ctx context.Context, userID string) error {
 	if userID == "" {
 		return nil // anonymous sessions have no per-user permission to revoke
 	}
+	if len(userID) > maxNotifyPayload {
+		return ErrUserIDTooLong
+	}
 	_, err := a.db.Exec(ctx, "SELECT pg_notify($1, $2)", revalChannel, userID)
 	return err
 }
@@ -91,6 +102,9 @@ func (c *Call) RevalidateAfterCommit(userID string) error {
 	}
 	if userID == "" {
 		return nil
+	}
+	if len(userID) > maxNotifyPayload {
+		return ErrUserIDTooLong // checked here: a failed pg_notify would abort c.Tx
 	}
 	// txid_current gives the transaction an ID even if the method writes
 	// nothing else, so a server that skips the fence for ID-less calls
