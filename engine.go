@@ -669,7 +669,7 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	if pub == nil {
 		return NewError(CodeNotFound, "unknown publication "+sub.name)
 	}
-	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
+	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.Scope()))
 	// fn runs for every sub, not only the observer's first: it may check
 	// access for this caller. The key already determines the query, so a
 	// joining sub's Query is discarded.
