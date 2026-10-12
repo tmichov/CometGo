@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http/httptest"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -260,5 +262,64 @@ func TestRevalidateReachesOtherNode(t *testing.T) {
 	}
 	if en := entries(b.next()); en[0]["s"] != float64(1) || en[0]["ops"] == nil {
 		t.Fatalf("bob on the other node: %v", en)
+	}
+}
+
+// A RevalidateAfterCommit whose notification is lost, because the method
+// commits while the listener is down, is caught up by the reconnect tick:
+// the revoked sub still ends, ahead of the method's res.
+func TestRevalidateAfterCommitLostWhileListenerDown(t *testing.T) {
+	var members string
+	appName := "cometgo_test_" + newID(4)
+	e := setupFull(t, func(c *Config) {
+		cfg := c.DB.Config()
+		cfg.ConnConfig.RuntimeParams["application_name"] = appName
+		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		c.DB = pool
+	}, dbTeam(t, &members))
+	e.waitListening(t)
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "dbteam"})
+	if en := entries(a.next()); en[0]["ready"] != true {
+		t.Fatalf("snapshot %v", en)
+	}
+
+	ctx := context.Background()
+	before := e.listened()
+	var pid int32
+	if err := e.pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
+		WHERE application_name = $1 AND query LIKE 'LISTEN %'`, appName).Scan(&pid); err != nil {
+		t.Fatalf("find listener: %v", err)
+	}
+	if _, err := e.pool.Exec(ctx, "SELECT pg_terminate_backend($1)", pid); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		var alive bool
+		if err := e.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)", pid).Scan(&alive); err != nil {
+			t.Fatal(err)
+		}
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("listener backend did not exit")
+		}
+	}
+
+	// Commits inside the listener's 500ms reconnect backoff.
+	a.send(map[string]any{"t": "call", "id": 1, "m": "leave", "args": map[string]any{"User": "alice"}})
+	if en := entries(a.next()); len(en) != 1 || en[0]["s"] != float64(1) || !isForbiddenEnd(en[0]) {
+		t.Fatalf("expected the end before res, got %v", en)
+	}
+	if r := a.next(); r["t"] != "res" || r["ok"] != true || r["lag"] == true {
+		t.Fatalf("leave res %v", r)
+	}
+	if e.listened() == before {
+		t.Fatal("listener did not reconnect")
 	}
 }
