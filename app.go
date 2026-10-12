@@ -199,16 +199,31 @@ func New(cfg Config) *App {
 // cleanup until ctx is done or Shutdown stops them. Shutdown needs them
 // running while it drains, so with Shutdown pass a ctx that outlives the
 // shutdown signal. After Shutdown, Start does nothing.
-func (a *App) Start(ctx context.Context) {
+//
+// Start first checks that every table in a publication's Tables exists under
+// exactly that name and has the triggers InstallTriggers creates, and returns
+// an error without starting anything if not. The check needs the database:
+// if it is unreachable, Start fails after at most Config.QueryTimeout. A
+// later Start may retry.
+func (a *App) Start(ctx context.Context) error {
 	a.startMu.Lock()
 	defer a.startMu.Unlock()
 	if a.started {
 		panic("cometgo: Start called twice")
 	}
-	a.started = true
 	if a.shutting.Load() {
-		return
+		a.started = true
+		return nil
 	}
+	checkCtx, cancel := context.WithTimeout(ctx, a.cfg.QueryTimeout)
+	defer cancel()
+	if err := a.checkTables(checkCtx); err != nil {
+		// Logged too: a caller that ignores the error would otherwise serve
+		// an app with no engine, and no clue why.
+		a.log.Error("start failed", "err", err)
+		return err
+	}
+	a.started = true
 	ctx, a.stop = context.WithCancel(ctx)
 	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
 		a.running.Add(1)
@@ -217,6 +232,7 @@ func (a *App) Start(ctx context.Context) {
 			run(ctx)
 		}()
 	}
+	return nil
 }
 
 // Scope controls which connections share one observer of a publication.

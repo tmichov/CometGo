@@ -163,7 +163,9 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 	if extra != nil {
 		extra(env, app)
 	}
-	app.Start(ctx)
+	if err := app.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(app)
 	t.Cleanup(srv.Close)
 	env.app, env.srv = app, srv

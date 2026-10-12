@@ -73,7 +73,9 @@ func main() {
 	}
 
 	// The app outlives ctx: Shutdown stops it once the signal arrives.
-	app.Start(context.Background())
+	if err := app.Start(context.Background()); err != nil {
+		log.Fatal(err)
+	}
 
 	public, err := fs.Sub(webFS, "web/public")
 	if err != nil {
