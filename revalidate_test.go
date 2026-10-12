@@ -94,11 +94,13 @@ func TestRevalidateReachesDetachedSession(t *testing.T) {
 	a.send(map[string]any{"t": "sub", "s": 2, "name": "items.mine"})
 	last := a.next()
 	a.kill()
-	time.Sleep(50 * time.Millisecond)
+	c := e.session(t, w["session"])
+	waitConn(t, c, "detached", func() bool { return c.sock == nil })
 
 	m.revoke("alice")
 	e.revalidate(t, "alice")
-	time.Sleep(100 * time.Millisecond)
+	// The end gets the next seq once the engine has re-checked the session.
+	waitConn(t, c, "the end", func() bool { return c.seq > seqOf(last) })
 
 	b, w2 := e.dial(t, resumeHello(map[string]any{
 		"auth":   map[string]any{"token": "alice"},
@@ -273,7 +275,50 @@ func TestRevalidateReachesOtherNode(t *testing.T) {
 func TestRevalidateAfterCommitLostWhileListenerDown(t *testing.T) {
 	var members string
 	appName := "cometgo_test_" + newID(4)
-	e := setupFull(t, func(c *Config) {
+	e := setupFull(t, namedPool(t, appName), dbTeam(t, &members))
+	e.waitListening(t)
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "dbteam"})
+	if en := entries(a.next()); en[0]["ready"] != true {
+		t.Fatalf("snapshot %v", en)
+	}
+
+	before := e.listened()
+	e.killListener(t, appName)
+
+	// Commits inside the listener's 500ms reconnect backoff.
+	a.send(map[string]any{"t": "call", "id": 1, "m": "leave", "args": map[string]any{"User": "alice"}})
+	if en := entries(a.next()); len(en) != 1 || en[0]["s"] != float64(1) || !isForbiddenEnd(en[0]) {
+		t.Fatalf("expected the end before res, got %v", en)
+	}
+	if r := a.next(); r["t"] != "res" || r["ok"] != true || r["lag"] == true {
+		t.Fatalf("leave res %v", r)
+	}
+	if e.listened() == before {
+		t.Fatal("listener did not reconnect")
+	}
+}
+
+// waitConn polls cond under c.mu until it holds, failing after 5s.
+func waitConn(t *testing.T, c *conn, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		c.mu.Lock()
+		ok := cond()
+		c.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session never reached %s", what)
+		}
+	}
+}
+
+// namedPool gives the app its own pool tagged with appName, so a test can
+// find and kill the app's LISTEN backend (killListener).
+func namedPool(t *testing.T, appName string) func(*Config) {
+	return func(c *Config) {
 		cfg := c.DB.Config()
 		cfg.ConnConfig.RuntimeParams["application_name"] = appName
 		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
@@ -282,16 +327,15 @@ func TestRevalidateAfterCommitLostWhileListenerDown(t *testing.T) {
 		}
 		t.Cleanup(pool.Close)
 		c.DB = pool
-	}, dbTeam(t, &members))
-	e.waitListening(t)
-	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
-	a.send(map[string]any{"t": "sub", "s": 1, "name": "dbteam"})
-	if en := entries(a.next()); en[0]["ready"] != true {
-		t.Fatalf("snapshot %v", en)
 	}
+}
 
+// killListener terminates the LISTEN backend of the app whose pool is
+// tagged appName and waits until it has exited. The engine reconnects after
+// a 500ms backoff.
+func (e *testEnv) killListener(t *testing.T, appName string) {
+	t.Helper()
 	ctx := context.Background()
-	before := e.listened()
 	var pid int32
 	if err := e.pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
 		WHERE application_name = $1 AND query LIKE 'LISTEN %'`, appName).Scan(&pid); err != nil {
@@ -306,21 +350,80 @@ func TestRevalidateAfterCommitLostWhileListenerDown(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !alive {
-			break
+			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("listener backend did not exit")
 		}
 	}
+}
 
-	// Commits inside the listener's 500ms reconnect backoff.
-	a.send(map[string]any{"t": "call", "id": 1, "m": "leave", "args": map[string]any{"User": "alice"}})
-	if en := entries(a.next()); len(en) != 1 || en[0]["s"] != float64(1) || !isForbiddenEnd(en[0]) {
-		t.Fatalf("expected the end before res, got %v", en)
+// Revocation through a join table (docs/server.md, Authorization): deleting
+// the membership row empties the user's result, also when it commits while
+// the listener is down, once the listener is back.
+func TestJoinTableRevocation(t *testing.T) {
+	var members string
+	appName := "cometgo_test_" + newID(4)
+	e := setupFull(t, namedPool(t, appName), func(env *testEnv, app *App) {
+		members = env.table + "_m"
+		ctx := context.Background()
+		if _, err := env.pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s (team text, user_id text, PRIMARY KEY (team, user_id))`, members)); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { env.pool.Exec(context.Background(), "DROP TABLE "+members) })
+		if err := InstallTriggers(ctx, env.pool, members); err != nil {
+			t.Fatal(err)
+		}
+		Publish(app, "joined", PubOptions{Tables: []string{env.table, members}}, func(c *SubCtx, _ struct{}) (Query, error) {
+			if c.Identity == nil {
+				return Query{}, ErrForbidden
+			}
+			return Query{SQL: "SELECT i.id, i.name FROM " + env.table + " i JOIN " + members +
+				" m ON m.team = i.owner WHERE m.user_id = $1 ORDER BY i.id", Args: []any{c.Identity.UserID}}, nil
+		})
+	})
+	ctx := context.Background()
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := e.pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if r := a.next(); r["t"] != "res" || r["ok"] != true || r["lag"] == true {
-		t.Fatalf("leave res %v", r)
+	exec("INSERT INTO " + e.table + " (owner, name) VALUES ('t1', 'secret')")
+	grant := "INSERT INTO " + members + " VALUES ('t1', 'alice')"
+	revoke := "DELETE FROM " + members + " WHERE user_id = 'alice'"
+	exec(grant)
+	e.waitListening(t)
+
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	rows := subRows{}
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "joined"})
+	rows.apply(t, a.next())
+	// waitRows reads tx until sub 1 holds n rows; an end fails the test.
+	waitRows := func(n int, what string) {
+		t.Helper()
+		for len(rows[1]) != n {
+			m := a.next()
+			if en := entries(m); len(en) > 0 && en[0]["end"] != nil {
+				t.Fatalf("%s: sub ended: %v", what, en[0])
+			}
+			rows.apply(t, m)
+		}
 	}
+	waitRows(1, "snapshot")
+
+	exec(revoke)
+	waitRows(0, "live revoke")
+	exec(grant)
+	waitRows(1, "grant")
+
+	before := e.listened()
+	e.killListener(t, appName)
+	exec(revoke) // inside the listener's reconnect backoff: its notification is lost
+	if e.listened() != before {
+		t.Fatal("listener reconnected before the revoke committed; the lost-notification path was not exercised")
+	}
+	waitRows(0, "revoke while the listener was down")
 	if e.listened() == before {
 		t.Fatal("listener did not reconnect")
 	}
