@@ -158,11 +158,13 @@ type rebindReq struct {
 	after sequenced
 }
 
-// revalidateReq re-runs fn for every sub of every session whose identity
-// has userID (every session, if all), ending those it now rejects.
+// revalidateReq re-runs fn for every sub of every session whose identity's
+// UserID is in users (every session, if all), ending those it now rejects.
+// tick merges a drain's requests into one, so each sub is re-checked at most
+// once per tick however many Revalidate calls named its user.
 type revalidateReq struct {
-	userID string
-	all    bool
+	users map[string]bool
+	all   bool
 }
 
 func newEngine(a *App) *engine {
@@ -361,15 +363,23 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		return o
 	}
 
+	// Re-checks (comet_reval) sent while nobody listened are lost too, so
+	// a tick after a reconnect re-checks every sub, as it re-runs every
+	// observer. They run after the other requests, once each, when every sub
+	// is bound to its connection's current identity, and before fences are
+	// released, so an end still precedes the res of the method that caused
+	// it.
+	reval := revalidateReq{users: map[string]bool{}, all: listened > 0}
 	for _, r := range reqs {
+		if rv, ok := r.(revalidateReq); ok {
+			maps.Copy(reval.users, rv.users)
+			reval.all = reval.all || rv.all
+			continue
+		}
 		e.handleReq(ctx, r, outFor)
 	}
-	// Re-checks (comet_reval) sent while nobody listened are lost too, so
-	// this tick re-checks every sub, as it re-runs every observer. It runs
-	// before fences are released, so an end still precedes the res of the
-	// method that caused it.
-	if listened > 0 {
-		e.handleReq(ctx, revalidateReq{all: true}, outFor)
+	if reval.all || len(reval.users) > 0 {
+		e.handleReq(ctx, reval, outFor)
 	}
 
 	// Coalescing connections (§8.1) get their held resets once their queue
@@ -651,7 +661,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			// A session whose identity changed since its subs were bound
 			// has a rebind queued, which re-checks them anyway.
 			ident := c.identity()
-			if c.isClosed() || (!r.all && ident.userID() != r.userID) {
+			if c.isClosed() || (!r.all && !r.users[ident.userID()]) {
 				continue
 			}
 			for s, sub := range subs {
@@ -1010,7 +1020,7 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 			// Enqueued before a fence notified later on this connection, so
 			// the re-check runs no later than the tick releasing the fence.
 			if n.Payload != "" {
-				e.enqueue(revalidateReq{userID: n.Payload})
+				e.enqueue(revalidateReq{users: map[string]bool{n.Payload: true}})
 			}
 			continue
 		}
