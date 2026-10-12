@@ -132,7 +132,10 @@ func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, da
 	if err != nil {
 		return err
 	}
-	_, err = c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2)", evtChannel, payload)
+	// txid_current assigns the transaction an ID, which keeps the call's
+	// fence (a call with no ID skips it): the evt must precede the res.
+	// pg_notify alone assigns none before commit.
+	_, err = c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2), txid_current()", evtChannel, payload)
 	return err
 }
 

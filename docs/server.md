@@ -207,14 +207,16 @@ Every call runs in its own Postgres transaction, `c.Tx`:
 
 **Always write through `c.Tx`.** Writes made through it are *fenced*: the framework adds a marker notification as the last statement before commit, and holds the result until the engine has processed every change up to that marker and sent the resulting update to the caller. That is what makes the client's `await call(...)` resolve with the write already visible. If that takes longer than `Config.FenceTimeout`, the result is sent anyway with `lag: true`.
 
-Writes through another connection (the pool passed as `Config.DB`, or any other connection) still update subscriptions, because the triggers see them, but they carry no fence: the call can resolve before its effects reach the client.
+A call whose transaction wrote nothing (Postgres assigned it no transaction ID) skips the fence and resolves as soon as it commits, because it has no effects to wait for. A call that used `EmitAfterCommit` keeps the fence, because that function assigns an ID, so its events still reach the client before the result. A replay of an [idempotency key](#idempotency-keys) also keeps the fence. Because a read-only call doesn't wait for a tick, its result can be newer than what the client's subscriptions show at that moment.
+
+Writes through another connection (the pool passed as `Config.DB`, or any other connection) still update subscriptions, because the triggers see them, but they carry no fence: the call can resolve before its effects reach the client. If the handler wrote nothing through `c.Tx`, the call resolves as soon as it commits, before any tick. A write it made on another connection is then very likely not yet visible to the client.
 
 Other details:
 
 - Calls on one connection run concurrently, up to `Config.MaxInflight`. A client that needs two calls in order should await the first.
 - `c.Context` is **not** cancelled when the client disconnects. A call that has started runs to completion and commits or rolls back on its own. If the client resumes its session, it gets the result; otherwise it reports `CONNECTION_LOST`, because it cannot know which happened.
 - `c.Context` **is** cancelled when the client cancels the call (`signal` in the TypeScript client), and only then: it stays valid after the call returns, so work a handler starts with it is not cut off. Pass it to every query so a long one stops promptly. A cancel that arrives while the handler is running always rolls the transaction back and the client gets `CANCELED`, even if the handler ignores the context and returns normally. A cancel that arrives once the handler has returned is too late: the call commits and the client gets the real result.
-- A client can send a call with `noFence`, which commits without the fence and returns as soon as the transaction commits. Use it for calls that do not write.
+- A client can send a call with `noFence`, which commits without the fence and returns as soon as the transaction commits. A call that writes nothing already skips the fence; `noFence` is for calls that write but don't need to wait for their update.
 - An unknown method name returns `NOT_FOUND`.
 - A client can send a call with an idempotency key, so it can retry safely after a disconnect. See [Idempotency keys](#idempotency-keys).
 

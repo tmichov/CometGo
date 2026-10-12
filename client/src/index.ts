@@ -58,7 +58,8 @@ interface PendingAuth {
 const ACK_BYTES = 64 << 10;
 
 export interface CallOptions {
-  /** Skip the read-your-writes fence (§6.2); for calls that do not write. */
+  /** Skip the read-your-writes fence (§6.2), for writes that need not wait.
+   * A call whose method writes nothing skips it anyway. */
   noFence?: boolean;
   /**
    * Cancels the call when aborted (§5). A call not yet sent is rejected at

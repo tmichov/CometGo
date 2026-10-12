@@ -854,11 +854,22 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	}
 	// Fence (§6.2): registered before commit, notified as the last
 	// statement, so its notification follows every row notification of
-	// this transaction.
+	// this transaction. A transaction with no ID wrote nothing and has no
+	// effects to wait for, so it is not fenced; EmitAfterCommit assigns one.
+	// A replay is always fenced: the original may still be running.
 	token, f := c.a.engine.registerFence(c)
-	if _, err := tx.Exec(ctx, "SELECT pg_notify('comet', $1)", "1|f|"+token); err != nil {
+	fenceSQL := "SELECT pg_notify('comet', $1) WHERE txid_current_if_assigned() IS NOT NULL"
+	if stored != nil {
+		fenceSQL = "SELECT pg_notify('comet', $1)"
+	}
+	tag, err := tx.Exec(ctx, fenceSQL, "1|f|"+token)
+	if err != nil {
 		c.a.engine.dropFence(token)
 		return nil, false, err
+	}
+	if tag.RowsAffected() == 0 {
+		c.a.engine.dropFence(token)
+		return val, false, tx.Commit(ctx)
 	}
 	if err := c.a.engine.commitFenced(ctx, tx, token); err != nil {
 		c.a.engine.dropFence(token)
