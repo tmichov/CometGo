@@ -435,7 +435,7 @@ Types are described once per sub in `init.cols`, and values are plain JSON. Ther
 
 Not part of the wire protocol. Specified here because the consistency guarantees depend on it.
 
-All notifications use channel `comet`. Payload fields are separated by `|`, and the JSON part is always last.
+Change and fence notifications use channel `comet`. Events (§4.5) use `comet_evt`, and `App.Revalidate` re-checks use `comet_reval` (the payload is the user ID); both are delivered to every node's listener. On `comet`, payload fields are separated by `|`, and the JSON part is always last.
 
 | Kind | Payload | Example |
 |---|---|---|
@@ -456,7 +456,7 @@ All notifications use channel `comet`. Payload fields are separated by `|`, and 
 - A dirty observer re-runs its full query. An observer whose query declares a single-table equality predicate (`Query.Match` on the server) is dirtied by a row notification only if a changed row, read once per tick by PK inside the snapshot, matches the predicate, or its current result holds a changed PK. Table-dirty notifications and anything the server cannot evaluate re-run it as before.
 - A minimum interval between ticks (default 20 ms, `Config.MinTickInterval`) coalesces bursts.
 
-**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped.
+**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped. `comet_reval` re-checks are lost too, so the same tick re-runs the publication fn of every subscription, before it releases fences.
 
 Every node receives every fence and ignores the tokens it does not own.
 

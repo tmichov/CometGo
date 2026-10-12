@@ -160,8 +160,11 @@ type rebindReq struct {
 }
 
 // revalidateReq re-runs fn for every sub of every session whose identity
-// has userID, ending those it now rejects.
-type revalidateReq struct{ userID string }
+// has userID (every session, if all), ending those it now rejects.
+type revalidateReq struct {
+	userID string
+	all    bool
+}
 
 func newEngine(a *App) *engine {
 	return &engine{
@@ -353,6 +356,13 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 
 	for _, r := range reqs {
 		e.handleReq(ctx, r, outFor)
+	}
+	// Re-checks (comet_reval) sent while nobody listened are lost too, so
+	// this tick re-checks every sub, as it re-runs every observer. It runs
+	// before fences are released, so an end still precedes the res of the
+	// method that caused it.
+	if listened > 0 {
+		e.handleReq(ctx, revalidateReq{all: true}, outFor)
 	}
 
 	// Coalescing connections (§8.1) get their held resets once their queue
@@ -634,11 +644,11 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			// A session whose identity changed since its subs were bound
 			// has a rebind queued, which re-checks them anyway.
 			ident := c.identity()
-			if c.isClosed() || ident.userID() != r.userID {
+			if c.isClosed() || (!r.all && ident.userID() != r.userID) {
 				continue
 			}
 			for s, sub := range subs {
-				if sub.userID != r.userID {
+				if sub.userID != ident.userID() {
 					continue
 				}
 				if err := e.recheck(ctx, sub, ident); err != nil {
@@ -959,7 +969,7 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 	defer conn.Close(context.Background())
 	// Fenced commits wait while LISTEN runs (listenMu).
 	e.listenMu.Lock()
-	for _, ch := range []string{"comet", evtChannel} {
+	for _, ch := range []string{"comet", evtChannel, revalChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			e.listenMu.Unlock()
 			return time.Time{}, err
@@ -974,9 +984,17 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 		if err != nil {
 			return listenedAt, err
 		}
-		if n.Channel == evtChannel {
+		switch n.Channel {
+		case evtChannel:
 			if evt, ok := parseEvt(n.Payload); ok {
 				e.notify(notification{evt: evt})
+			}
+			continue
+		case revalChannel:
+			// Enqueued before a fence notified later on this connection, so
+			// the re-check runs no later than the tick releasing the fence.
+			if n.Payload != "" {
+				e.enqueue(revalidateReq{userID: n.Payload})
 			}
 			continue
 		}

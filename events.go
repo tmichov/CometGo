@@ -51,25 +51,52 @@ func observerKey(pub, argsKey, scope string) string {
 	return pub + "\x00" + argsKey + "\x00" + scope
 }
 
+// revalChannel is the Postgres channel Revalidate travels on, so it reaches
+// sessions on every node listening to the same database. The payload is
+// the user ID.
+const revalChannel = "comet_reval"
+
 // Revalidate re-runs the publication fn of every live subscription held by
 // sessions whose Identity.UserID is userID, including sessions waiting to be
-// resumed. A sub whose fn now returns an error ends with that error; the
-// others are untouched. Call it after changing a permission that fn checks
-// but that its query does not read (a query that reads the permission table,
-// listed in Tables, picks up the change by itself).
+// resumed, on every node listening to this database. A sub whose fn now
+// returns an error ends with that error; the others are untouched. Call it
+// after changing a permission that fn checks but that its query does not
+// read (a query that reads the permission table, listed in Tables, picks up
+// the change by itself).
 //
 // Only an error ends a sub: a fn that narrows its Query instead (say, to the
 // teams the user still belongs to) changes nothing, since the observer keeps
 // the Query it was created with. Any error ends the sub, a transient one too.
 //
-// It returns at once; the re-check runs on the engine's next tick, against
-// what fn reads then, so call it after the change has committed. It reaches
-// only sessions on this App's node. An empty userID does nothing.
-func (a *App) Revalidate(userID string) {
+// It sends a notification and returns; each node re-checks on its next tick
+// after receiving it, against what fn reads then, so call it after the
+// change has committed. Inside a method, use Call.RevalidateAfterCommit. A
+// node whose listener is reconnecting when the notification is sent misses
+// it, as with events. An empty userID does nothing.
+func (a *App) Revalidate(ctx context.Context, userID string) error {
 	if userID == "" {
-		return // anonymous sessions have no per-user permission to revoke
+		return nil // anonymous sessions have no per-user permission to revoke
 	}
-	a.engine.enqueue(revalidateReq{userID: userID})
+	_, err := a.db.Exec(ctx, "SELECT pg_notify($1, $2)", revalChannel, userID)
+	return err
+}
+
+// RevalidateAfterCommit is Revalidate inside the method's transaction: the
+// re-check is sent only if the transaction commits, and runs once the
+// method's writes are visible. A sub it ends gets its end before the
+// method's res (unless the call was sent with noFence).
+func (c *Call) RevalidateAfterCommit(userID string) error {
+	if c.app == nil {
+		return errors.New("cometgo: RevalidateAfterCommit needs a Call made by the framework")
+	}
+	if userID == "" {
+		return nil
+	}
+	// txid_current gives the transaction an ID even if the method writes
+	// nothing else, so a server that skips the fence for ID-less calls
+	// still sends the end before the res. pg_notify alone assigns none.
+	_, err := c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2), txid_current()", revalChannel, userID)
+	return err
 }
 
 // Emit sends an ephemeral event to every subscription of the publication
