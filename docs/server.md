@@ -91,6 +91,8 @@ Each distinct `(publication, args, scope)` combination has one server-side **obs
 - Everything the query depends on must be in `Query.SQL` and `Query.Args`, and the scope must separate callers whose queries would differ (see [Scope](#scope)).
 - `fn` runs on the engine's loop, so keep it fast. Doing an access check against the database there delays every subscription on the server.
 - Returning an error from `fn` ends the subscription with that error. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
+- A panic in `fn` is recovered: it ends only that subscription with `INTERNAL` and is logged with its stack trace. The server and every other subscription keep running.
+- A panic while encoding `Query.Args` (from a `driver.Valuer` or a pgx encoder) is recovered too, each time the query runs: it ends every subscription on that observer with `INTERNAL` and is logged with its stack trace. Other observers re-run in the same tick are not affected.
 - Bad args (wrong types, unknown fields) end the subscription with `BAD_REQUEST`. An unknown publication name ends it with `NOT_FOUND`.
 
 All observers that need re-running in one tick run inside one `REPEATABLE READ READ ONLY` transaction, so every update a client receives comes from one consistent database snapshot.
@@ -445,4 +447,4 @@ All failing tables are reported in one error, which `Start` also logs. Because o
 
 The check runs once, at `Start`. Dropping or disabling the triggers, or dropping the table, while the server runs is not detected, and the affected subscriptions silently stop updating.
 
-If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.
+If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. It reconnects after 500 ms, doubling the wait after each attempt that fails or drops soon, up to 2 s. Calls committed while it is down wait for the reconnect, so the cap keeps them under the default `FenceTimeout`. After a connection that stayed up for 30 s, the wait starts again at 500 ms. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -644,7 +645,17 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
 	obs := e.observers[key]
 	if obs == nil {
-		q, err := pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
+		// fn runs on the engine goroutine, so a panic would take down the
+		// process; end only this sub instead. Moves with fn if fn leaves
+		// this goroutine.
+		q, err := func() (q Query, err error) {
+			defer func() {
+				if p := recover(); p != nil {
+					err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+				}
+			}()
+			return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
+		}()
 		if err != nil {
 			return e.a.toWireError(err, "publication "+sub.name)
 		}
@@ -710,7 +721,20 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}
 		r := runResult{obs: obs}
 		var qerr error
-		r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		func() {
+			// Encoding Query.Args runs user code (driver.Valuer, pgx
+			// encoders) on the engine goroutine; a panic there fails only
+			// this observer. pgx encodes before sending, so sp is still
+			// usable for the rollback. A panic after sending (decoding
+			// rows) is caught too; rows.Close drains the result first, and
+			// if the rollback fails anyway the tick retries.
+			defer func() {
+				if p := recover(); p != nil {
+					qerr = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+				}
+			}()
+			r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		}()
 		if qerr != nil {
 			if err := sp.Rollback(ctx); err != nil {
 				return err
@@ -840,11 +864,25 @@ func sameCols(a, b []colSpec) bool {
 
 // listen maintains the LISTEN connection (PROTOCOL.md §11).
 func (e *engine) listen(ctx context.Context) {
-	backoff := 500 * time.Millisecond
+	// Every gap delays the calls committed in it (they wait for the
+	// reconnect tick), so maxBackoff stays well under the default 5s
+	// FenceTimeout. A connection that stayed up for stableAfter resets the
+	// backoff; one that drops sooner keeps backing off, so a connection
+	// cut right after LISTEN cannot trigger an all-dirty re-run every
+	// 500ms.
+	const (
+		minBackoff  = 500 * time.Millisecond
+		maxBackoff  = 2 * time.Second
+		stableAfter = 30 * time.Second
+	)
+	backoff := minBackoff
 	for ctx.Err() == nil {
-		err := e.listenOnce(ctx)
+		listenedAt, err := e.listenOnce(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if !listenedAt.IsZero() && time.Since(listenedAt) >= stableAfter {
+			backoff = minBackoff
 		}
 		e.a.log.Warn("listener disconnected", "err", err, "retry", backoff)
 		select {
@@ -852,14 +890,16 @@ func (e *engine) listen(ctx context.Context) {
 			return
 		case <-time.After(backoff):
 		}
-		backoff = min(backoff*2, 10*time.Second)
+		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
-func (e *engine) listenOnce(ctx context.Context) error {
+// listenOnce runs one listener connection until it fails. It reports when
+// LISTEN succeeded, or the zero time if it did not.
+func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err error) {
 	conn, err := pgx.ConnectConfig(ctx, e.a.db.Config().ConnConfig.Copy())
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	defer conn.Close(context.Background())
 	// Fenced commits wait while LISTEN runs (listenMu).
@@ -867,16 +907,17 @@ func (e *engine) listenOnce(ctx context.Context) error {
 	for _, ch := range []string{"comet", evtChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			e.listenMu.Unlock()
-			return err
+			return time.Time{}, err
 		}
 	}
 	// Notifications sent while we were not listening are lost.
 	e.listening()
 	e.listenMu.Unlock()
+	listenedAt = time.Now()
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			return err
+			return listenedAt, err
 		}
 		if n.Channel == evtChannel {
 			if evt, ok := parseEvt(n.Payload); ok {
