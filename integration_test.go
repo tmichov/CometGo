@@ -3,6 +3,7 @@ package cometgo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -484,5 +485,62 @@ func TestBulkChangeUsesTableDirty(t *testing.T) {
 	}
 	if total != 1500 {
 		t.Fatalf("got %d inserts", total)
+	}
+}
+
+// A failed mid-session auth, rejected or erroring, keeps the identity and
+// its subscriptions (§3.2).
+func TestFailedAuthKeepsIdentity(t *testing.T) {
+	e := setupWith(t, func(c *Config) {
+		auth := c.Authenticate
+		c.Authenticate = func(ctx context.Context, token string) (*Identity, error) {
+			if token == "flaky" {
+				return nil, errors.New("auth store timed out")
+			}
+			return auth(ctx, token)
+		}
+	})
+	ctx := context.Background()
+	if _, err := e.pool.Exec(ctx, "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'a1')"); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
+	a.next()
+
+	for i, tc := range []struct {
+		token any
+		code  string
+	}{{"flaky", CodeInternal}, {"mallory", CodeUnauthenticated}, {7, CodeBadRequest}} {
+		a.send(map[string]any{"t": "auth", "id": 10 + i, "token": tc.token})
+		if r := a.next(); r["t"] != "authRes" || r["ok"] != false || r["err"].(map[string]any)["code"] != tc.code {
+			t.Fatalf("token %v: want authRes %s, got %v", tc.token, tc.code, r)
+		}
+	}
+	// Still alice: her sub stays live and a call runs as her.
+	a.send(map[string]any{"t": "call", "id": 20, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "a2"}})
+	tx := a.next()
+	if tx["t"] != "tx" || entries(tx)[0]["s"] != float64(1) || entries(tx)[0]["end"] != nil {
+		t.Fatalf("alice's sub after failed auths: %v", tx)
+	}
+	if r := a.next(); r["t"] != "res" || r["ok"] != true {
+		t.Fatalf("res %v", r)
+	}
+	if c := e.app.liveConns()[0]; c.identity() == nil || c.identity().UserID != "alice" {
+		t.Fatalf("identity %v", c.identity())
+	}
+}
+
+// A failed refresh keeps the old identity's expiry: the session still lapses
+// to anonymous (AUTH_EXPIRED) when the old token does.
+func TestFailedAuthKeepsExpiry(t *testing.T) {
+	e := setup(t)
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice-short"}})
+	a.send(map[string]any{"t": "auth", "id": 2, "token": "mallory"})
+	if r := a.next(); r["t"] != "authRes" || r["ok"] != false {
+		t.Fatalf("authRes %v", r)
+	}
+	if r := a.next(); r["t"] != "authRes" || r["id"] != nil || r["err"].(map[string]any)["code"] != CodeAuthExpired {
+		t.Fatalf("want AUTH_EXPIRED push, got %v", r)
 	}
 }

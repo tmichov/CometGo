@@ -246,3 +246,21 @@ test("when the resume fails and the server lacks ik, a held ik call gets CONNECT
   await lostConnection(p);
   assert.equal(second.of("call").length, 0);
 });
+
+test("a failed setToken rejects and keeps the current user; only an expiry clears it", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const login = comet.setToken("alice");
+  await tick();
+  ws.recv({ t: "authRes", seq: 1, id: ws.of("auth")[0].id, ok: true, user: { id: "alice" } });
+  assert.deepEqual(await login, { id: "alice" });
+
+  const refresh = comet.setToken("flaky");
+  await tick();
+  ws.recv({ t: "authRes", seq: 2, id: ws.of("auth")[1].id, ok: false, err: { code: "INTERNAL" } });
+  await assert.rejects(refresh, (e: unknown) => e instanceof CometError && e.code === "INTERNAL");
+  assert.deepEqual(comet.user, { id: "alice" });
+
+  ws.recv({ t: "authRes", seq: 3, ok: false, err: { code: "AUTH_EXPIRED" } });
+  assert.equal(comet.user, null);
+});

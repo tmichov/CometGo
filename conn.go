@@ -761,7 +761,13 @@ func (c *conn) reauth(id uint64, rawToken json.RawMessage) {
 			ident, authErr = c.a.authenticate(c.ctx, token)
 		}
 	}
-	res := &authResMsg{T: "authRes", ID: &id, OK: authErr == nil, User: ident.wireUser(), AuthExp: ident.authExp(), Err: authErr}
+	if authErr != nil {
+		// A failed auth changes nothing: the current identity stays until
+		// it expires or the client logs out with token null (§3.2).
+		c.send(&authResMsg{T: "authRes", ID: &id, OK: false, Err: authErr})
+		return
+	}
+	res := &authResMsg{T: "authRes", ID: &id, OK: true, User: ident.wireUser(), AuthExp: ident.authExp()}
 	old := c.identity()
 	c.setIdentity(ident)
 	if samePrincipal(old, ident) {
