@@ -872,7 +872,14 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 				sub.needInit = true
 			}
 		default:
-			obs.ops = diffResults(obs.res, r.res, !obs.pub.opts.Unordered)
+			var reset bool
+			obs.ops, reset = diffResults(obs.res, r.res, !obs.pub.opts.Unordered)
+			if reset {
+				// Most rows moved: a snapshot is cheaper than the moves.
+				for sub := range obs.subs {
+					sub.needInit = true
+				}
+			}
 		}
 		obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
 	}

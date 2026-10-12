@@ -178,7 +178,7 @@ On a SubEntry with `reset:true`:
 
 Rows that did not change keep their object identity, so the UI does not re-render them. While a reset is in progress, `sub.status` is `"resyncing"`, so the UI can dim stale data if it wants to.
 
-Resets are used for reconnect resync, identity change and slow-consumer recovery (§8.1).
+Resets are used for reconnect resync, identity change, slow-consumer recovery (§8.1), a change of the result's columns, and a reorder of an ordered sub that moves most of its rows (at least 64 and more than half of the rows that remain), where a snapshot is cheaper to build and apply than one move per row.
 
 ### 4.5 Events (`evt`)
 
