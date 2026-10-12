@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -116,6 +117,7 @@ type subscription struct {
 	args    json.RawMessage
 	argsKey string
 	obs     *observer
+	userID  string // the UserID it was last bound for
 	// needInit: send init + full snapshot next tick. holds: the client
 	// already has data for the sub (an earlier snapshot, or have on sub), so
 	// that snapshot goes out as a reset.
@@ -156,6 +158,10 @@ type rebindReq struct {
 	ident *Identity
 	after sequenced
 }
+
+// revalidateReq re-runs fn for every sub of every session whose identity
+// has userID, ending those it now rejects.
+type revalidateReq struct{ userID string }
 
 func newEngine(a *App) *engine {
 	return &engine{
@@ -621,6 +627,28 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			}
 		}
 
+	case revalidateReq:
+		// Not a rebind: the observers stay as they are; fn only re-checks
+		// access, so its Query is discarded.
+		for c, subs := range e.conns {
+			// A session whose identity changed since its subs were bound
+			// has a rebind queued, which re-checks them anyway.
+			ident := c.identity()
+			if c.isClosed() || ident.userID() != r.userID {
+				continue
+			}
+			for s, sub := range subs {
+				if sub.userID != r.userID {
+					continue
+				}
+				if err := e.recheck(ctx, sub, ident); err != nil {
+					e.detach(sub)
+					delete(subs, s)
+					end(c, s, err)
+				}
+			}
+		}
+
 	case rebindReq:
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
 		for s, sub := range e.conns[r.c] {
@@ -655,7 +683,25 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 		e.observers[key] = obs
 	}
 	obs.subs[sub] = struct{}{}
-	sub.obs = obs
+	sub.obs, sub.userID = obs, ident.userID()
+	return nil
+}
+
+// recheck runs sub's fn for ident. A panic, which would otherwise take down
+// the engine goroutine, becomes INTERNAL.
+func (e *engine) recheck(ctx context.Context, sub *subscription, ident *Identity) *Error {
+	pub := e.a.pubs[sub.name]
+	_, err := func() (q Query, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+			}
+		}()
+		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
+	}()
+	if err != nil {
+		return e.a.toWireError(err, "publication "+sub.name)
+	}
 	return nil
 }
 
