@@ -90,11 +90,13 @@ cometgo.Publish(app, "tasks.byProject", cometgo.PubOptions{Tables: []string{"tas
 
 ### How a publication runs
 
-Each distinct `(publication, args, scope)` combination has one server-side **observer**, shared by every subscription that matches it. `fn` is called **once**, when the observer is created, and the `Query` it returns is reused for every re-run until the last subscription to it goes away. So:
+Each distinct `(publication, args, scope)` combination has one server-side **observer**, shared by every subscription that matches it. `fn` is called for **every** subscription, with that subscriber's `SubCtx`, so an access check in `fn` applies to each caller. Only the first call's `Query`, the one that created the observer, is used. It is reused for every re-run until the last subscription to the observer goes away, and the `Query` from later calls is discarded. So:
 
 - Everything the query depends on must be in `Query.SQL` and `Query.Args`, and the scope must separate callers whose queries would differ (see [Scope](#scope)).
 - `fn` runs on the engine's loop, so keep it fast. Doing an access check against the database there delays every subscription on the server.
-- Returning an error from `fn` ends the subscription with that error. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
+- `fn` is the access check for a subscription when it starts, and when the connection's `UserID` changes (log in, log out, switch user, or an expired identity), because every subscription is re-bound then. It is **not** re-run when a token refresh or session resume keeps the same `UserID`, even if `Identity.Data` (a role, say) changed, and not when access changes in the database, so neither ends a live subscription.
+- `fn` runs once per subscription, and again for each of a connection's subscriptions when its user changes. An access check that queries the database therefore costs one round trip per subscriber on the engine's loop. Keep it cheap or cached, especially for a `ScopeShared` publication with many subscribers.
+- Returning an error from `fn` ends that subscription only, with that error. Other subscriptions to the same observer keep streaming. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
 - A panic in `fn` is recovered: it ends only that subscription with `INTERNAL` and is logged with its stack trace. The server and every other subscription keep running.
 - A panic while encoding `Query.Args` (from a `driver.Valuer` or a pgx encoder) is recovered too, each time the query runs: it ends every subscription on that observer with `INTERNAL` and is logged with its stack trace. Other observers re-run in the same tick are not affected.
 - Bad args (wrong types, unknown fields) end the subscription with `BAD_REQUEST`. An unknown publication name ends it with `NOT_FOUND`.
@@ -122,7 +124,7 @@ const (
 ```
 
 - **`ScopeUser`** (the default) shares an observer only between connections whose `Identity.UserID` is the same. Anonymous connections share with each other. This is the safe choice for any query that depends on who is asking, **as long as `UserID` alone determines the query**. The scope key is `UserID` and nothing else: an identity with an empty `UserID` shares with anonymous connections, and two identities with the same `UserID` but different `Data` (say, a different tenant or role) share one observer. If the query depends on anything in `Identity` besides `UserID`, make `UserID` unique per distinct query (for example `tenant + ":" + user`) or pass that value in the subscription args and check it in `fn`.
-- **`ScopeShared`** shares one observer between every connection. Only use it when the query does not depend on the caller's identity at all, such as a public feed. Because `fn` runs once per observer, a `ScopeShared` publication that reads `c.Identity` serves the **first** subscriber's result to everyone else.
+- **`ScopeShared`** shares one observer between every connection. Only use it when the query does not depend on the caller's identity at all, such as a public feed. `fn` still runs for every subscriber, so it can check access per caller (for example, whether the caller is a member of the team in the args) and return `ErrForbidden`. But only the first subscriber's `Query` is used, so a `ScopeShared` publication whose **query** reads `c.Identity` serves the **first** subscriber's result to everyone else.
 
 ### Query and SubCtx
 

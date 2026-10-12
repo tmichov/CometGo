@@ -647,22 +647,23 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 		return NewError(CodeNotFound, "unknown publication "+sub.name)
 	}
 	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
+	// fn runs for every sub, not only the observer's first: it may check
+	// access for this caller. The key already determines the query, so a
+	// joining sub's Query is discarded. fn runs on the engine goroutine, so
+	// a panic would take down the process; end only this sub instead.
+	q, err := func() (q Query, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+			}
+		}()
+		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
+	}()
+	if err != nil {
+		return e.a.toWireError(err, "publication "+sub.name)
+	}
 	obs := e.observers[key]
 	if obs == nil {
-		// fn runs on the engine goroutine, so a panic would take down the
-		// process; end only this sub instead. Moves with fn if fn leaves
-		// this goroutine.
-		q, err := func() (q Query, err error) {
-			defer func() {
-				if p := recover(); p != nil {
-					err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
-				}
-			}()
-			return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
-		}()
-		if err != nil {
-			return e.a.toWireError(err, "publication "+sub.name)
-		}
 		// Checked after fn, so its FORBIDDEN or VALIDATION wins over a
 		// retryable OVERLOADED.
 		if e.a.cfg.MaxObservers > 0 && len(e.observers) >= e.a.cfg.MaxObservers {
