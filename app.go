@@ -23,8 +23,14 @@ import (
 // Identity is an authenticated principal.
 type Identity struct {
 	// UserID identifies the user. Publications with ScopeUser are shared only
-	// between connections with the same UserID.
+	// between connections with the same Scope().
 	UserID string
+	// ScopeKey, if set, partitions one user's identities, e.g. by tenant: two
+	// identities with the same UserID but different ScopeKey get separate
+	// ScopeUser observers and Emit targets, and are different principals for
+	// resume, re-auth and idempotency keys. Set it when the query depends on
+	// more than the user. It is always combined with UserID (see Scope).
+	ScopeKey string
 	// User is sent to the client in welcome/authRes. Defaults to {"id": UserID}.
 	User any
 	// ExpiresAt, if set, downgrades the connection to anonymous when reached
@@ -39,6 +45,31 @@ func (id *Identity) userID() string {
 		return ""
 	}
 	return id.UserID
+}
+
+// Scope is the identity's scope: what ScopeUser observers are keyed by and
+// what Emit's scope argument must be. It is UserID when ScopeKey is empty,
+// otherwise UserID and ScopeKey joined by a NUL byte, so it never equals
+// another user's scope as long as UserIDs contain no NUL. "" when nil.
+func (id *Identity) Scope() string {
+	if id == nil {
+		return ""
+	}
+	if id.ScopeKey == "" {
+		return id.UserID
+	}
+	return id.UserID + "\x00" + id.ScopeKey
+}
+
+// ikMethod is the method recorded with an idempotency key. Keys are stored
+// per UserID (so rows written before ScopeKey was set still match); the
+// ScopeKey rides along so a key reused under another scope is refused rather
+// than run again or answered with the other scope's result.
+func ikMethod(method string, id *Identity) string {
+	if id == nil || id.ScopeKey == "" {
+		return method
+	}
+	return method + "\x1f" + id.ScopeKey // Postgres text cannot hold NUL
 }
 
 func (id *Identity) wireUser() any {
@@ -103,6 +134,21 @@ type Config struct {
 	MaxMsg      int // default 1 MiB
 	MaxRows     int // per-observer row cap, default 10,000
 
+	// MaxObservers caps live queries (observers) on the server. A sub that
+	// would create one more ends with OVERLOADED; a sub joining an existing
+	// observer is unaffected. 0 means no limit.
+	MaxObservers int
+	// MaxConns caps open WebSocket connections; MaxConnsPerIP caps them per
+	// ClientIP. Over either, the upgrade is refused with HTTP 503. 0 means
+	// no limit.
+	MaxConns      int
+	MaxConnsPerIP int
+	// ClientIP returns the address MaxConnsPerIP counts against. Default,
+	// and when it returns "": the host of r.RemoteAddr. Behind a proxy,
+	// return the client address the proxy forwards, or every client shares
+	// the proxy's limit.
+	ClientIP func(r *http.Request) string
+
 	// ResumeGrace is how long a session outlives a lost socket, waiting for
 	// the client to resume it (§7.2). Default 60s; negative disables resume.
 	// Resume needs sticky routing when several nodes serve one endpoint.
@@ -146,6 +192,9 @@ type App struct {
 	shutOnce sync.Once
 	shutDone chan struct{}
 	shutErr  error
+	connMu   sync.Mutex         // guards conns and ipConns
+	conns    int                // open WebSocket connections
+	ipConns  map[string]int     // open connections by ClientIP
 	startMu  sync.Mutex         // guards started and stop
 	stop     context.CancelFunc // stops what Start runs
 	running  sync.WaitGroup
@@ -195,6 +244,7 @@ func New(cfg Config) *App {
 		methods:  map[string]*method{},
 		sessions: map[string]*conn{},
 		live:     map[*conn]struct{}{},
+		ipConns:  map[string]int{},
 		shutDone: make(chan struct{}),
 	}
 	a.engine = newEngine(a)
@@ -205,16 +255,31 @@ func New(cfg Config) *App {
 // cleanup until ctx is done or Shutdown stops them. Shutdown needs them
 // running while it drains, so with Shutdown pass a ctx that outlives the
 // shutdown signal. After Shutdown, Start does nothing.
-func (a *App) Start(ctx context.Context) {
+//
+// Start first checks that every table in a publication's Tables exists under
+// exactly that name and has the triggers InstallTriggers creates, and returns
+// an error without starting anything if not. The check needs the database:
+// if it is unreachable, Start fails after at most Config.QueryTimeout. A
+// later Start may retry.
+func (a *App) Start(ctx context.Context) error {
 	a.startMu.Lock()
 	defer a.startMu.Unlock()
 	if a.started {
 		panic("cometgo: Start called twice")
 	}
-	a.started = true
 	if a.shutting.Load() {
-		return
+		a.started = true
+		return nil
 	}
+	checkCtx, cancel := context.WithTimeout(ctx, a.cfg.QueryTimeout)
+	defer cancel()
+	if err := a.checkTables(checkCtx); err != nil {
+		// Logged too: a caller that ignores the error would otherwise serve
+		// an app with no engine, and no clue why.
+		a.log.Error("start failed", "err", err)
+		return err
+	}
+	a.started = true
 	ctx, a.stop = context.WithCancel(ctx)
 	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
 		a.running.Add(1)
@@ -223,6 +288,7 @@ func (a *App) Start(ctx context.Context) {
 			run(ctx)
 		}()
 	}
+	return nil
 }
 
 // Scope controls which connections share one observer of a publication.

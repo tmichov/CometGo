@@ -20,6 +20,7 @@ const (
 	CodeTimeout         = "TIMEOUT"
 	CodeCanceled        = "CANCELED"
 	CodeResultTooLarge  = "RESULT_TOO_LARGE"
+	CodeOverloaded      = "OVERLOADED"
 	CodeUnavailable     = "UNAVAILABLE"
 	CodeInternal        = "INTERNAL"
 )

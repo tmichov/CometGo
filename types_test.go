@@ -101,7 +101,8 @@ func TestUserEnumTypeCode(t *testing.T) {
 }
 
 // A type created after the server started (a migration while it runs) is
-// looked up when first seen, not missed for good.
+// looked up when first seen, not missed for good. The table must exist at
+// Start, so the migration changes its column to the new type.
 func TestUserEnumCreatedWhileRunning(t *testing.T) {
 	var table, mood string
 	e := setupFull(t, nil, func(e *testEnv, app *App) {
@@ -110,6 +111,12 @@ func TestUserEnumCreatedWhileRunning(t *testing.T) {
 			e.pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+table)
 			e.pool.Exec(context.Background(), "DROP TYPE IF EXISTS "+mood)
 		})
+		if _, err := e.pool.Exec(context.Background(), fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, m text)", table)); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallTriggers(context.Background(), e.pool, table); err != nil {
+			t.Fatal(err)
+		}
 		Publish(app, "late", PubOptions{Tables: []string{table}, Scope: ScopeShared},
 			func(c *SubCtx, _ struct{}) (Query, error) {
 				return Query{SQL: "SELECT id, m FROM " + table + " ORDER BY id"}, nil
@@ -117,7 +124,7 @@ func TestUserEnumCreatedWhileRunning(t *testing.T) {
 	})
 	for _, ddl := range []string{
 		fmt.Sprintf("CREATE TYPE %s AS ENUM ('on', 'off')", mood),
-		fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, m %s)", table, mood),
+		fmt.Sprintf("ALTER TABLE %s ALTER COLUMN m TYPE %s USING m::%s", table, mood, mood),
 		fmt.Sprintf("INSERT INTO %s VALUES (1, 'on')", table),
 	} {
 		if _, err := e.pool.Exec(context.Background(), ddl); err != nil {

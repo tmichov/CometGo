@@ -74,6 +74,8 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 			switch token {
 			case "alice", "bob":
 				return &Identity{UserID: token}, nil
+			case "alice@acme", "alice@globex": // one user in two tenants
+				return &Identity{UserID: "alice", ScopeKey: strings.TrimPrefix(token, "alice@")}, nil
 			case "alice-short":
 				return &Identity{UserID: "alice", ExpiresAt: time.Now().Add(300 * time.Millisecond)}, nil
 			}
@@ -163,7 +165,9 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 	if extra != nil {
 		extra(env, app)
 	}
-	app.Start(ctx)
+	if err := app.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(app)
 	t.Cleanup(srv.Close)
 	env.app, env.srv = app, srv

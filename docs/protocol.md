@@ -209,7 +209,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 - **`"noFence":true`** skips the read-your-writes fence (§6.2). Use it for latency-sensitive calls that do not write.
 - **`"ik":"<uuid>"` idempotency key.** Negotiated with the `ik` cap: the client offers `"caps":["ik"]` in `hello`, and a server that supports keys includes `"ik"` in `welcome.caps`.
   - The framework writes `(ik, userId, method, result)` to `comet_idempotency` inside the method's own transaction, so the record commits atomically with the method's effects.
-  - A retry with the same `ik` from the same user returns the stored result instead of executing again. Its `res` is fenced like any call's.
+  - A retry with the same `ik` from the same user returns the stored result instead of executing again. The same user under a different server-side scope (e.g. another tenant) gets `BAD_REQUEST` instead. Its `res` is fenced like any call's.
   - A duplicate that arrives while the first is still running waits for its outcome; the handler runs once.
   - A failed call stores nothing. The same `ik` for a different method is `BAD_REQUEST`. `ik` must be a non-empty string of at most 128 bytes.
   - Stored results expire after a server-configured TTL (default 24 h).
@@ -297,7 +297,7 @@ Resume makes a short drop invisible: no snapshot is re-sent, and calls in flight
 **Validity.** The resume succeeds only if all of these hold:
 - the session exists on this node and has not ended,
 - `seq` is not below the last ack or the overflow point, and not above the last `seq` sent,
-- the `hello` authenticates the same principal (same user ID, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
+- the `hello` authenticates the same principal (same user ID and same server-side scope, e.g. tenant, or anonymous on both sides) as the session's current identity. A refreshed token for the same user is accepted, and its expiry replaces the old one.
 
 For an anonymous session, the session id is the only credential, as a session cookie would be. It is 72 random bits, is sent only in `welcome`, and must be kept as secret as a token.
 
@@ -365,6 +365,8 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 | `maxMsg` | 1 MiB | |
 | Per-observer row cap | 10,000 | Sub ends with `RESULT_TOO_LARGE`. |
 | Observer query hard timeout | 30 s | Sub ends with `TIMEOUT`. |
+| Server-wide observers | no limit | A sub that needs a new observer ends with `OVERLOADED`; a sub that joins an existing observer (same publication, args and scope) is unaffected. Not advertised: it depends on other clients. |
+| Open connections, total and per client IP | no limit | The upgrade is refused with HTTP 503 before any `welcome`; the client treats it as a failed connect and retries with backoff. Not advertised. |
 | **[later]** per-method rate limits | | Token bucket. |
 
 ### 8.4 [later] Slow observers
@@ -388,7 +390,7 @@ Cancel-and-retry is rejected because a query that always exceeds the deadline wo
 |---|---|
 | Request and auth | `BAD_REQUEST`, `VALIDATION` (`details.fields`), `UNAUTHENTICATED`, `AUTH_EXPIRED`, `FORBIDDEN` |
 | Data | `NOT_FOUND`, `CONFLICT` |
-| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE` |
+| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE`, `OVERLOADED` (server-wide capacity; retrying later may succeed) |
 | Server and connection | `UNAVAILABLE`, `INTERNAL` (`details.ref` is a log correlation ID; internals are never leaked), `CONNECTION_LOST` (synthesized by the client) |
 
 Application-defined codes are namespaced `app.<name>`.
@@ -433,7 +435,7 @@ Types are described once per sub in `init.cols`, and values are plain JSON. Ther
 
 Not part of the wire protocol. Specified here because the consistency guarantees depend on it.
 
-All notifications use channel `comet`. Payload fields are separated by `|`, and the JSON part is always last.
+Change and fence notifications use channel `comet`. Events (§4.5) use `comet_evt`, and `App.Revalidate` re-checks use `comet_reval` (the payload is the user ID); both are delivered to every node's listener. On `comet`, payload fields are separated by `|`, and the JSON part is always last.
 
 | Kind | Payload | Example |
 |---|---|---|
@@ -454,7 +456,7 @@ All notifications use channel `comet`. Payload fields are separated by `|`, and 
 - A dirty observer re-runs its full query. An observer whose query declares a single-table equality predicate (`Query.Match` on the server) is dirtied by a row notification only if a changed row, read once per tick by PK inside the snapshot, matches the predicate, or its current result holds a changed PK. Table-dirty notifications and anything the server cannot evaluate re-run it as before.
 - A minimum interval between ticks (default 20 ms, `Config.MinTickInterval`) coalesces bursts.
 
-**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped.
+**Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped. `comet_reval` re-checks are lost too, so the same tick re-runs the publication fn of every subscription, before it releases fences.
 
 Every node receives every fence and ignores the tokens it does not own.
 

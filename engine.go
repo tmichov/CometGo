@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -116,6 +117,7 @@ type subscription struct {
 	args    json.RawMessage
 	argsKey string
 	obs     *observer
+	userID  string // the UserID it was last bound for
 	// needInit: send init + full snapshot next tick. holds: the client
 	// already has data for the sub (an earlier snapshot, or have on sub), so
 	// that snapshot goes out as a reset.
@@ -155,6 +157,13 @@ type rebindReq struct {
 	c     *conn
 	ident *Identity
 	after sequenced
+}
+
+// revalidateReq re-runs fn for every sub of every session whose identity
+// has userID (every session, if all), ending those it now rejects.
+type revalidateReq struct {
+	userID string
+	all    bool
 }
 
 func newEngine(a *App) *engine {
@@ -355,6 +364,13 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 
 	for _, r := range reqs {
 		e.handleReq(ctx, r, outFor)
+	}
+	// Re-checks (comet_reval) sent while nobody listened are lost too, so
+	// this tick re-checks every sub, as it re-runs every observer. It runs
+	// before fences are released, so an end still precedes the res of the
+	// method that caused it.
+	if listened > 0 {
+		e.handleReq(ctx, revalidateReq{all: true}, outFor)
 	}
 
 	// Coalescing connections (§8.1) get their held resets once their queue
@@ -629,11 +645,37 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			}
 		}
 
+	case revalidateReq:
+		// Not a rebind: the observers stay as they are; fn only re-checks
+		// access, so its Query is discarded.
+		for c, subs := range e.conns {
+			// A session whose identity changed since its subs were bound
+			// has a rebind queued, which re-checks them anyway.
+			ident := c.identity()
+			if c.isClosed() || (!r.all && ident.userID() != r.userID) {
+				continue
+			}
+			for s, sub := range subs {
+				if sub.userID != ident.userID() {
+					continue
+				}
+				if err := e.recheck(ctx, sub, ident); err != nil {
+					e.detach(sub)
+					delete(subs, s)
+					end(c, s, err)
+				}
+			}
+		}
+
 	case rebindReq:
 		// v1-core: identity change resets every sub (§3.2), all in this tick's tx.
-		for s, sub := range e.conns[r.c] {
+		// Every sub is detached before any rebinds, so observers only the old
+		// identity held are freed before MaxObservers is checked.
+		for _, sub := range e.conns[r.c] {
 			e.detach(sub)
 			sub.needInit, sub.needsReset = true, false
+		}
+		for s, sub := range e.conns[r.c] {
 			if err := e.bind(ctx, sub, r.ident); err != nil {
 				end(r.c, s, err)
 				delete(e.conns[r.c], s)
@@ -649,18 +691,52 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	if pub == nil {
 		return NewError(CodeNotFound, "unknown publication "+sub.name)
 	}
-	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.userID()))
+	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.Scope()))
+	// fn runs for every sub, not only the observer's first: it may check
+	// access for this caller. The key already determines the query, so a
+	// joining sub's Query is discarded. fn runs on the engine goroutine, so
+	// a panic would take down the process; end only this sub instead.
+	q, err := func() (q Query, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+			}
+		}()
+		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
+	}()
+	if err != nil {
+		return e.a.toWireError(err, "publication "+sub.name)
+	}
 	obs := e.observers[key]
 	if obs == nil {
-		q, err := pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
-		if err != nil {
-			return e.a.toWireError(err, "publication "+sub.name)
+		// Checked after fn, so its FORBIDDEN or VALIDATION wins over a
+		// retryable OVERLOADED.
+		if e.a.cfg.MaxObservers > 0 && len(e.observers) >= e.a.cfg.MaxObservers {
+			return NewError(CodeOverloaded, "too many live queries on the server")
 		}
 		obs = &observer{key: key, pub: pub, q: q, tables: pub.tables, subs: map[*subscription]struct{}{}}
 		e.observers[key] = obs
 	}
 	obs.subs[sub] = struct{}{}
-	sub.obs = obs
+	sub.obs, sub.userID = obs, ident.userID()
+	return nil
+}
+
+// recheck runs sub's fn for ident. A panic, which would otherwise take down
+// the engine goroutine, becomes INTERNAL.
+func (e *engine) recheck(ctx context.Context, sub *subscription, ident *Identity) *Error {
+	pub := e.a.pubs[sub.name]
+	_, err := func() (q Query, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+			}
+		}()
+		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
+	}()
+	if err != nil {
+		return e.a.toWireError(err, "publication "+sub.name)
+	}
 	return nil
 }
 
@@ -723,7 +799,20 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		if e.a.cfg.Metrics != nil {
 			start = time.Now()
 		}
-		r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		func() {
+			// Encoding Query.Args runs user code (driver.Valuer, pgx
+			// encoders) on the engine goroutine; a panic there fails only
+			// this observer. pgx encodes before sending, so sp is still
+			// usable for the rollback. A panic after sending (decoding
+			// rows) is caught too; rows.Close drains the result first, and
+			// if the rollback fails anyway the tick retries.
+			defer func() {
+				if p := recover(); p != nil {
+					qerr = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+				}
+			}()
+			r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		}()
 		if e.a.cfg.Metrics != nil {
 			r.took = time.Since(start)
 		}
@@ -863,11 +952,25 @@ func sameCols(a, b []colSpec) bool {
 
 // listen maintains the LISTEN connection (PROTOCOL.md §11).
 func (e *engine) listen(ctx context.Context) {
-	backoff := 500 * time.Millisecond
+	// Every gap delays the calls committed in it (they wait for the
+	// reconnect tick), so maxBackoff stays well under the default 5s
+	// FenceTimeout. A connection that stayed up for stableAfter resets the
+	// backoff; one that drops sooner keeps backing off, so a connection
+	// cut right after LISTEN cannot trigger an all-dirty re-run every
+	// 500ms.
+	const (
+		minBackoff  = 500 * time.Millisecond
+		maxBackoff  = 2 * time.Second
+		stableAfter = 30 * time.Second
+	)
+	backoff := minBackoff
 	for ctx.Err() == nil {
-		err := e.listenOnce(ctx)
+		listenedAt, err := e.listenOnce(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if !listenedAt.IsZero() && time.Since(listenedAt) >= stableAfter {
+			backoff = minBackoff
 		}
 		e.a.log.Warn("listener disconnected", "err", err, "retry", backoff)
 		e.a.metric(MetricListenReconnect, "", 1)
@@ -876,35 +979,46 @@ func (e *engine) listen(ctx context.Context) {
 			return
 		case <-time.After(backoff):
 		}
-		backoff = min(backoff*2, 10*time.Second)
+		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
-func (e *engine) listenOnce(ctx context.Context) error {
+// listenOnce runs one listener connection until it fails. It reports when
+// LISTEN succeeded, or the zero time if it did not.
+func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err error) {
 	conn, err := pgx.ConnectConfig(ctx, e.a.db.Config().ConnConfig.Copy())
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	defer conn.Close(context.Background())
 	// Fenced commits wait while LISTEN runs (listenMu).
 	e.listenMu.Lock()
-	for _, ch := range []string{"comet", evtChannel} {
+	for _, ch := range []string{"comet", evtChannel, revalChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			e.listenMu.Unlock()
-			return err
+			return time.Time{}, err
 		}
 	}
 	// Notifications sent while we were not listening are lost.
 	e.listening()
 	e.listenMu.Unlock()
+	listenedAt = time.Now()
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			return err
+			return listenedAt, err
 		}
-		if n.Channel == evtChannel {
+		switch n.Channel {
+		case evtChannel:
 			if evt, ok := parseEvt(n.Payload); ok {
 				e.notify(notification{evt: evt})
+			}
+			continue
+		case revalChannel:
+			// Enqueued before a fence notified later on this connection, so
+			// the re-check runs no later than the tick releasing the fence.
+			if n.Payload != "" {
+				e.enqueue(revalidateReq{userID: n.Payload})
 			}
 			continue
 		}

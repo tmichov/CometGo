@@ -51,10 +51,59 @@ func observerKey(pub, argsKey, scope string) string {
 	return pub + "\x00" + argsKey + "\x00" + scope
 }
 
+// revalChannel is the Postgres channel Revalidate travels on, so it reaches
+// sessions on every node listening to the same database. The payload is
+// the user ID.
+const revalChannel = "comet_reval"
+
+// Revalidate re-runs the publication fn of every live subscription held by
+// sessions whose Identity.UserID is userID, including sessions waiting to be
+// resumed, on every node listening to this database. A sub whose fn now
+// returns an error ends with that error; the others are untouched. Call it
+// after changing a permission that fn checks but that its query does not
+// read (a query that reads the permission table, listed in Tables, picks up
+// the change by itself).
+//
+// Only an error ends a sub: a fn that narrows its Query instead (say, to the
+// teams the user still belongs to) changes nothing, since the observer keeps
+// the Query it was created with. Any error ends the sub, a transient one too.
+//
+// It sends a notification and returns; each node re-checks on its next tick
+// after receiving it, against what fn reads then, so call it after the
+// change has committed. Inside a method, use Call.RevalidateAfterCommit. A
+// node whose listener is reconnecting when the notification is sent misses
+// it, as with events. An empty userID does nothing.
+func (a *App) Revalidate(ctx context.Context, userID string) error {
+	if userID == "" {
+		return nil // anonymous sessions have no per-user permission to revoke
+	}
+	_, err := a.db.Exec(ctx, "SELECT pg_notify($1, $2)", revalChannel, userID)
+	return err
+}
+
+// RevalidateAfterCommit is Revalidate inside the method's transaction: the
+// re-check is sent only if the transaction commits, and runs once the
+// method's writes are visible. A sub it ends gets its end before the
+// method's res (unless the call was sent with noFence).
+func (c *Call) RevalidateAfterCommit(userID string) error {
+	if c.app == nil {
+		return errors.New("cometgo: RevalidateAfterCommit needs a Call made by the framework")
+	}
+	if userID == "" {
+		return nil
+	}
+	// txid_current gives the transaction an ID even if the method writes
+	// nothing else, so a server that skips the fence for ID-less calls
+	// still sends the end before the res. pg_notify alone assigns none.
+	_, err := c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2), txid_current()", revalChannel, userID)
+	return err
+}
+
 // Emit sends an ephemeral event to every subscription of the publication
 // pubName with the given args and scope: the subs that share one observer.
 // args must encode to the same JSON value the client subscribed with. scope
-// is the user ID for a ScopeUser publication and is ignored for ScopeShared.
+// is the subscribers' scope key (Identity.ScopeKey, or UserID when that is
+// empty) for a ScopeUser publication and is ignored for ScopeShared.
 // The publication must have PubOptions.Events set.
 //
 // Delivery is at-most-once and best-effort: an event reaches the subs bound
@@ -96,8 +145,8 @@ func (a *App) evtPayload(pubName string, args any, scope, topic string, data any
 		return "", fmt.Errorf("cometgo: emit: publication %q does not have Events enabled", pubName)
 	}
 	if pub.opts.Scope == ScopeUser && scope == "" {
-		// "" is the anonymous scope; a missing user ID must not reach it.
-		return "", fmt.Errorf("cometgo: emit: publication %q is ScopeUser and needs a user ID as scope", pubName)
+		// "" is the anonymous scope; a missing scope key must not reach it.
+		return "", fmt.Errorf("cometgo: emit: publication %q is ScopeUser and needs a scope key (ScopeKey or UserID) as scope", pubName)
 	}
 	rawArgs, err := json.Marshal(args)
 	if err != nil {
@@ -123,9 +172,9 @@ func (a *App) evtPayload(pubName string, args any, scope, topic string, data any
 }
 
 // scopeKey is the scope part of an observer key (see engine.bind).
-func scopeKey(pub *publication, userID string) string {
+func scopeKey(pub *publication, scope string) string {
 	if pub.opts.Scope == ScopeUser {
-		return "u:" + userID
+		return "u:" + scope
 	}
 	return ""
 }
