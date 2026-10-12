@@ -49,6 +49,10 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `MaxInflight int` | 32 | Concurrent method calls per connection. A call over the limit gets `RATE_LIMITED` with `retryAfterMs: 100`. |
 | `MaxMsg int` | 1 MiB | Largest message the server accepts from a client. A larger message closes the connection. |
 | `MaxRows int` | 10,000 | Row cap per publication result. A larger result ends its subscriptions with `RESULT_TOO_LARGE`. |
+| `MaxObservers int` | 0 (no limit) | Live queries (observers) on the whole server. One observer serves every subscription with the same publication, args and scope. A subscription that would create one more is ended with `OVERLOADED` (after the publication's `fn` runs, so its own `FORBIDDEN` or `VALIDATION` comes first). Subscriptions that join an existing observer are not limited. The pool is shared, so one client with many distinct args can fill it for everyone. `MaxSubs` bounds each connection's share, so set `MaxObservers` well above the observers you expect, as a backstop rather than a quota. |
+| `MaxConns int` | 0 (no limit) | Open WebSocket connections. Over the limit, the upgrade is refused with HTTP 503 and `Retry-After: 5`. Browsers don't expose that header, so the TypeScript client retries with its normal jittered reconnect backoff. |
+| `MaxConnsPerIP int` | 0 (no limit) | Open WebSocket connections per `ClientIP`, refused the same way. Users behind one NAT share the limit. A connection that dropped without the server noticing (e.g. a network blip) keeps its slot until the heartbeat times it out, so a limit of 1 or 2 can refuse that user's own reconnect for up to three times `Heartbeat` (75 s by default). |
+| `ClientIP func(*http.Request) string` | host of `r.RemoteAddr`, also used when it returns `""` | The address `MaxConnsPerIP` counts against. Behind a reverse proxy, every connection comes from the proxy, so return the client address it forwards (e.g. from `X-Forwarded-For`, trusting only what your proxy sets), or leave `MaxConnsPerIP` at 0. |
 | `ResumeGrace` | 60s | How long a session outlives a lost connection, waiting for the client to resume it ([protocol §7.2](protocol.md#72-session-resume)). Unlike the other durations, a **negative** value disables resume, and clients then resync on every reconnect. See [Session resume](#session-resume). |
 | `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay, at most 4 MiB (half the outbound queue limit, since a resume sends the whole replay at once). A disconnected session that outgrows it ends, and its client resyncs. |
 | `Logger *slog.Logger` | `slog.Default()` | Where the framework logs, including the details of `INTERNAL` errors. |
@@ -295,6 +299,7 @@ Return a `*cometgo.Error` from a method, a publication or `Authenticate` to cont
 | `CodeTimeout` | `TIMEOUT` | a publication query exceeds `QueryTimeout` |
 | `CodeCanceled` | `CANCELED` | The client cancelled the call before it committed; nothing was written. |
 | `CodeResultTooLarge` | `RESULT_TOO_LARGE` | a publication result exceeds `MaxRows` |
+| `CodeOverloaded` | `OVERLOADED` | a subscription would create a live query over `MaxObservers` |
 | `CodeUnavailable` | `UNAVAILABLE` | never |
 | `CodeInternal` | `INTERNAL` | any error that is not a `*cometgo.Error` |
 

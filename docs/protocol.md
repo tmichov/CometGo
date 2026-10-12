@@ -365,6 +365,8 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 | `maxMsg` | 1 MiB | |
 | Per-observer row cap | 10,000 | Sub ends with `RESULT_TOO_LARGE`. |
 | Observer query hard timeout | 30 s | Sub ends with `TIMEOUT`. |
+| Server-wide observers | no limit | A sub that needs a new observer ends with `OVERLOADED`; a sub that joins an existing observer (same publication, args and scope) is unaffected. Not advertised: it depends on other clients. |
+| Open connections, total and per client IP | no limit | The upgrade is refused with HTTP 503 before any `welcome`; the client treats it as a failed connect and retries with backoff. Not advertised. |
 | **[later]** per-method rate limits | | Token bucket. |
 
 ### 8.4 [later] Slow observers
@@ -388,7 +390,7 @@ Cancel-and-retry is rejected because a query that always exceeds the deadline wo
 |---|---|
 | Request and auth | `BAD_REQUEST`, `VALIDATION` (`details.fields`), `UNAUTHENTICATED`, `AUTH_EXPIRED`, `FORBIDDEN` |
 | Data | `NOT_FOUND`, `CONFLICT` |
-| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE` |
+| Load and timing | `RATE_LIMITED`, `TIMEOUT`, `CANCELED`, `RESULT_TOO_LARGE`, `OVERLOADED` (server-wide capacity; retrying later may succeed) |
 | Server and connection | `UNAVAILABLE`, `INTERNAL` (`details.ref` is a log correlation ID; internals are never leaked), `CONNECTION_LOST` (synthesized by the client) |
 
 Application-defined codes are namespaced `app.<name>`.
