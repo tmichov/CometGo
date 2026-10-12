@@ -115,12 +115,21 @@ func cleanupInterval(ttl time.Duration) time.Duration {
 	return max(min(ttl, time.Hour), time.Minute)
 }
 
-func (a *App) deleteExpiredIK(ctx context.Context) error {
-	var exists bool
-	if err := a.db.QueryRow(ctx, `SELECT to_regclass('comet_idempotency') IS NOT NULL`).Scan(&exists); err != nil || !exists {
+// deleteExpiredIK runs on the cleanup goroutine, so a panic in a pool
+// tracer is recovered and logged as a failed cleanup. The connection is
+// acquired explicitly so such a panic releases it.
+func (a *App) deleteExpiredIK(ctx context.Context) (err error) {
+	defer recoverErr(&err)
+	pc, err := a.db.Acquire(ctx)
+	if err != nil {
 		return err
 	}
-	_, err := a.db.Exec(ctx, `DELETE FROM comet_idempotency WHERE created_at < now() - make_interval(secs => $1)`,
+	defer pc.Release()
+	var exists bool
+	if err := pc.QueryRow(ctx, `SELECT to_regclass('comet_idempotency') IS NOT NULL`).Scan(&exists); err != nil || !exists {
+		return err
+	}
+	_, err = pc.Exec(ctx, `DELETE FROM comet_idempotency WHERE created_at < now() - make_interval(secs => $1)`,
 		a.cfg.IdempotencyTTL.Seconds())
 	return err
 }

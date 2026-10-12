@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -212,25 +213,24 @@ func (l *errLogs) mustHavePanic(t *testing.T) {
 	}
 }
 
-// panicTracer panics once, in the engine's SET LOCAL, after being armed.
-type panicTracer struct{ armed atomic.Bool }
+// panicTracer panics once, on the first statement starting with prefix,
+// after being armed.
+type panicTracer struct {
+	prefix string
+	armed  atomic.Bool
+}
 
 func (p *panicTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
-	if strings.HasPrefix(d.SQL, "SET LOCAL statement_timeout") && p.armed.CompareAndSwap(true, false) {
+	if strings.HasPrefix(d.SQL, p.prefix) && p.armed.CompareAndSwap(true, false) {
 		panic("boom in tracer")
 	}
 	return ctx
 }
 
-func (p *panicTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
-
-// A pool tracer that panics while the engine opens a tick's snapshot does
-// not crash the server: the tick fails, is retried, and the write still
-// reaches the sub before the call's res.
-func TestPoolTracerPanicRetriesTick(t *testing.T) {
-	logs := &errLogs{}
-	tr := &panicTracer{}
-	e := setupFull(t, func(c *Config) {
+// tracedPool gives the app its own pool with tr as its tracer and logs to
+// logs.
+func tracedPool(t *testing.T, tr *panicTracer, logs *errLogs) func(*Config) {
+	return func(c *Config) {
 		c.Logger = slog.New(logs)
 		cfg, err := pgxpool.ParseConfig(os.Getenv("COMETGO_TEST_DATABASE_URL"))
 		if err != nil {
@@ -243,26 +243,112 @@ func TestPoolTracerPanicRetriesTick(t *testing.T) {
 		}
 		t.Cleanup(pool.Close)
 		c.DB = pool
-	}, nil)
-	a, _ := e.dial(t, nil)
-	subscribe(t, a, 1, "items.all")
+	}
+}
 
-	tr.armed.Store(true)
-	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "after"}})
-	if tx := a.next(); tx["t"] != "tx" || entries(tx)[0]["s"] != float64(1) {
-		t.Fatalf("expected tx for s1, got %v", tx)
+// mustHaveTracerPanic fails unless the tracer's panic was logged with its
+// stack.
+func (l *errLogs) mustHaveTracerPanic(t *testing.T) {
+	t.Helper()
+	l.mu.Lock()
+	logged := strings.Join(l.errs, "\n")
+	l.mu.Unlock()
+	if !strings.Contains(logged, "panic: boom in tracer") || !strings.Contains(logged, "runtime/debug.Stack") {
+		t.Fatalf("panic not logged with stack: %q", logged)
 	}
-	if r := a.next(); r["t"] != "res" || r["ok"] != true {
-		t.Fatalf("res %v", r)
+}
+
+func (p *panicTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// A pool tracer that panics while the engine opens a tick's snapshot does
+// not crash the server: the tick fails, is retried, and the write still
+// reaches the sub before the call's res. A panic during BEGIN must not leak
+// the pool connection either, or the test's pool.Close hangs.
+func TestPoolTracerPanicRetriesTick(t *testing.T) {
+	// The snapshot's BEGIN (before a tx holds the connection) and its SET
+	// LOCAL (inside the tx).
+	for _, prefix := range []string{"begin isolation level repeatable read", "SET LOCAL statement_timeout"} {
+		t.Run(prefix, func(t *testing.T) {
+			logs := &errLogs{}
+			tr := &panicTracer{prefix: prefix}
+			e := setupFull(t, tracedPool(t, tr, logs), nil)
+			a, _ := e.dial(t, nil)
+			subscribe(t, a, 1, "items.all")
+
+			tr.armed.Store(true)
+			a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "after"}})
+			if tx := a.next(); tx["t"] != "tx" || entries(tx)[0]["s"] != float64(1) {
+				t.Fatalf("expected tx for s1, got %v", tx)
+			}
+			if r := a.next(); r["t"] != "res" || r["ok"] != true {
+				t.Fatalf("res %v", r)
+			}
+			if tr.armed.Load() {
+				t.Fatal("tracer never panicked")
+			}
+			logs.mustHaveTracerPanic(t)
+		})
 	}
+}
+
+// A pool tracer that panics on a method call's BEGIN or COMMIT fails only
+// that call, with INTERNAL, and drops any fence it registered. The server
+// keeps answering calls. No sub is open, so the engine runs no BEGIN or
+// COMMIT of its own that the tracer could hit instead.
+func TestPoolTracerPanicFailsOnlyThatCall(t *testing.T) {
+	for _, sql := range []string{"begin", "commit"} {
+		t.Run(sql, func(t *testing.T) {
+			logs := &errLogs{}
+			tr := &panicTracer{prefix: sql}
+			e := setupFull(t, tracedPool(t, tr, logs), nil)
+			a, _ := e.dial(t, nil)
+			tr.armed.Store(true)
+			a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "boom-" + sql}})
+			r := a.next()
+			if end, _ := r["err"].(map[string]any); r["t"] != "res" || r["ok"] != false || !isInternal(end) {
+				t.Fatalf("res %v", r)
+			}
+			if tr.armed.Load() {
+				t.Fatal("tracer never panicked")
+			}
+			logs.mustHaveTracerPanic(t)
+			e.app.engine.mu.Lock()
+			fences := len(e.app.engine.fences)
+			e.app.engine.mu.Unlock()
+			if fences != 0 {
+				t.Fatalf("%d fences left registered", fences)
+			}
+			if n := e.countRows(t, "SELECT count(*) FROM "+e.table+" WHERE name = 'boom-"+sql+"'"); n != 0 {
+				t.Fatalf("failed call wrote %d rows", n)
+			}
+			a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "x", "Name": "after"}})
+			if r := a.next(); r["t"] != "res" || r["ok"] != true {
+				t.Fatalf("call after the panic: %v", r)
+			}
+		})
+	}
+}
+
+// A pool tracer that panics on the listener's LISTEN drops that
+// connection like a network error: the listener reconnects and live
+// updates flow.
+func TestPoolTracerPanicOnListenReconnects(t *testing.T) {
+	logs := &errLogs{}
+	tr := &panicTracer{prefix: "LISTEN "}
+	tr.armed.Store(true) // the first LISTEN, at Start
+	e := setupFull(t, tracedPool(t, tr, logs), nil)
+	e.waitListening(t)
 	if tr.armed.Load() {
 		t.Fatal("tracer never panicked")
 	}
-	logs.mu.Lock()
-	logged := strings.Join(logs.errs, "\n")
-	logs.mu.Unlock()
-	if !strings.Contains(logged, "panic: boom in tracer") || !strings.Contains(logged, "runtime/debug.Stack") {
-		t.Fatalf("panic not logged with stack: %q", logged)
+	logs.mustHaveTracerPanic(t)
+	a, _ := e.dial(t, nil)
+	subscribe(t, a, 1, "items.all")
+	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('x', 'live')"); err != nil {
+		t.Fatal(err)
+	}
+	if tx := a.next(); tx["t"] != "tx" || entries(tx)[0]["s"] != float64(1) {
+		t.Fatalf("expected tx for s1, got %v", tx)
 	}
 }
 
@@ -306,5 +392,32 @@ func TestPanickedErrorKeepsItsClass(t *testing.T) {
 	a.send(map[string]any{"t": "sub", "s": 2, "name": "forbidden"})
 	if end, _ := entries(a.next())[0]["end"].(map[string]any); end["code"] != CodeInternal {
 		t.Fatalf("forbidden end: %v", end)
+	}
+}
+
+// A call waiting on its fence does not hold a pool connection: with the
+// engine stuck in a slow query, the only connection acquired is the
+// engine's.
+func TestFenceWaitReleasesConnection(t *testing.T) {
+	e := setupFull(t, nil, func(env *testEnv, app *App) {
+		Publish(app, "slow", PubOptions{Tables: []string{env.table}}, func(c *SubCtx, _ struct{}) (Query, error) {
+			return Query{SQL: "SELECT 1 AS id FROM pg_sleep(3)"}, nil
+		})
+	})
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "slow"})
+	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "fenced"}})
+	// The call has committed once its row is visible; its fence waits for
+	// the stalled engine.
+	for deadline := time.Now().Add(2 * time.Second); e.countRows(t, "SELECT count(*) FROM "+e.table+" WHERE name = 'fenced'") == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("call never committed")
+		}
+	}
+	// Within the slow query's 3s, only the engine's connection stays out.
+	for deadline := time.Now().Add(time.Second); e.pool.Stat().AcquiredConns() != 1; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d connections acquired during the fence wait, want 1 (the engine's)", e.pool.Stat().AcquiredConns())
+		}
 	}
 }

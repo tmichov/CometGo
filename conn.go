@@ -798,6 +798,18 @@ func (c *conn) call(msg *clientMsg, ident *Identity, hctx context.Context, r *ru
 // runCall runs the handler with hctx, which the client's cancel cancels, and
 // everything after it (commit, fence) with a context cancel cannot reach.
 func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (val json.RawMessage, lag bool, err error) {
+	// Pool hooks and tracers run user code in Begin, claimIK, storeIK, the
+	// fence and the commit, outside the handler's own recover. A panic there
+	// fails this call with INTERNAL rather than the process. A call that
+	// fails after registering a fence drops it (deferred first, so it runs
+	// after recoverErr has set err).
+	var token string
+	defer func() {
+		if err != nil && token != "" {
+			c.a.engine.dropFence(token)
+		}
+	}()
+	defer recoverErr(&err)
 	m := c.a.methods[msg.M]
 	if m == nil {
 		return nil, false, NewError(CodeNotFound, "unknown method "+msg.M)
@@ -810,7 +822,14 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	if hctx.Err() != nil {
 		return nil, false, NewError(CodeCanceled, "call canceled") // before it started
 	}
-	tx, err := c.a.db.Begin(ctx)
+	// Acquired explicitly: pgxpool's Begin does not release its connection
+	// when a tracer panics during BEGIN, so the panic would leak it.
+	pc, err := c.a.db.Acquire(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer pc.Release()
+	tx, err := pc.Begin(ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -865,14 +884,14 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	// this transaction. A transaction with no ID wrote nothing and has no
 	// effects to wait for, so it is not fenced; EmitAfterCommit assigns one.
 	// A replay is always fenced: the original may still be running.
-	token, f := c.a.engine.registerFence(c)
+	var f *fence
+	token, f = c.a.engine.registerFence(c)
 	fenceSQL := "SELECT pg_notify('comet', $1) WHERE txid_current_if_assigned() IS NOT NULL"
 	if stored != nil {
 		fenceSQL = "SELECT pg_notify('comet', $1)"
 	}
 	tag, err := tx.Exec(ctx, fenceSQL, "1|f|"+token)
 	if err != nil {
-		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
 	if tag.RowsAffected() == 0 {
@@ -880,9 +899,11 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		return val, false, tx.Commit(ctx)
 	}
 	if err := c.a.engine.commitFenced(ctx, tx, token); err != nil {
-		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
+	// Committed: return the connection before waiting on the fence, as
+	// pgxpool's Tx.Commit would (Release is idempotent; the defer is a no-op).
+	pc.Release()
 	var committed time.Time
 	if c.a.cfg.Metrics != nil {
 		committed = time.Now()
