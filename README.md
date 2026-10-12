@@ -1,5 +1,7 @@
 # CometGo
 
+> **Preview (v0.1.0).** CometGo works end to end, but it is young: read the [known limitations](docs/limitations.md) before relying on it, and expect the API to change before 1.0 ([stability policy](docs/stability.md)).
+
 A realtime web framework for Go, inspired by MeteorJS.
 
 - **The Go server serves your UI** and pushes live data over WebSocket.
@@ -9,15 +11,27 @@ A realtime web framework for Go, inspired by MeteorJS.
 
 ## Quick start
 
+### Try the todo example
+
 Requires Go 1.25+, Node 22.18+ and Docker.
 
 ```sh
+git clone https://github.com/tmichov/CometGo.git && cd CometGo
 make db      # Postgres on localhost:54329
 npm install
 make todo    # builds the UI and serves it at http://localhost:8080
 ```
 
-Open the page in two tabs: changes appear in both.
+Open the page in two tabs: changes appear in both. [Getting started](docs/getting-started.md) walks through how the example is built.
+
+### Add it to your app
+
+```sh
+go get github.com/tmichov/cometgo@v0.1.0   # the server
+npm install @cometgo/client                 # the browser client (React hooks: @cometgo/client/react)
+```
+
+Then follow the [server](docs/server.md) and [client](docs/client.md) guides.
 
 ## Documentation
 

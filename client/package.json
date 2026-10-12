@@ -4,6 +4,12 @@
   "description": "TypeScript client for CometGo",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tmichov/CometGo.git",
+    "directory": "client"
+  },
+  "homepage": "https://github.com/tmichov/CometGo#readme",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
