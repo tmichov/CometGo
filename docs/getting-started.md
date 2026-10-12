@@ -56,7 +56,7 @@ cometgo.Publish(app, "todos.all", cometgo.PubOptions{Tables: []string{"todos"}, 
 
 - `Tables` lists every table the query reads. A change to any of them re-runs the query.
 - The result's key column defaults to `id`.
-- `ScopeShared` is correct here only because the demo has no users: every visitor sees the same list, so all connections can share one copy of the query. Any query that depends on who is asking must keep the default `ScopeUser`. See [Server: Scope](server.md#scope).
+- `ScopeShared` is correct here only because the demo has no users: every visitor sees the same list, so all connections can share one copy of the query. Any query that depends on who is asking must keep the default `ScopeUser`. See [Server: Scope](server.md#scope), and [Server: Authorization](server.md#authorization) for where to put access checks.
 - `ORDER BY` makes the order deterministic. The client never sorts; it shows rows in the order the server sends.
 
 ### 4. Methods

@@ -442,12 +442,12 @@ All notifications use channel `comet`. Payload fields are separated by `|`, and 
 | Fence | `1\|f\|<nodeId>:<counter>` | |
 
 **Row notifications:**
-- Emitted by **statement-level AFTER triggers with transition tables** (PG 10+), one trigger per event (INSERT, UPDATE, DELETE), because a transition-table trigger cannot list several events.
-- Each builds `json_agg(json_build_array(pk…))` from the transition table and chunks the payload to at most 7,500 bytes (the hard limit is 8,000).
+- Emitted by **statement-level AFTER triggers with transition tables** (PG 10+; the server's triggers use `EXECUTE FUNCTION`, so they need PG 11+), one trigger per event (INSERT, UPDATE, DELETE), because a transition-table trigger cannot list several events.
+- Each sends **one** notification per statement, listing the changed PKs as a JSON array of PK arrays built from the transition table. Payloads are not chunked: if the statement changed more than 1,000 rows, or the payload would exceed 7,500 bytes (the hard limit is 8,000), the trigger sends a table-dirty notification instead.
 - An UPDATE reports the union of old and new PKs, so primary-key changes are handled.
 - PK values use the wire encoding (int8 as text).
 
-**Table-dirty notifications** are emitted when a statement touches more than 1,000 rows, for TRUNCATE (`T`, via a statement trigger), or when a PK set would not fit.
+**Table-dirty notifications** are emitted when a statement touches more than 1,000 rows, for TRUNCATE (`T`, via a statement trigger), or when its PK list would exceed 7,500 bytes. They carry no keys, so every observer of the table re-runs, including observers that declare `Query.Match`: Match filtering is off for that write.
 
 **Observer invalidation:**
 - Observers declare the tables they read. Any notification for one of those tables marks the observer dirty.
