@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -71,7 +72,12 @@ func claimIK(ctx context.Context, tx pgx.Tx, ik, userID, method string) (stored 
 			return nil, err
 		}
 		if storedMethod != method {
-			return nil, NewError(CodeBadRequest, "idempotency key already used for method "+storedMethod)
+			// The stored method may carry a ScopeKey (ikMethod); don't echo it.
+			storedName, _, _ := strings.Cut(storedMethod, "\x1f")
+			if name, _, _ := strings.Cut(method, "\x1f"); name == storedName {
+				return nil, NewError(CodeBadRequest, "idempotency key already used under another scope")
+			}
+			return nil, NewError(CodeBadRequest, "idempotency key already used for method "+storedName)
 		}
 		return result, nil
 	}

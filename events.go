@@ -102,7 +102,8 @@ func (c *Call) RevalidateAfterCommit(userID string) error {
 // Emit sends an ephemeral event to every subscription of the publication
 // pubName with the given args and scope: the subs that share one observer.
 // args must encode to the same JSON value the client subscribed with. scope
-// is the user ID for a ScopeUser publication and is ignored for ScopeShared.
+// is the subscribers' scope key (Identity.ScopeKey, or UserID when that is
+// empty) for a ScopeUser publication and is ignored for ScopeShared.
 // The publication must have PubOptions.Events set.
 //
 // Delivery is at-most-once and best-effort: an event reaches the subs bound
@@ -144,8 +145,8 @@ func (a *App) evtPayload(pubName string, args any, scope, topic string, data any
 		return "", fmt.Errorf("cometgo: emit: publication %q does not have Events enabled", pubName)
 	}
 	if pub.opts.Scope == ScopeUser && scope == "" {
-		// "" is the anonymous scope; a missing user ID must not reach it.
-		return "", fmt.Errorf("cometgo: emit: publication %q is ScopeUser and needs a user ID as scope", pubName)
+		// "" is the anonymous scope; a missing scope key must not reach it.
+		return "", fmt.Errorf("cometgo: emit: publication %q is ScopeUser and needs a scope key (ScopeKey or UserID) as scope", pubName)
 	}
 	rawArgs, err := json.Marshal(args)
 	if err != nil {
@@ -171,9 +172,9 @@ func (a *App) evtPayload(pubName string, args any, scope, topic string, data any
 }
 
 // scopeKey is the scope part of an observer key (see engine.bind).
-func scopeKey(pub *publication, userID string) string {
+func scopeKey(pub *publication, scope string) string {
 	if pub.opts.Scope == ScopeUser {
-		return "u:" + userID
+		return "u:" + scope
 	}
 	return ""
 }

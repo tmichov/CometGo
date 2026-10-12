@@ -23,8 +23,14 @@ import (
 // Identity is an authenticated principal.
 type Identity struct {
 	// UserID identifies the user. Publications with ScopeUser are shared only
-	// between connections with the same UserID.
+	// between connections with the same Scope().
 	UserID string
+	// ScopeKey, if set, partitions one user's identities, e.g. by tenant: two
+	// identities with the same UserID but different ScopeKey get separate
+	// ScopeUser observers and Emit targets, and are different principals for
+	// resume, re-auth and idempotency keys. Set it when the query depends on
+	// more than the user. It is always combined with UserID (see Scope).
+	ScopeKey string
 	// User is sent to the client in welcome/authRes. Defaults to {"id": UserID}.
 	User any
 	// ExpiresAt, if set, downgrades the connection to anonymous when reached
@@ -39,6 +45,31 @@ func (id *Identity) userID() string {
 		return ""
 	}
 	return id.UserID
+}
+
+// Scope is the identity's scope: what ScopeUser observers are keyed by and
+// what Emit's scope argument must be. It is UserID when ScopeKey is empty,
+// otherwise UserID and ScopeKey joined by a NUL byte, so it never equals
+// another user's scope as long as UserIDs contain no NUL. "" when nil.
+func (id *Identity) Scope() string {
+	if id == nil {
+		return ""
+	}
+	if id.ScopeKey == "" {
+		return id.UserID
+	}
+	return id.UserID + "\x00" + id.ScopeKey
+}
+
+// ikMethod is the method recorded with an idempotency key. Keys are stored
+// per UserID (so rows written before ScopeKey was set still match); the
+// ScopeKey rides along so a key reused under another scope is refused rather
+// than run again or answered with the other scope's result.
+func ikMethod(method string, id *Identity) string {
+	if id == nil || id.ScopeKey == "" {
+		return method
+	}
+	return method + "\x1f" + id.ScopeKey // Postgres text cannot hold NUL
 }
 
 func (id *Identity) wireUser() any {
