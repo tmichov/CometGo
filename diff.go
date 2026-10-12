@@ -83,6 +83,11 @@ func snapshotOps(r *result, ordered bool) []op {
 	return ops
 }
 
+// resetMoves is the fewest moved rows for which diffResults resets instead
+// of diffing, when they are also most of the surviving rows. Below it moves
+// are cheap, and smaller on the wire than a snapshot.
+const resetMoves = 64
+
 // diffResults returns ops that transform old into new.
 //
 // Unordered: deletes, then inserts and patches, no positions.
@@ -93,8 +98,11 @@ func snapshotOps(r *result, ordered bool) []op {
 // its final position, each placed directly after its final predecessor. A
 // placed row stays adjacent to its predecessor because later placements only
 // ever go after their own predecessor, so the sequence ends exactly at new.
-func diffResults(old, new *result, ordered bool) []op {
-	var ops []op
+//
+// Each move costs O(len(old)) here and in the client, so when most rows move
+// (see resetMoves) diffResults returns reset instead of ops: the caller
+// sends a fresh snapshot, which is linear to build and apply.
+func diffResults(old, new *result, ordered bool) (ops []op, reset bool) {
 	cur := make([]string, 0, len(old.keys))
 	for _, k := range old.keys {
 		if _, ok := new.rows[k]; ok {
@@ -113,7 +121,7 @@ func diffResults(old, new *result, ordered bool) []op {
 				ops = append(ops, *p)
 			}
 		}
-		return ops
+		return ops, false
 	}
 
 	newPos := make(map[string]int, len(new.keys))
@@ -124,8 +132,12 @@ func diffResults(old, new *result, ordered bool) []op {
 	for i, k := range cur {
 		seq[i] = newPos[k]
 	}
+	keep := lis(seq)
+	if moved := len(cur) - len(keep); moved >= resetMoves && moved > len(cur)/2 {
+		return nil, true
+	}
 	stable := make(map[string]bool, len(cur))
-	for _, i := range lis(seq) {
+	for _, i := range keep {
 		stable[cur[i]] = true
 	}
 
@@ -157,7 +169,7 @@ func diffResults(old, new *result, ordered bool) []op {
 			}
 		}
 	}
-	return ops
+	return ops, false
 }
 
 func patchOf(key string, oldRow, newRow []json.RawMessage) *op {

@@ -544,3 +544,31 @@ func TestFailedAuthKeepsExpiry(t *testing.T) {
 		t.Fatalf("want AUTH_EXPIRED push, got %v", r)
 	}
 }
+
+// A reorder that moves most rows reaches subscribers as a reset snapshot,
+// not as one move per row.
+func TestLargeReorderResets(t *testing.T) {
+	e := setupFull(t, nil, func(e *testEnv, app *App) {
+		Publish(app, "items.byN", PubOptions{Tables: []string{e.table}, Scope: ScopeShared},
+			func(*SubCtx, struct{}) (Query, error) {
+				return Query{SQL: "SELECT id, n FROM " + e.table + " ORDER BY n"}, nil
+			})
+	})
+	ctx := context.Background()
+	if _, err := e.pool.Exec(ctx, "INSERT INTO "+e.table+" (owner, name, n) SELECT 'o', 'r', i FROM generate_series(1, 200) i"); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.byN"})
+	a.next()
+	if _, err := e.pool.Exec(ctx, "UPDATE "+e.table+" SET n = -n"); err != nil {
+		t.Fatal(err)
+	}
+	en := entries(a.next())
+	if len(en) != 1 || en[0]["reset"] != true || en[0]["init"] == nil || len(en[0]["ops"].([]any)) != 200 {
+		t.Fatalf("want a 200-row reset, got %v", en)
+	}
+	if first := en[0]["ops"].([]any)[0].([]any); first[0] != "i" || first[2].([]any)[1] != float64(-200) {
+		t.Fatalf("reset not in the new order: first op %v", first)
+	}
+}

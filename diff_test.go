@@ -100,8 +100,8 @@ func TestDiffMinimalCases(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			old, new := mkResult(c.old, v), mkResult(c.new, v)
-			ops := diffResults(old, new, true)
-			if len(ops) != c.wantOps {
+			ops, reset := diffResults(old, new, true)
+			if reset || len(ops) != c.wantOps {
 				t.Fatalf("got %d ops, want %d: %v", len(ops), c.wantOps, ops)
 			}
 			if got := applyOps(t, old, ops); !sameResult(got, new) {
@@ -111,10 +111,55 @@ func TestDiffMinimalCases(t *testing.T) {
 	}
 }
 
+// A reorder that moves most rows resets instead of diffing; one that moves
+// few rows, or fewer than resetMoves, still diffs.
+func TestDiffResetsLargeReorders(t *testing.T) {
+	v := func(string) string { return "1" }
+	keys := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("k%d", i)
+		}
+		return out
+	}
+	big := keys(10000)
+	reversed := slices.Clone(big)
+	slices.Reverse(reversed)
+	if ops, reset := diffResults(mkResult(big, v), mkResult(reversed, v), true); !reset || ops != nil {
+		t.Fatalf("reversed 10000 rows: reset %v, %d ops", reset, len(ops))
+	}
+	if _, reset := diffResults(mkResult(big, v), mkResult(reversed, v), false); reset {
+		t.Fatal("unordered diff reset")
+	}
+	oneMoved := append(slices.Clone(big[1:]), big[0])
+	if ops, reset := diffResults(mkResult(big, v), mkResult(oneMoved, v), true); reset || len(ops) != 1 {
+		t.Fatalf("one row moved: reset %v, %d ops", reset, len(ops))
+	}
+	// resetMoves-1 moves out of resetMoves rows: most rows, but few.
+	small := keys(resetMoves)
+	smallRev := slices.Clone(small)
+	slices.Reverse(smallRev)
+	old, new := mkResult(small, v), mkResult(smallRev, v)
+	ops, reset := diffResults(old, new, true)
+	if reset || len(ops) != resetMoves-1 {
+		t.Fatalf("small reversal: reset %v, %d ops", reset, len(ops))
+	}
+	if got := applyOps(t, old, ops); !sameResult(got, new) {
+		t.Fatal("small reversal: apply mismatch")
+	}
+	// One more row makes the moves reach resetMoves.
+	small = keys(resetMoves + 1)
+	smallRev = slices.Clone(small)
+	slices.Reverse(smallRev)
+	if _, reset := diffResults(mkResult(small, v), mkResult(smallRev, v), true); !reset {
+		t.Fatal("reversal of resetMoves+1 rows did not reset")
+	}
+}
+
 func TestDiffPatchOnlyChangedColumns(t *testing.T) {
 	old := mkResult([]string{"a"}, func(string) string { return "1" })
 	new := mkResult([]string{"a"}, func(string) string { return "2" })
-	ops := diffResults(old, new, true)
+	ops, _ := diffResults(old, new, true)
 	if len(ops) != 1 || ops[0].kind != opUpdate || !slices.Equal(ops[0].patch, []int{1}) || ops[0].hasIdx {
 		t.Fatalf("unexpected ops %+v", ops)
 	}
@@ -156,7 +201,11 @@ func TestDiffRandomOrdered(t *testing.T) {
 	for i := range 20000 {
 		old, new := randomPair(rng)
 		for _, ordered := range []bool{true, false} {
-			got := applyOps(t, old, diffResults(old, new, ordered))
+			ops, reset := diffResults(old, new, ordered)
+			if reset {
+				t.Fatalf("case %d: reset for %d rows", i, len(old.keys))
+			}
+			got := applyOps(t, old, ops)
 			if !ordered {
 				// Unordered subs only promise the same row set.
 				slices.Sort(got.keys)
@@ -194,7 +243,8 @@ func TestWriteDiffVectors(t *testing.T) {
 	for i := range 300 {
 		old, new := randomPair(rng)
 		ordered := i%4 != 0
-		vecs = append(vecs, vec{ordered, rows(old), rows(new), diffResults(old, new, ordered)})
+		ops, _ := diffResults(old, new, ordered) // never a reset at this size
+		vecs = append(vecs, vec{ordered, rows(old), rows(new), ops})
 	}
 	b, err := json.Marshal(vecs)
 	if err != nil {
