@@ -148,3 +148,19 @@ func TestStartRetryAfterFix(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// New refuses a pool of one connection, where a tick resolving column types
+// would wait forever for a second one.
+func TestNewRejectsSingleConnPool(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), "postgres://x:x@127.0.0.1:1/x?pool_max_conns=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	defer func() {
+		if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), "MaxConns >= 2") {
+			t.Fatalf("New with MaxConns=1: recovered %v, want MaxConns panic", r)
+		}
+	}()
+	New(Config{DB: pool})
+}

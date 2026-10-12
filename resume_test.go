@@ -472,7 +472,12 @@ func TestNormalCloseEndsSession(t *testing.T) {
 }
 
 func TestResumeBufferClampedToOutboundQueue(t *testing.T) {
-	a := New(Config{DB: &pgxpool.Pool{}, ResumeBuffer: 64 << 20})
+	pool, err := pgxpool.New(context.Background(), "postgres://x:x@127.0.0.1:1/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	a := New(Config{DB: pool, ResumeBuffer: 64 << 20})
 	if a.cfg.ResumeBuffer != maxQueuedBytes/2 {
 		t.Fatalf("ResumeBuffer %d", a.cfg.ResumeBuffer)
 	}

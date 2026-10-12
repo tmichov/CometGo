@@ -23,7 +23,7 @@ Register every publication and method before `Start` and before serving requests
 
 | Identifier | Description |
 |---|---|
-| `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil. |
+| `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil or its `MaxConns` is below 2. |
 | `(*App) Start(ctx) error` | Checks every publication's `Tables` (see [Table checks at Start](#table-checks-at-start)), then starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. If the check fails, it returns the error and starts nothing, and `Start` may be called again. Panics if called again after succeeding. |
 | `(*App) Shutdown(ctx) error` | Stops the server gracefully: see [Graceful shutdown](#graceful-shutdown). |
 | `(*App) Revalidate(ctx, userID)` | Re-checks a user's live subscriptions, on every node, after a permission change: see [Revoking access](#revoking-access-revalidate). |
@@ -36,7 +36,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 
 | Field | Default | Meaning |
 |---|---|---|
-| `DB *pgxpool.Pool` | required | Pool used for publication queries, method transactions and the `LISTEN` connection. |
+| `DB *pgxpool.Pool` | required | Pool used for publication queries, method transactions and the `LISTEN` connection. Needs `MaxConns` of at least 2 (`pool_max_conns`): a tick holds one connection while it looks up column types on another. |
 | `Authenticate` | nil | Validates bearer tokens. See [Authentication](#authentication). If nil, every token is rejected with `UNAUTHENTICATED`. |
 | `AuthenticateRequest` | nil | Resolves a cookie-session identity at WebSocket upgrade. See [Authentication](#authentication). |
 | `Build string` | `""` | Identifies the current client build. Sent to clients in `welcome`, where the client exposes it as `comet.serverBuild`. The server does not compare it with anything. |
