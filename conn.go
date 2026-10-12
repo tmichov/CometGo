@@ -60,6 +60,12 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var cookieErr error
 	if a.cfg.AuthenticateRequest != nil {
 		cookieIdent, cookieErr = a.cfg.AuthenticateRequest(r)
+		if cookieErr == nil {
+			if err := cookieIdent.validate(); err != nil {
+				a.log.Error("AuthenticateRequest returned an invalid identity", "err", err)
+				cookieIdent, cookieErr = nil, err
+			}
+		}
 	}
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:   []string{Subprotocol},
@@ -229,10 +235,12 @@ func (a *App) serve(s *socket, cookieIdent *Identity, cookieErr error) {
 	}
 	if first.T != "hello" {
 		s.fail(closeProtocol, "PROTOCOL", "first message must be hello")
+		<-s.ctx.Done() // fail cancels after its close frame; CloseNow would cut it off
 		return
 	}
 	c := a.hello(s, first, cookieIdent, cookieErr)
 	if c == nil {
+		<-s.ctx.Done() // hello failed the socket; see above
 		return
 	}
 	defer c.socketLost(s)
@@ -583,6 +591,10 @@ func (a *App) authenticate(ctx context.Context, token string) (*Identity, *Error
 	}
 	if ident == nil {
 		return nil, NewError(CodeUnauthenticated, "invalid token")
+	}
+	if err := ident.validate(); err != nil {
+		a.log.Error("Authenticate returned an invalid identity", "err", err)
+		return nil, NewError(CodeUnauthenticated, "invalid identity")
 	}
 	return ident, nil
 }

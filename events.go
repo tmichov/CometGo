@@ -46,7 +46,7 @@ type evtNote struct {
 }
 
 // observerKey identifies the observer for (publication, canonical args,
-// scope key). engine.bind and event delivery both use it.
+// scopeKey). engine.bind and event delivery both use it.
 func observerKey(pub, argsKey, scope string) string {
 	return pub + "\x00" + argsKey + "\x00" + scope
 }
@@ -102,8 +102,9 @@ func (c *Call) RevalidateAfterCommit(userID string) error {
 // Emit sends an ephemeral event to every subscription of the publication
 // pubName with the given args and scope: the subs that share one observer.
 // args must encode to the same JSON value the client subscribed with. scope
-// is the subscribers' scope key (Identity.ScopeKey, or UserID when that is
-// empty) for a ScopeUser publication and is ignored for ScopeShared.
+// is the subscribers' Identity.Scope() (their UserID when they have no
+// ScopeKey) for a ScopeUser publication and is ignored for ScopeShared.
+// The bare ScopeKey is not a scope: an event sent to it reaches no one.
 // The publication must have PubOptions.Events set.
 //
 // Delivery is at-most-once and best-effort: an event reaches the subs bound
@@ -120,7 +121,8 @@ func (a *App) Emit(ctx context.Context, pubName string, args any, scope, topic s
 	return err
 }
 
-// EmitAfterCommit is Emit inside the method's transaction: the event is sent
+// EmitAfterCommit is Emit inside the method's transaction, with the same
+// arguments (scope is the subscribers' Identity.Scope()): the event is sent
 // only if the transaction commits, and reaches subscribers after the tx
 // carrying the method's writes and before the method's res (unless the call
 // was sent with noFence, whose res does not wait).
@@ -148,8 +150,8 @@ func (a *App) evtPayload(pubName string, args any, scope, topic string, data any
 		return "", fmt.Errorf("cometgo: emit: publication %q does not have Events enabled", pubName)
 	}
 	if pub.opts.Scope == ScopeUser && scope == "" {
-		// "" is the anonymous scope; a missing scope key must not reach it.
-		return "", fmt.Errorf("cometgo: emit: publication %q is ScopeUser and needs a scope key (ScopeKey or UserID) as scope", pubName)
+		// "" is the anonymous scope; a missing scope must not reach it.
+		return "", fmt.Errorf("cometgo: emit: publication %q is ScopeUser and needs the subscribers' Identity.Scope() as scope", pubName)
 	}
 	rawArgs, err := json.Marshal(args)
 	if err != nil {

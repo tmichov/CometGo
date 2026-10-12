@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -45,6 +46,24 @@ func (id *Identity) userID() string {
 		return ""
 	}
 	return id.UserID
+}
+
+// validate rejects a UserID or ScopeKey that Postgres text cannot store
+// (idempotency rows, revalidate payloads) or that would break Scope's NUL
+// separator. nil (anonymous) is valid.
+func (id *Identity) validate() error {
+	if id == nil {
+		return nil
+	}
+	for _, f := range [...]struct{ name, v string }{{"UserID", id.UserID}, {"ScopeKey", id.ScopeKey}} {
+		if strings.IndexByte(f.v, 0) >= 0 {
+			return fmt.Errorf("Identity.%s contains a NUL byte", f.name)
+		}
+		if !utf8.ValidString(f.v) {
+			return fmt.Errorf("Identity.%s is not valid UTF-8", f.name)
+		}
+	}
+	return nil
 }
 
 // Scope is the identity's scope: what ScopeUser observers are keyed by and

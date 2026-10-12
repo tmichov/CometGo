@@ -358,6 +358,8 @@ Publications and methods see it as `c.Identity` (nil when anonymous). `User` is 
 - cannot [resume](#session-resume) each other's sessions;
 - cannot reuse each other's [idempotency keys](#idempotency-keys).
 
+`UserID` and `ScopeKey` must be valid UTF-8 and contain no NUL byte: Postgres `text` cannot store a NUL, and `Scope()` uses NUL as its separator. An identity that breaks this is refused as an invalid login: `Authenticate`'s token is rejected with `UNAUTHENTICATED`, and an `AuthenticateRequest` session is closed with 4401, as if the function had returned an error. Either way the server logs which field was wrong.
+
 `ScopeKey` only partitions a single user; it never makes different users share. To share data across a tenant, use `ScopeShared` with the tenant in the args, and check membership in `fn`.
 
 There are two ways to authenticate.
