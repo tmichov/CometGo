@@ -105,8 +105,9 @@ type observer struct {
 	dirty bool
 
 	// Per-tick output.
-	ops []op
-	err *Error
+	ops      []op
+	snapJSON []json.RawMessage // snapshot ops, built on the first snapshotEntry
+	err      *Error
 }
 
 type subscription struct {
@@ -507,7 +508,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 				outFor(sub.c).entries = append(outFor(sub.c).entries, subEntry{S: sub.s, Ops: opsJSON})
 			}
 		}
-		obs.ops = nil
+		obs.ops, obs.snapJSON = nil, nil
 	}
 	e.flush(out)
 	for c := range snapped {
@@ -574,11 +575,15 @@ func (e *engine) snapshotEntry(sub *subscription) subEntry {
 	if len(obs.pub.tables) == 1 {
 		init.Src = obs.pub.tables[0]
 	}
+	// Every sub of obs that needs a snapshot this tick shares one encoding.
+	if obs.snapJSON == nil {
+		obs.snapJSON = marshalOps(snapshotOps(obs.res, init.Ordered))
+	}
 	return subEntry{
 		S:     sub.s,
 		Init:  init,
 		Reset: sub.holds,
-		Ops:   marshalOps(snapshotOps(obs.res, init.Ordered)),
+		Ops:   obs.snapJSON,
 		Ready: true,
 	}
 }
