@@ -721,7 +721,18 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}
 		r := runResult{obs: obs}
 		var qerr error
-		r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		func() {
+			// Encoding Query.Args runs user code (driver.Valuer, pgx
+			// encoders) on the engine goroutine; a panic there fails only
+			// this observer. pgx encodes before sending, so sp is still
+			// usable for the rollback.
+			defer func() {
+				if p := recover(); p != nil {
+					qerr = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+				}
+			}()
+			r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		}()
 		if qerr != nil {
 			if err := sp.Rollback(ctx); err != nil {
 				return err

@@ -2,10 +2,12 @@ package cometgo
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -117,6 +119,72 @@ func TestPublicationPanicOnRebindEndsOnlyThatSub(t *testing.T) {
 
 	// items.mine is live for bob.
 	a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "bob", "Name": "b1"}})
+	if tx := a.next(); tx["t"] != "tx" || entries(tx)[0]["s"] != float64(1) {
+		t.Fatalf("expected tx for s1, got %v", tx)
+	}
+}
+
+// panicValuer is a query arg whose Value dereferences nil once armed.
+type panicValuer struct{ armed *atomic.Bool }
+
+func (v panicValuer) Value() (driver.Value, error) {
+	if v.armed.Load() {
+		var p *int64
+		return *p, nil
+	}
+	return int64(1), nil
+}
+
+// A Query.Args value that panics while the observer re-runs ends that
+// observer's sub with INTERNAL; another observer re-run in the same tick
+// still sends its tx.
+func TestQueryArgsPanicEndsOnlyThatObserver(t *testing.T) {
+	logs := &errLogs{}
+	var armed atomic.Bool
+	e := setupFull(t, func(c *Config) { c.Logger = slog.New(logs) }, func(env *testEnv, app *App) {
+		Publish(app, "boomArgs", PubOptions{Tables: []string{env.table}}, func(c *SubCtx, _ struct{}) (Query, error) {
+			return Query{SQL: "SELECT id FROM " + env.table + " WHERE $1::int8 = 1 ORDER BY id", Args: []any{panicValuer{&armed}}}, nil
+		})
+	})
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	a.next()
+	a.send(map[string]any{"t": "sub", "s": 2, "name": "boomArgs"})
+	if en := entries(a.next()); en[0]["s"] != float64(2) || en[0]["ready"] != true {
+		t.Fatalf("boomArgs snapshot %v", en)
+	}
+
+	// Both observers read the table, so this write re-runs both in one tick.
+	armed.Store(true)
+	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "after"}})
+	got := map[float64]map[string]any{}
+	for {
+		m := a.next()
+		if m["t"] == "res" {
+			if m["ok"] != true {
+				t.Fatalf("res %v", m)
+			}
+			break
+		}
+		for _, en := range entries(m) {
+			got[en["s"].(float64)] = en
+		}
+	}
+	if end, _ := got[2]["end"].(map[string]any); !isInternal(end) {
+		t.Fatalf("boomArgs sub: %v", got[2])
+	}
+	if ops, _ := got[1]["ops"].([]any); got[1]["end"] != nil || len(ops) != 1 {
+		t.Fatalf("items.all sub: %v", got[1])
+	}
+	logs.mu.Lock()
+	logged := strings.Join(logs.errs, "\n")
+	logs.mu.Unlock()
+	if !strings.Contains(logged, "panic: runtime error: invalid memory address") || !strings.Contains(logged, "runtime/debug.Stack") {
+		t.Fatalf("panic not logged with stack: %q", logged)
+	}
+
+	// The engine keeps running: items.all still gets live diffs.
+	a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "x", "Name": "later"}})
 	if tx := a.next(); tx["t"] != "tx" || entries(tx)[0]["s"] != float64(1) {
 		t.Fatalf("expected tx for s1, got %v", tx)
 	}
