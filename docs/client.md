@@ -5,8 +5,8 @@ The TypeScript client lives in [`client/`](../client) as the package `@cometgo/c
 The package is not on npm yet. To use it from another app, build a tarball and install that:
 
 ```sh
-cd client && npm pack          # builds dist/, writes cometgo-client-0.1.0.tgz
-cd ../my-app && npm install ../cometgo/client/cometgo-client-0.1.0.tgz
+cd path/to/cometgo/client && npm pack   # builds dist/, writes cometgo-client-0.1.0.tgz here
+cd path/to/my-app && npm install path/to/cometgo/client/cometgo-client-0.1.0.tgz
 ```
 
 Inside this repository, `client` is an npm workspace, so `npm install` at the root links it into `node_modules/@cometgo/client` and the todo example imports it by name. The link points at the built `dist/`, so run `npm run build:client` (or `npm run build` / `npm run typecheck`, which do it first) after changing `client/src`.
