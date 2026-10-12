@@ -96,7 +96,7 @@ Each distinct `(publication, args, scope)` combination has one server-side **obs
 
 - Everything the query depends on must be in `Query.SQL` and `Query.Args`, and the scope must separate callers whose queries would differ (see [Scope](#scope)).
 - `fn` runs on the engine's loop, so keep it fast. Doing an access check against the database there delays every subscription on the server.
-- `fn` is the access check for a subscription when it starts, and when the connection's `UserID` changes (log in, log out, switch user, or an expired identity), because every subscription is re-bound then. It is **not** re-run when a token refresh or session resume keeps the same `UserID`, even if `Identity.Data` (a role, say) changed, and not when access changes in the database, so neither ends a live subscription.
+- `fn` is the access check for a subscription when it starts, and when the connection's principal changes (log in, log out, switch user, switch `ScopeKey`, or an expired identity), because every subscription is re-bound then. It is **not** re-run when a token refresh or session resume keeps the same `UserID` and `ScopeKey`, even if `Identity.Data` (a role, say) changed, and not by itself when access changes in the database, so neither ends a live subscription. After such a change, call [`Revalidate`](#revoking-access-revalidate) to re-run it, or put the check in the query ([Authorization](#authorization)).
 - `fn` runs once per subscription, and again for each of a connection's subscriptions when its user changes. An access check that queries the database therefore costs one round trip per subscriber on the engine's loop. Keep it cheap or cached, especially for a `ScopeShared` publication with many subscribers.
 - Returning an error from `fn` ends that subscription only, with that error. Other subscriptions to the same observer keep streaming. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
 - A panic in `fn` is recovered: it ends only that subscription with `INTERNAL` and is logged with its stack trace. The server and every other subscription keep running.
@@ -126,7 +126,28 @@ const (
 ```
 
 - **`ScopeUser`** (the default) shares an observer only between connections with the same [`Identity.Scope()`](#authentication): the `UserID`, plus the `ScopeKey` if one is set. Anonymous connections share with each other. This is the safe choice for any query that depends on who is asking, **as long as `UserID` and `ScopeKey` together determine the query**. Nothing else is compared: an identity with an empty `UserID` and no `ScopeKey` shares with anonymous connections, and two identities that differ only in `Data` share one observer. If the query depends on anything else in `Identity`, such as a tenant or a role, put it in `ScopeKey`, or pass it in the subscription args and check it in `fn`.
-- **`ScopeShared`** shares one observer between every connection. Only use it when the query does not depend on the caller's identity at all, such as a public feed. `fn` still runs for every subscriber, so it can check access per caller (for example, whether the caller is a member of the team in the args) and return `ErrForbidden`. But only the first subscriber's `Query` is used, so a `ScopeShared` publication whose **query** reads `c.Identity` serves the **first** subscriber's result to everyone else.
+- **`ScopeShared`** shares one observer between every connection. Only use it when the query does not depend on the caller's identity at all, such as a public feed. `fn` still runs for every subscriber, so it can check access per caller (for example, whether the caller is a member of the team in the args) and return `ErrForbidden`.
+
+> **Security:** under `ScopeShared`, only the first subscriber's `Query` is ever run. If the query reads `c.Identity` (a `WHERE user_id = $1` with the caller's ID, a join on the caller's memberships), every later subscriber with the same args gets the **first subscriber's rows**: one user's data is served to another. A per-caller check in `fn` does not prevent this, because it decides only whether the caller may subscribe, not what the query returns. If the query depends on who is asking, keep the default `ScopeUser`.
+
+### Authorization
+
+Put the access check in the query's SQL. Join the table that grants access (memberships, shares, ACL rows) and list it in `Tables`, as `tasks.byProject` above does with `members`:
+
+- **Revocation is live.** Removing a membership is an ordinary write to a table the query reads, so the query re-runs and the rows the user may no longer see disappear from their result. No extra call is needed, and it works the same on every node and after the server's `LISTEN` connection reconnects, because it goes through the normal change path.
+- **Granting is live too.** Adding a membership makes the rows appear.
+- **Keep the default `ScopeUser`.** The query reads `c.Identity.UserID`, so it must not be shared between users (see the warning in [Scope](#scope)). If it also depends on a tenant or a role, put that in [`Identity.ScopeKey`](#authentication) so each tenant gets its own observer.
+- The client sees an empty or smaller result, not an error. When the client needs an explicit `FORBIDDEN`, check in `fn` as well (below).
+- Every write to the membership table re-runs every observer of every publication that lists it in `Tables`. [`Query.Match`](#skipping-unaffected-re-runs-querymatch) can't narrow that, because it applies only to single-table queries.
+
+Check in `fn` instead when the decision can't be expressed in the query, or when it should end the subscription with an error rather than empty it:
+
+- an external authorization service, a role or flag in `Identity.Data`, a subscription the caller may not open at all;
+- a `ScopeShared` publication whose query is the same for everyone, gated per caller (for example, membership of the team named in the args).
+
+`fn` runs when a subscription starts and when the connection's user changes, not when the permission later changes. After changing a permission that only `fn` checks, call [`Revalidate`](#revoking-access-revalidate) for the affected user; otherwise their live subscriptions keep streaming until they resubscribe.
+
+Use [`Identity.ScopeKey`](#authentication) when one user acts under several identities whose queries differ, such as one per tenant. It gives each its own `ScopeUser` observer, its own `Emit` target and its own idempotency keys. It is not an access check by itself: the query or `fn` still has to enforce what each tenant may read.
 
 ### Query and SubCtx
 
@@ -372,7 +393,7 @@ If `ExpiresAt` is set, the server tells the client when the identity expires (`w
 
 A publication's `fn` checks access when a subscription starts and when the connection's user changes, but not afterwards. Removing a user from a team does not, by itself, end a subscription they already hold.
 
-The best fix is to make the permission part of the query. Join the membership table in the SQL and list it in `Tables`. A revocation is then an ordinary write: the query re-runs, and the rows the user may no longer see disappear from the result.
+The best fix is to make the permission part of the query (see [Authorization](#authorization)). A revocation is then an ordinary write: the query re-runs, and the rows the user may no longer see disappear from the result.
 
 For a check that can't be expressed in SQL, call `Revalidate` after the change, or `RevalidateAfterCommit` from the method that makes it:
 
