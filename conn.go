@@ -901,6 +901,9 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	if err := c.a.engine.commitFenced(ctx, tx, token); err != nil {
 		return nil, false, err
 	}
+	// Committed: return the connection before waiting on the fence, as
+	// pgxpool's Tx.Commit would (Release is idempotent; the defer is a no-op).
+	pc.Release()
 	var committed time.Time
 	if c.a.cfg.Metrics != nil {
 		committed = time.Now()

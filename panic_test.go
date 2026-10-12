@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -391,5 +392,32 @@ func TestPanickedErrorKeepsItsClass(t *testing.T) {
 	a.send(map[string]any{"t": "sub", "s": 2, "name": "forbidden"})
 	if end, _ := entries(a.next())[0]["end"].(map[string]any); end["code"] != CodeInternal {
 		t.Fatalf("forbidden end: %v", end)
+	}
+}
+
+// A call waiting on its fence does not hold a pool connection: with the
+// engine stuck in a slow query, the only connection acquired is the
+// engine's.
+func TestFenceWaitReleasesConnection(t *testing.T) {
+	e := setupFull(t, nil, func(env *testEnv, app *App) {
+		Publish(app, "slow", PubOptions{Tables: []string{env.table}}, func(c *SubCtx, _ struct{}) (Query, error) {
+			return Query{SQL: "SELECT 1 AS id FROM pg_sleep(3)"}, nil
+		})
+	})
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "slow"})
+	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "x", "Name": "fenced"}})
+	// The call has committed once its row is visible; its fence waits for
+	// the stalled engine.
+	for deadline := time.Now().Add(2 * time.Second); e.countRows(t, "SELECT count(*) FROM "+e.table+" WHERE name = 'fenced'") == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("call never committed")
+		}
+	}
+	// Within the slow query's 3s, only the engine's connection stays out.
+	for deadline := time.Now().Add(time.Second); e.pool.Stat().AcquiredConns() != 1; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d connections acquired during the fence wait, want 1 (the engine's)", e.pool.Stat().AcquiredConns())
+		}
 	}
 }
