@@ -450,3 +450,40 @@ func TestChangedKeyFilterFallsBackWhenItCannotCompare(t *testing.T) {
 		t.Fatalf("rows that stopped matching kept: %v", rows)
 	}
 }
+
+// A statement that changes more than 1,000 rows, or whose key list exceeds
+// 7,500 bytes, sends one table-dirty notification instead of its keys
+// (docs/protocol.md §11). That must re-run Match observers of the table
+// too, not only unfiltered ones.
+func TestTableDirtyRerunsMatchObservers(t *testing.T) {
+	for _, c := range []struct {
+		name, pub, seed, update string
+		rows                    int
+	}{
+		{"over 1000 rows", "f.owner",
+			"INSERT INTO %[1]s (owner, name) SELECT 'other', 'r' || g FROM generate_series(1, 1001) g",
+			"UPDATE %[1]s SET owner = 'bob' WHERE owner = 'other'", 1001},
+		{"key list over 7500 bytes", "f.comp", // 100 keys of ~110 bytes
+			"INSERT INTO %[1]s_c (org, id, owner) SELECT repeat('k', 100), g, 'other' FROM generate_series(1, 100) g",
+			"UPDATE %[1]s_c SET owner = 'bob' WHERE owner = 'other'", 100},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := setupFilter(t, nil)
+			if _, err := e.pool.Exec(context.Background(), fmt.Sprintf(c.seed, e.table)); err != nil {
+				t.Fatal(err)
+			}
+			e.waitListening(t)
+			a, _ := e.dial(t, nil)
+			rows := subRows{}
+			a.send(map[string]any{"t": "sub", "s": 1, "name": c.pub, "args": map[string]any{"Owner": "bob"}})
+			rows.apply(t, a.next())
+			if len(rows[1]) != 0 {
+				t.Fatalf("snapshot holds %d rows", len(rows[1]))
+			}
+			a.execCall(rows, 1, fmt.Sprintf(c.update, e.table))
+			if len(rows[1]) != c.rows {
+				t.Fatalf("Match observer holds %d rows after the update, want %d", len(rows[1]), c.rows)
+			}
+		})
+	}
+}

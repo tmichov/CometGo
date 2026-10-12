@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -124,6 +125,7 @@ func (w *watcher) converge(t *testing.T, e *testEnv, within time.Duration) {
 type callLog struct {
 	mu       sync.Mutex
 	ok, errs int
+	redials  int      // sockets a writer replaced after a transport error
 	problems []string // stalled, lagged or lost calls
 }
 
@@ -143,7 +145,10 @@ func (l *callLog) add(ok bool, problem string) {
 // writers starts n clients that each add a row and then bump it in a loop,
 // until the returned stop is called or the test ends. stop waits for them
 // and returns their log. A call may fail (the database may be down) but must answer within
-// chaosCallBudget, and a call that succeeded must not report lag.
+// chaosCallBudget, and a call that succeeded must not report lag. A writer
+// whose socket fails (a read that outlives its context closes it) logs the
+// call as a problem, dials again and carries on, so writes keep flowing for
+// the rest of the test.
 func (e *testEnv) writers(t *testing.T, n int) (stop func() *callLog) {
 	t.Helper()
 	log := &callLog{}
@@ -152,6 +157,8 @@ func (e *testEnv) writers(t *testing.T, n int) (stop func() *callLog) {
 	for w := range n {
 		c, _ := e.dial(t, nil)
 		wg.Go(func() {
+			ws := c.ws
+			defer func() { ws.CloseNow() }()
 			var row string
 			for i := 1; ; i++ {
 				select {
@@ -166,15 +173,19 @@ func (e *testEnv) writers(t *testing.T, n int) (stop func() *callLog) {
 				b, _ := json.Marshal(call)
 				start := time.Now()
 				ctx, cancel := context.WithTimeout(context.Background(), e.app.cfg.FenceTimeout+2*time.Second)
-				err := c.ws.Write(ctx, websocket.MessageText, b)
+				err := ws.Write(ctx, websocket.MessageText, b)
 				var res map[string]any
 				for err == nil && (res["t"] != "res" || res["id"] != float64(i)) {
-					res, err = readMsg(ctx, c.ws)
+					res, err = readMsg(ctx, ws)
 				}
 				cancel()
 				if err != nil {
 					log.add(false, fmt.Sprintf("writer %d call %d: %v", w, i, err))
-					return
+					ws.CloseNow()
+					if ws = e.redial(done, log); ws == nil {
+						return
+					}
+					continue
 				}
 				problem := ""
 				if d := time.Since(start); d > chaosCallBudget {
@@ -202,10 +213,45 @@ func (e *testEnv) writers(t *testing.T, n int) (stop func() *callLog) {
 	return stop
 }
 
+// redial opens a fresh socket for a writer, retrying until it succeeds or
+// done is closed (then nil). Off the test goroutine, so it cannot t.Fatal.
+func (e *testEnv) redial(done <-chan struct{}, log *callLog) *websocket.Conn {
+	for {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http"), &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+		if err == nil {
+			ws.SetReadLimit(1 << 20)
+			b, _ := json.Marshal(map[string]any{"t": "hello", "v": 1})
+			if err = ws.Write(ctx, websocket.MessageText, b); err == nil {
+				var m map[string]any
+				if m, err = readMsg(ctx, ws); err == nil && m["t"] != "welcome" {
+					err = fmt.Errorf("expected welcome, got %v", m)
+				}
+			}
+			if err != nil {
+				ws.CloseNow()
+			}
+		}
+		cancel()
+		if err == nil {
+			log.mu.Lock()
+			log.redials++
+			log.mu.Unlock()
+			return ws
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // check fails the test if any call stalled or lagged, or none succeeded.
 func (l *callLog) check(t *testing.T) {
 	t.Helper()
-	t.Logf("calls: %d ok, %d failed", l.ok, l.errs)
+	t.Logf("calls: %d ok, %d failed, %d redials", l.ok, l.errs, l.redials)
 	for _, p := range l.problems {
 		t.Error(p)
 	}
@@ -359,7 +405,7 @@ func TestChaosSlowObserverQuery(t *testing.T) {
 	}
 	s.send(map[string]any{"t": "unsub", "s": 1})
 	log := stop()
-	t.Logf("calls: %d ok, %d failed", log.ok, log.errs)
+	t.Logf("calls: %d ok, %d failed, %d redials", log.ok, log.errs, log.redials)
 	for _, w := range ws {
 		w.converge(t, e, 15*time.Second)
 	}
