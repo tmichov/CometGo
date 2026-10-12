@@ -87,6 +87,8 @@ A `timestamptz` of `infinity` or `-infinity` arrives as that string, not as a `D
 
 Every other column, including expressions, aggregates and the non-key columns of a multi-table publication, is typed `T | null`. To state the types by hand, use `Row`.
 
+If the builder, or the encoding of its `Query.Args`, fails or panics with zero-value args, `Describe` returns an error naming the publication (a panic includes its stack trace). Set `Row` for such a publication.
+
 **`PubOptions.Row`.** A query that cannot run with zero-value args, or whose types should be stated by hand, can set `Row` to a struct value. `Describe` then uses the struct and does not run the query. Each field is a column, named by its `json` tag or field name. A pointer field is nullable. A `cometgo` tag sets the column's type code directly (`cometgo:"date"`, `cometgo:"[]enum"`); otherwise the Go type picks it:
 
 | Go field | Column |

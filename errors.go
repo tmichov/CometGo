@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime/debug"
 )
 
 // Stable error codes (PROTOCOL.md §9). Application codes use the "app." prefix.
@@ -52,7 +53,8 @@ var ErrForbidden = NewError(CodeForbidden, "forbidden")
 // are logged with a ref and never leak their message.
 func (a *App) toWireError(err error, what string) *Error {
 	var e *Error
-	if errors.As(err, &e) {
+	var p *panicError
+	if !errors.As(err, &p) && errors.As(err, &e) {
 		return e
 	}
 	ref := newID(6)
@@ -66,4 +68,29 @@ func newID(n int) string {
 		panic(fmt.Sprintf("cometgo: crypto/rand: %v", err))
 	}
 	return hex.EncodeToString(b)
+}
+
+// panicError is a recovered panic in user code. When the panic value is an
+// error it is wrapped, so errors.Is/As still classify it (errTooLarge, a
+// PgError), but toWireError always reports it as INTERNAL, never as an
+// *Error the panic happened to carry.
+type panicError struct {
+	val   any
+	stack []byte
+}
+
+func (p *panicError) Error() string { return fmt.Sprintf("panic: %v\n%s", p.val, p.stack) }
+
+func (p *panicError) Unwrap() error {
+	err, _ := p.val.(error)
+	return err
+}
+
+// recoverErr turns a panic into *errp, keeping the stack. It must be the
+// deferred function itself, `defer recoverErr(&err)`: recover works nowhere
+// else.
+func recoverErr(errp *error) {
+	if p := recover(); p != nil {
+		*errp = &panicError{val: p, stack: debug.Stack()}
+	}
 }
