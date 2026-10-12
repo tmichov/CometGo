@@ -160,6 +160,12 @@ type Config struct {
 	ResumeBuffer int
 
 	Logger *slog.Logger
+
+	// Metrics, if set, receives engine and connection health measurements
+	// (see the Metric* constants). It is called synchronously from the
+	// engine and connection goroutines, so it must be fast and safe for
+	// concurrent use. Nil reports nothing.
+	Metrics func(Metric)
 }
 
 // App is a CometGo server. It implements http.Handler for the WebSocket

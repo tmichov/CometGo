@@ -265,7 +265,15 @@ func (e *engine) run(ctx context.Context) {
 			return
 		case <-e.wake:
 		}
+		var start time.Time
+		var runs int64
+		if e.a.cfg.Metrics != nil {
+			start, runs = time.Now(), e.runs.Load()
+		}
 		retry := e.tick(ctx)
+		if e.a.cfg.Metrics != nil {
+			e.tickMetrics(start, e.runs.Load()-runs)
+		}
 		if retry {
 			e.retryBackoff = min(max(e.retryBackoff*2, 250*time.Millisecond), 5*time.Second)
 			time.AfterFunc(e.retryBackoff, e.signal)
@@ -753,6 +761,7 @@ type runResult struct {
 	keyIdx []int
 	res    *result
 	err    *Error
+	took   time.Duration // query time, measured only for Config.Metrics
 }
 
 // runObservers re-runs toRun inside one REPEATABLE READ snapshot, plus each
@@ -786,6 +795,10 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}
 		r := runResult{obs: obs}
 		var qerr error
+		var start time.Time
+		if e.a.cfg.Metrics != nil {
+			start = time.Now()
+		}
 		func() {
 			// Encoding Query.Args runs user code (driver.Valuer, pgx
 			// encoders) on the engine goroutine; a panic there fails only
@@ -800,6 +813,9 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 			}()
 			r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
 		}()
+		if e.a.cfg.Metrics != nil {
+			r.took = time.Since(start)
+		}
 		if qerr != nil {
 			if err := sp.Rollback(ctx); err != nil {
 				return err
@@ -812,6 +828,13 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	if e.a.cfg.Metrics != nil {
+		// Reported after the commit: runs of a failed snapshot are retried
+		// and would be counted twice.
+		for _, r := range staged {
+			e.a.metric(MetricPubRun, r.obs.pub.name, r.took.Seconds())
+		}
 	}
 	for _, r := range staged {
 		obs := r.obs
@@ -950,6 +973,7 @@ func (e *engine) listen(ctx context.Context) {
 			backoff = minBackoff
 		}
 		e.a.log.Warn("listener disconnected", "err", err, "retry", backoff)
+		e.a.metric(MetricListenReconnect, "", 1)
 		select {
 		case <-ctx.Done():
 			return

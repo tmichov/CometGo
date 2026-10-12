@@ -69,6 +69,9 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return // Accept already wrote the HTTP error (e.g. bad Origin)
 	}
 	s := &socket{ws: ws, outSig: make(chan struct{}, 1), onDrain: a.engine.signal}
+	if a.cfg.Metrics != nil {
+		s.onSlow = func() { a.metric(MetricSlowClose, "", 1) }
+	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	a.serve(s, cookieIdent, cookieErr)
 }
@@ -193,6 +196,9 @@ type socket struct {
 	outSig chan struct{}
 	// onDrain is called once the queue drops below drainAt (§8.1).
 	onDrain func()
+	// onSlow, if set, is called once if the socket is closed as a slow
+	// consumer (queue over its limit, or a write timeout).
+	onSlow func()
 
 	mu       sync.Mutex // guards the fields below
 	out      [][]byte
@@ -277,6 +283,18 @@ func (s *socket) fail(code websocket.StatusCode, name, msg string) {
 		_ = s.ws.Close(code, string(reason))
 		s.cancel()
 	}()
+}
+
+// slow closes the socket as a slow consumer, reporting it once per socket.
+// The hook runs on its own goroutine: callers may hold c.mu.
+func (s *socket) slow(msg string) {
+	s.mu.Lock()
+	first := !s.dead
+	s.mu.Unlock()
+	s.fail(closeSlow, "SLOW_CONSUMER", msg)
+	if first && s.onSlow != nil {
+		go s.onSlow()
+	}
 }
 
 func (s *socket) isFatal() bool {
@@ -846,13 +864,25 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		c.a.engine.dropFence(token)
 		return nil, false, err
 	}
+	var committed time.Time
+	if c.a.cfg.Metrics != nil {
+		committed = time.Now()
+	}
 	select {
 	case <-f.released:
-		return val, false, nil
+		lag = false
 	case <-time.After(c.a.cfg.FenceTimeout):
 		c.a.engine.dropFence(token)
-		return val, true, nil
+		lag = true
 	}
+	if c.a.cfg.Metrics != nil {
+		// A lagged call's wait is observed too, so slow fences show.
+		c.a.metric(MetricFenceWait, "", time.Since(committed).Seconds())
+		if lag {
+			c.a.metric(MetricFenceLag, "", 1)
+		}
+	}
+	return val, lag, nil
 }
 
 // send enqueues one message, assigning seq to stateful messages.
@@ -999,7 +1029,7 @@ func (s *socket) push(b []byte) {
 	over := s.outBytes > maxQueuedBytes
 	s.mu.Unlock()
 	if over {
-		s.fail(closeSlow, "SLOW_CONSUMER", "client is not keeping up")
+		s.slow("client is not keeping up")
 		return
 	}
 	select {
@@ -1031,6 +1061,7 @@ func (s *socket) writer() {
 		for _, b := range batch {
 			ctx, cancel := context.WithTimeout(s.ctx, writeTimeout)
 			err := s.ws.Write(ctx, websocket.MessageText, b)
+			timedOut := ctx.Err() == context.DeadlineExceeded
 			cancel()
 			s.mu.Lock()
 			s.outBytes -= len(b)
@@ -1043,8 +1074,12 @@ func (s *socket) writer() {
 				s.onDrain()
 			}
 			if err != nil {
-				if s.ctx.Err() == nil {
-					s.fail(closeSlow, "SLOW_CONSUMER", "write timed out")
+				switch {
+				case s.ctx.Err() != nil:
+				case timedOut:
+					s.slow("write timed out")
+				default: // the peer went away; same close, but not slowness
+					s.fail(closeSlow, "SLOW_CONSUMER", "write failed")
 				}
 				return
 			}

@@ -57,6 +57,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `ResumeGrace` | 60s | How long a session outlives a lost connection, waiting for the client to resume it ([protocol §7.2](protocol.md#72-session-resume)). Unlike the other durations, a **negative** value disables resume, and clients then resync on every reconnect. See [Session resume](#session-resume). |
 | `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay, at most 4 MiB (half the outbound queue limit, since a resume sends the whole replay at once). A disconnected session that outgrows it ends, and its client resyncs. |
 | `Logger *slog.Logger` | `slog.Default()` | Where the framework logs, including the details of `INTERNAL` errors. |
+| `Metrics func(Metric)` | nil | Receives engine and connection health measurements. See [Metrics](#metrics). |
 
 `MaxSubs`, `MaxInflight` and `MaxMsg` are also advertised to the client in `welcome.limits`.
 
@@ -461,6 +462,36 @@ While the connection is held back:
 - If the connection drops, a resumed session gets the messages it missed and then the resets.
 
 A client that makes no progress at all is still disconnected with 4429 SLOW_CONSUMER, when about 8 MiB is queued or a single write is stuck for 10 seconds. That close leaves a resumable session resumable.
+
+## Metrics
+
+Set `Config.Metrics` to receive health measurements, for example to feed Prometheus or OpenTelemetry. CometGo itself has no dependency on either:
+
+```go
+type Metric struct {
+	Name  string  // one of the Metric* constants below
+	Pub   string  // the publication, for MetricPubRun; "" otherwise
+	Value float64 // seconds for durations, a number otherwise
+}
+```
+
+| Name | Kind | Reported |
+|---|---|---|
+| `MetricTick` (`tick_seconds`) | duration | once per engine tick: how long the tick took |
+| `MetricTickRuns` (`tick_runs`) | number | once per tick: how many observer queries it ran |
+| `MetricObservers` (`observers`) | gauge | after every tick: live observers |
+| `MetricSubscriptions` (`subscriptions`) | gauge | after every tick: bound subscriptions, on all sessions, including detached ones |
+| `MetricQueuedBytes` (`queued_bytes`) | gauge | after every tick: bytes waiting to be written, summed over every live session's socket |
+| `MetricCoalescing` (`coalescing_conns`) | gauge | after every tick: connections that are [coalescing](#slow-clients) |
+| `MetricFenceWait` (`fence_wait_seconds`) | duration | per fenced method call: from its commit until its update was sent (its fence released), or until `FenceTimeout` for a lagged call |
+| `MetricFenceLag` (`fence_lag`) | counter | 1 per call answered with `lag: true` after `FenceTimeout` |
+| `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed as a slow consumer: its queue went over 8 MiB, or a write timed out. A write that fails because the peer went away also closes with 4429, but is not counted |
+| `MetricListenReconnect` (`listen_reconnects`) | counter | 1 per failed `LISTEN` attempt: each drop, and each failed reconnect during an outage (retried with backoff up to 10 s) |
+| `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` set, reported once the tick's snapshot commits |
+
+Gauges are the current value, so map them to a gauge and set it; a counter is reported as `1` per occurrence; a duration is one observation, for a histogram. A tick happens only when there is work (a change, a request, a timer), so an idle server reports no gauges until something happens.
+
+The hook is called synchronously from the engine goroutine and from connection goroutines, so it must be fast and safe for concurrent use. Do the aggregation there, such as incrementing a counter or recording into a histogram, and never block. A panic in the hook is recovered and logged. When `Metrics` is nil, each measurement point costs one nil check, and the gauges are not computed. When it is set, computing the gauges visits every session after each tick.
 
 ## InstallTriggers
 
