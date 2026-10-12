@@ -26,6 +26,7 @@ Register every publication and method before `Start` and before serving requests
 | `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil. |
 | `(*App) Start(ctx) error` | Checks every publication's `Tables` (see [Table checks at Start](#table-checks-at-start)), then starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. If the check fails, it returns the error and starts nothing, and `Start` may be called again. Panics if called again after succeeding. |
 | `(*App) Shutdown(ctx) error` | Stops the server gracefully: see [Graceful shutdown](#graceful-shutdown). |
+| `(*App) Revalidate(userID)` | Re-checks a user's live subscriptions after a permission change: see [Revoking access](#revoking-access-revalidate). |
 | `(*App) ServeHTTP(w, r)` | `App` is an `http.Handler`. It upgrades the request to a CometGo WebSocket. Mount it at `/_comet`, the client's default URL. |
 | `Subprotocol` | The WebSocket subprotocol, `"cometgo.1.json"`. A request that does not offer it gets HTTP 426 with `{"supported":["cometgo.1.json"]}`. |
 
@@ -352,6 +353,27 @@ Called with the upgrade request, so it can read session cookies. Its result is u
 ### Expiry: `Identity.ExpiresAt`
 
 If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The client should call `setToken` with a fresh token before then. Proactive refresh by the client library and the HTTP refresh endpoint are *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
+
+### Revoking access: `Revalidate`
+
+A publication's `fn` checks access when a subscription starts and when the connection's user changes, but not afterwards. Removing a user from a team does not, by itself, end a subscription they already hold.
+
+The best fix is to make the permission part of the query. Join the membership table in the SQL and list it in `Tables`. A revocation is then an ordinary write: the query re-runs, and the rows the user may no longer see disappear from the result.
+
+For a check that can't be expressed in SQL, call `Revalidate` after the change:
+
+```go
+func (a *App) Revalidate(userID string)
+```
+
+It re-runs `fn`, with each session's current identity, for every live subscription of every session whose `Identity.UserID` is `userID`. That includes sessions whose socket dropped and that are waiting to be [resumed](#session-resume); those get the end in the replay. A subscription whose `fn` now returns an error ends with that error (e.g. `FORBIDDEN`). The user's other subscriptions, and other users' subscriptions to the same observer, carry on untouched, and no query is re-run. A panic in `fn` ends that subscription with `INTERNAL`.
+
+- **Only an error ends a subscription.** A `fn` that responds to the change by returning a narrower `Query` (for example, only the teams the user still belongs to) changes nothing, because the observer keeps the `Query` it was created with. To revoke, `fn` must return an error, such as `ErrForbidden`.
+- **Any error ends the subscription, a transient one too.** If `fn` queries the database and that query fails during the re-check, the subscription ends with `INTERNAL` and the client has to subscribe again.
+- It returns at once, and the re-check happens on the engine's next tick, against whatever `fn` reads at that point. Call it after the change has **committed**. Inside a [method](#methods), the transaction commits only after the handler returns, so a `Revalidate` called from the handler can run before the change is visible.
+- It reaches only sessions on the server it is called on. In a multi-node deployment, each node has to call it.
+- `Revalidate("")` does nothing: anonymous sessions have no per-user permissions to revoke.
+- A session whose user is changing (an auth request is in progress) is skipped; the rebind that follows re-checks every one of its subscriptions anyway.
 
 ## InstallIdempotency
 
