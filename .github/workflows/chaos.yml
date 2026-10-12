@@ -1,0 +1,32 @@
+name: chaos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # A plain container rather than a service, so the tests can restart it.
+      - name: Start Postgres
+        run: |
+          docker run -d --name cometgo-pg -p 54329:5432 \
+            -e POSTGRES_USER=comet -e POSTGRES_PASSWORD=comet -e POSTGRES_DB=comet \
+            postgres:17-alpine
+          for i in $(seq 60); do
+            docker exec cometgo-pg pg_isready -U comet -d comet -h 127.0.0.1 && exit 0
+            sleep 1
+          done
+          docker logs cometgo-pg
+          exit 1
+      - name: Fault-injection tests
+        env:
+          COMETGO_TEST_DATABASE_URL: postgres://comet:comet@localhost:54329/comet
+          COMETGO_TEST_PG_RESTART: docker restart cometgo-pg
+        run: go test -race -count=3 -run TestChaos -v .

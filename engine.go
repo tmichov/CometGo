@@ -851,11 +851,18 @@ func sameCols(a, b []colSpec) bool {
 
 // listen maintains the LISTEN connection (PROTOCOL.md §11).
 func (e *engine) listen(ctx context.Context) {
-	backoff := 500 * time.Millisecond
+	const minBackoff = 500 * time.Millisecond
+	backoff := minBackoff
 	for ctx.Err() == nil {
-		err := e.listenOnce(ctx)
+		listened, err := e.listenOnce(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		// Back off only across failures to connect: a listener that was
+		// up and then dropped retries soon, or every drop would wait
+		// longer than the last.
+		if listened {
+			backoff = minBackoff
 		}
 		e.a.log.Warn("listener disconnected", "err", err, "retry", backoff)
 		select {
@@ -867,10 +874,12 @@ func (e *engine) listen(ctx context.Context) {
 	}
 }
 
-func (e *engine) listenOnce(ctx context.Context) error {
+// listenOnce runs one listener connection until it fails. It reports
+// whether LISTEN succeeded first.
+func (e *engine) listenOnce(ctx context.Context) (listened bool, err error) {
 	conn, err := pgx.ConnectConfig(ctx, e.a.db.Config().ConnConfig.Copy())
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close(context.Background())
 	// Fenced commits wait while LISTEN runs (listenMu).
@@ -878,7 +887,7 @@ func (e *engine) listenOnce(ctx context.Context) error {
 	for _, ch := range []string{"comet", evtChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			e.listenMu.Unlock()
-			return err
+			return false, err
 		}
 	}
 	// Notifications sent while we were not listening are lost.
@@ -887,7 +896,7 @@ func (e *engine) listenOnce(ctx context.Context) error {
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			return err
+			return true, err
 		}
 		if n.Channel == evtChannel {
 			if evt, ok := parseEvt(n.Payload); ok {
