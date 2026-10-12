@@ -2,9 +2,14 @@ package cometgo
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // setupTenants registers "tenant.items", a ScopeUser publication whose
@@ -143,4 +148,80 @@ func TestIdentityScope(t *testing.T) {
 	if (&Identity{UserID: "bob"}).Scope() != "bob" {
 		t.Fatal("without ScopeKey, Scope must be the UserID")
 	}
+}
+
+// An identity Postgres text cannot store (NUL, invalid UTF-8) is refused on
+// both auth paths: as UNAUTHENTICATED for a token, close 4401 for a cookie.
+func TestInvalidIdentityRejected(t *testing.T) {
+	bad := map[string]*Identity{
+		"nul-scope":    {UserID: "alice", ScopeKey: "t\x00x"},
+		"bad-utf8-uid": {UserID: "al\xffice"},
+	}
+	e := setupWith(t, func(c *Config) {
+		auth := c.Authenticate
+		c.Authenticate = func(ctx context.Context, token string) (*Identity, error) {
+			if id, ok := bad[token]; ok {
+				return id, nil
+			}
+			return auth(ctx, token)
+		}
+		c.AuthenticateRequest = func(r *http.Request) (*Identity, error) {
+			ck, err := r.Cookie("u")
+			if err != nil {
+				return nil, nil
+			}
+			if id, ok := bad[ck.Value]; ok {
+				return id, nil
+			}
+			return &Identity{UserID: ck.Value}, nil
+		}
+	})
+	for token := range bad {
+		t.Run("token/"+token, func(t *testing.T) {
+			c, w := e.dial(t, map[string]any{"auth": map[string]any{"token": token}})
+			if w["user"] != nil {
+				t.Fatalf("welcome carries a user: %v", w)
+			}
+			r := c.next()
+			if r["t"] != "authRes" || r["ok"] != false || r["err"].(map[string]any)["code"] != CodeUnauthenticated {
+				t.Fatalf("got %v, want UNAUTHENTICATED authRes", r)
+			}
+		})
+		t.Run("cookie/"+token, func(t *testing.T) {
+			if st := cookieHelloClose(t, e, token); st != closeUnauth {
+				t.Fatalf("close status %v, want %v", st, closeUnauth)
+			}
+		})
+	}
+	// The cookie path still accepts a valid identity.
+	if st := cookieHelloClose(t, e, "alice"); st != -1 {
+		t.Fatalf("valid cookie closed with %v", st)
+	}
+}
+
+// cookieHelloClose sends a token-less hello with cookie u=value and returns
+// the close status, or -1 if the server answered with welcome.
+func cookieHelloClose(t *testing.T, e *testEnv, value string) websocket.StatusCode {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h := http.Header{}
+	h.Set("Cookie", "u="+value)
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http"), &websocket.DialOptions{Subprotocols: []string{Subprotocol}, HTTPHeader: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.CloseNow()
+	c := &client{t: t, ws: ws}
+	c.send(map[string]any{"t": "hello", "v": 1})
+	_, b, err := ws.Read(ctx)
+	if err != nil {
+		return websocket.CloseStatus(err)
+	}
+	var m map[string]any
+	if json.Unmarshal(b, &m) == nil && m["t"] == "welcome" {
+		return -1
+	}
+	t.Fatalf("unexpected message %s", b)
+	return 0
 }
