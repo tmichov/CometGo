@@ -57,23 +57,29 @@ func (e *testEnv) watch(t *testing.T, n int) []*watcher {
 		c.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
 		m := &mirror{}
 		m.apply(t, c.next())
-		ws[i] = follow(c, m)
+		ws[i] = follow(t, c, m)
 	}
 	return ws
 }
 
-// follow starts reading c into a watcher of mirror m.
-func follow(c *client, m *mirror) *watcher {
+// follow starts reading c into a watcher of mirror m, until the test ends.
+func follow(t *testing.T, c *client, m *mirror) *watcher {
 	w := &watcher{m: m, msgs: make(chan map[string]any, 1<<14)}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	go func() {
 		defer close(w.msgs)
 		for {
-			msg, err := readMsg(context.Background(), c.ws)
+			msg, err := readMsg(ctx, c.ws)
 			if err != nil {
 				w.err = err
 				return
 			}
-			w.msgs <- msg
+			select {
+			case w.msgs <- msg:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	return w
@@ -85,6 +91,19 @@ func (w *watcher) converge(t *testing.T, e *testEnv, within time.Duration) {
 	t.Helper()
 	deadline := time.After(within)
 	for {
+		// Apply what is queued first: one table read per batch, not per
+		// message.
+		for drained := false; !drained; {
+			select {
+			case msg, ok := <-w.msgs:
+				if !ok {
+					t.Fatalf("watcher socket closed: %v", w.err)
+				}
+				w.m.apply(t, msg)
+			default:
+				drained = true
+			}
+		}
 		diff := w.m.matchesDB(t, e)
 		if diff == nil {
 			return
@@ -122,8 +141,8 @@ func (l *callLog) add(ok bool, problem string) {
 }
 
 // writers starts n clients that each add a row and then bump it in a loop,
-// until the returned stop is called. stop waits for them and returns their
-// log. A call may fail (the database may be down) but must answer within
+// until the returned stop is called or the test ends. stop waits for them
+// and returns their log. A call may fail (the database may be down) but must answer within
 // chaosCallBudget, and a call that succeeded must not report lag.
 func (e *testEnv) writers(t *testing.T, n int) (stop func() *callLog) {
 	t.Helper()
@@ -171,11 +190,16 @@ func (e *testEnv) writers(t *testing.T, n int) (stop func() *callLog) {
 			}
 		})
 	}
-	return func() *callLog {
-		close(done)
-		wg.Wait()
+	var once sync.Once
+	stop = func() *callLog {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+		})
 		return log
 	}
+	t.Cleanup(func() { stop() })
+	return stop
 }
 
 // check fails the test if any call stalled or lagged, or none succeeded.
@@ -216,8 +240,10 @@ func TestChaosListenerKilled(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		before := e.listened()
 		var pid int32
+		// The newest: a backend killed last round may still be listed.
 		err := e.pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
-			WHERE application_name = $1 AND query LIKE 'LISTEN %'`, appName).Scan(&pid)
+			WHERE application_name = $1 AND query LIKE 'LISTEN %'
+			ORDER BY backend_start DESC LIMIT 1`, appName).Scan(&pid)
 		if err != nil {
 			stop()
 			t.Fatalf("find listener: %v", err)
@@ -366,7 +392,7 @@ func TestChaosSlowClientCoalescesThenDrains(t *testing.T) {
 	if !coalesced {
 		t.Fatal("connection never coalesced")
 	}
-	follow(a, m).converge(t, e, 10*time.Second)
+	follow(t, a, m).converge(t, e, 10*time.Second)
 	if !m.reset {
 		t.Fatal("drained without a reset")
 	}

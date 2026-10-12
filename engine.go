@@ -851,17 +851,24 @@ func sameCols(a, b []colSpec) bool {
 
 // listen maintains the LISTEN connection (PROTOCOL.md §11).
 func (e *engine) listen(ctx context.Context) {
-	const minBackoff = 500 * time.Millisecond
+	// Every gap delays the calls committed in it (they wait for the
+	// reconnect tick), so maxBackoff stays well under the default 5s
+	// FenceTimeout. A connection that stayed up for stableAfter resets the
+	// backoff; one that drops sooner keeps backing off, so a connection
+	// cut right after LISTEN cannot trigger an all-dirty re-run every
+	// 500ms.
+	const (
+		minBackoff  = 500 * time.Millisecond
+		maxBackoff  = 2 * time.Second
+		stableAfter = 30 * time.Second
+	)
 	backoff := minBackoff
 	for ctx.Err() == nil {
-		listened, err := e.listenOnce(ctx)
+		listenedAt, err := e.listenOnce(ctx)
 		if ctx.Err() != nil {
 			return
 		}
-		// Back off only across failures to connect: a listener that was
-		// up and then dropped retries soon, or every drop would wait
-		// longer than the last.
-		if listened {
+		if !listenedAt.IsZero() && time.Since(listenedAt) >= stableAfter {
 			backoff = minBackoff
 		}
 		e.a.log.Warn("listener disconnected", "err", err, "retry", backoff)
@@ -870,16 +877,16 @@ func (e *engine) listen(ctx context.Context) {
 			return
 		case <-time.After(backoff):
 		}
-		backoff = min(backoff*2, 10*time.Second)
+		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
-// listenOnce runs one listener connection until it fails. It reports
-// whether LISTEN succeeded first.
-func (e *engine) listenOnce(ctx context.Context) (listened bool, err error) {
+// listenOnce runs one listener connection until it fails. It reports when
+// LISTEN succeeded, or the zero time if it did not.
+func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err error) {
 	conn, err := pgx.ConnectConfig(ctx, e.a.db.Config().ConnConfig.Copy())
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
 	defer conn.Close(context.Background())
 	// Fenced commits wait while LISTEN runs (listenMu).
@@ -887,16 +894,17 @@ func (e *engine) listenOnce(ctx context.Context) (listened bool, err error) {
 	for _, ch := range []string{"comet", evtChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			e.listenMu.Unlock()
-			return false, err
+			return time.Time{}, err
 		}
 	}
 	// Notifications sent while we were not listening are lost.
 	e.listening()
 	e.listenMu.Unlock()
+	listenedAt = time.Now()
 	for {
 		n, err := conn.WaitForNotification(ctx)
 		if err != nil {
-			return true, err
+			return listenedAt, err
 		}
 		if n.Channel == evtChannel {
 			if evt, ok := parseEvt(n.Payload); ok {
