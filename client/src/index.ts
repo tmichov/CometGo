@@ -188,14 +188,18 @@ export class Comet {
   // shutting down, so new calls wait for the next connection, which is
   // opened after this delay instead of the usual backoff.
   #goaway?: number;
+  // Kept so close() can remove them. Not an AbortController signal: jsdom
+  // rejects a signal from another realm, such as Node's global one.
+  #onOnline = () => this.#reconnectNow();
+  #onVisible = () => {
+    if (document.visibilityState === "visible") this.#reconnectNow();
+  };
 
   constructor(opts: ConnectOptions) {
     this.#opts = opts;
     if (typeof window !== "undefined") {
-      window.addEventListener("online", () => this.#reconnectNow());
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") this.#reconnectNow();
-      });
+      window.addEventListener("online", this.#onOnline);
+      document.addEventListener("visibilitychange", this.#onVisible);
     }
     this.#hbTimer = setInterval(() => this.#checkLiveness(), 1000);
     void this.#open();
@@ -269,6 +273,10 @@ export class Comet {
 
   close(): void {
     this.#closed = true;
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", this.#onOnline);
+      document.removeEventListener("visibilitychange", this.#onVisible);
+    }
     clearTimeout(this.#reconnectTimer);
     clearInterval(this.#hbTimer);
     this.#ws?.close(1000);
