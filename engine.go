@@ -910,7 +910,7 @@ func (e *engine) listenOnce(ctx context.Context) error {
 	defer conn.Close(context.Background())
 	// Fenced commits wait while LISTEN runs (listenMu).
 	e.listenMu.Lock()
-	for _, ch := range []string{"comet", evtChannel} {
+	for _, ch := range []string{"comet", evtChannel, revalChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			e.listenMu.Unlock()
 			return err
@@ -924,9 +924,17 @@ func (e *engine) listenOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if n.Channel == evtChannel {
+		switch n.Channel {
+		case evtChannel:
 			if evt, ok := parseEvt(n.Payload); ok {
 				e.notify(notification{evt: evt})
+			}
+			continue
+		case revalChannel:
+			// Enqueued before a fence notified later on this connection, so
+			// the re-check runs no later than the tick releasing the fence.
+			if n.Payload != "" {
+				e.enqueue(revalidateReq{userID: n.Payload})
 			}
 			continue
 		}
