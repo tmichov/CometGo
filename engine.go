@@ -774,8 +774,21 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	// run user code in BeginTx, the SET LOCAL and the candidate filter. A
 	// panic there fails the tick, which tick retries like a lost snapshot.
 	// The per-observer recover below still isolates one observer's query.
+	// This also catches a panic in the framework's own apply loop after the
+	// commit (diffResults): deliberately, since crashing would only restart
+	// into the same data and take methods down too. A deterministic bug
+	// there stalls live updates, retried with backoff and logged with its
+	// stack each time, while methods keep answering (with lag). Observers
+	// applied before the panic keep their ops for the next good tick.
 	defer recoverErr(&err)
-	tx, err := e.a.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	// Acquired explicitly so a panic during BEGIN releases the connection
+	// (pgxpool's BeginTx would leak it).
+	pc, err := e.a.db.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer pc.Release()
+	tx, err := pc.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
 	}
@@ -988,22 +1001,32 @@ func (e *engine) listen(ctx context.Context) {
 // listenOnce runs one listener connection until it fails. It reports when
 // LISTEN succeeded, or the zero time if it did not.
 func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err error) {
+	// The connection copies the pool's ConnConfig, tracer included, so user
+	// code runs here too. A panic in it drops the connection like a network
+	// error, and run reconnects.
+	defer recoverErr(&err)
 	conn, err := pgx.ConnectConfig(ctx, e.a.db.Config().ConnConfig.Copy())
 	if err != nil {
 		return time.Time{}, err
 	}
 	defer conn.Close(context.Background())
-	// Fenced commits wait while LISTEN runs (listenMu).
-	e.listenMu.Lock()
-	for _, ch := range []string{"comet", evtChannel, revalChannel} {
-		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
-			e.listenMu.Unlock()
-			return time.Time{}, err
+	// Fenced commits wait while LISTEN runs (listenMu). Unlocked by defer, so
+	// a panic cannot leave it held.
+	err = func() error {
+		e.listenMu.Lock()
+		defer e.listenMu.Unlock()
+		for _, ch := range []string{"comet", evtChannel, revalChannel} {
+			if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
+				return err
+			}
 		}
+		// Notifications sent while we were not listening are lost.
+		e.listening()
+		return nil
+	}()
+	if err != nil {
+		return time.Time{}, err
 	}
-	// Notifications sent while we were not listening are lost.
-	e.listening()
-	e.listenMu.Unlock()
 	listenedAt = time.Now()
 	for {
 		n, err := conn.WaitForNotification(ctx)

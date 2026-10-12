@@ -94,7 +94,14 @@ func (e *engine) describeQuery(ctx context.Context, p *publication, ident *Ident
 	if err != nil {
 		return nil, fmt.Errorf("build query with zero-value args: %w (set PubOptions.Row or DescribeOptions.Identity)", err)
 	}
-	tx, err := e.a.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	// Acquired explicitly so a panic during BEGIN releases the connection
+	// (pgxpool's BeginTx would leak it).
+	pc, err := e.a.db.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer pc.Release()
+	tx, err := pc.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, err
 	}

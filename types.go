@@ -35,7 +35,14 @@ func (e *engine) resolveTypes(ctx context.Context, m *pgtype.Map, fds []pgconn.F
 	if len(oids) == 0 {
 		return nil
 	}
-	rows, err := e.a.db.Query(ctx, `
+	// Acquired explicitly: pgxpool's Query leaks its connection when a
+	// tracer panics, and the callers recover such panics.
+	pc, err := e.a.db.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("look up column types: %w", err)
+	}
+	defer pc.Release()
+	rows, err := pc.Query(ctx, `
 		SELECT t.oid, t.typtype::text, COALESCE(el.typtype::text, ''), COALESCE(base.typtype::text, '')
 		FROM pg_type t
 		LEFT JOIN pg_type el ON el.oid = t.typelem AND t.typcategory = 'A'
