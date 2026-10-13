@@ -52,3 +52,5 @@ Driver, server and Postgres share the one machine, so compare numbers only betwe
 ## Comparing an engine change
 
 M3's exit criterion is overall call p99 within the baseline + 20%. To check a change, run `make bench` on the same machine that recorded the baseline, with nothing else heavy running, and compare the **all** row of the Calls table. Commit the new reports with the change only when they become the new baseline.
+
+A single run is noisy on a laptop. Four back-to-back base runs on the baseline machine gave an overall p99 of 82.1, 157.6, 72.8 and 77.9 ms (p50 31.7 to 39.7 ms). One run in four was an outlier at about twice the others. So run the base scenario at least three times on each side of a change and compare the median p99, not one run against [base.md](base.md).
