@@ -74,6 +74,9 @@ type engine struct {
 	carryEvts    []*evtNote
 	carryOut     map[*conn]*connOut
 	retryBackoff time.Duration
+	// fns holds the fn calls prefetchFns made for the requests being
+	// handled; nil outside the request phase.
+	fns map[fnKey]*fnCall
 }
 
 type notification struct {
@@ -382,17 +385,24 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	// released, so an end still precedes the res of the method that caused
 	// it.
 	reval := revalidateReq{users: map[string]bool{}, all: listened > 0}
+	var rest []any
 	for _, r := range reqs {
 		if rv, ok := r.(revalidateReq); ok {
 			maps.Copy(reval.users, rv.users)
 			reval.all = reval.all || rv.all
 			continue
 		}
-		e.handleReq(ctx, r, outFor)
+		rest = append(rest, r)
 	}
-	if reval.all || len(reval.users) > 0 {
-		e.handleReq(ctx, reval, outFor)
+	doReval := reval.all || len(reval.users) > 0
+	e.prefetchFns(ctx, rest, reval, doReval)
+	for i, r := range rest {
+		e.handleReq(ctx, i, r, outFor)
 	}
+	if doReval {
+		e.handleReq(ctx, len(rest), reval, outFor)
+	}
+	e.fns = nil
 
 	// Coalescing connections (§8.1) get their held resets once their queue
 	// has drained, and right away when this tick releases one of their
@@ -607,7 +617,8 @@ func marshalOps(ops []op) []json.RawMessage {
 	return out
 }
 
-func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connOut) {
+// handleReq applies request i of the tick (fnKey).
+func (e *engine) handleReq(ctx context.Context, i int, r any, outFor func(*conn) *connOut) {
 	end := func(c *conn, s uint64, err *Error) {
 		outFor(c).entries = append(outFor(c).entries, subEntry{S: s, End: err})
 	}
@@ -641,7 +652,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 		// change sets it before queuing its rebind, so a sub handled
 		// before that rebind is rebound by it, and one handled after it
 		// already sees the new identity.
-		if err := e.bind(ctx, sub, r.c.identity()); err != nil {
+		if err := e.bind(ctx, i, sub, r.c.identity()); err != nil {
 			end(r.c, r.s, err)
 			return
 		}
@@ -684,7 +695,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 				if sub.userID != ident.userID() {
 					continue
 				}
-				if err := e.recheck(ctx, sub, ident); err != nil {
+				if err := e.recheck(ctx, i, sub, ident); err != nil {
 					e.detach(sub)
 					delete(subs, s)
 					end(c, s, err)
@@ -701,7 +712,7 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 			sub.needInit, sub.needsReset = true, false
 		}
 		for s, sub := range e.conns[r.c] {
-			if err := e.bind(ctx, sub, r.ident); err != nil {
+			if err := e.bind(ctx, i, sub, r.ident); err != nil {
 				end(r.c, s, err)
 				delete(e.conns[r.c], s)
 			}
@@ -710,8 +721,9 @@ func (e *engine) handleReq(ctx context.Context, r any, outFor func(*conn) *connO
 	}
 }
 
-// bind attaches sub to the observer for (pub, args, scope), creating it if needed.
-func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *Error {
+// bind attaches sub to the observer for (pub, args, scope), creating it if
+// needed. i is the request it handles (fnKey).
+func (e *engine) bind(ctx context.Context, i int, sub *subscription, ident *Identity) *Error {
 	pub := e.a.pubs[sub.name]
 	if pub == nil {
 		return NewError(CodeNotFound, "unknown publication "+sub.name)
@@ -719,12 +731,8 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	key := observerKey(sub.name, sub.argsKey, scopeKey(pub, ident.Scope()))
 	// fn runs for every sub, not only the observer's first: it may check
 	// access for this caller. The key already determines the query, so a
-	// joining sub's Query is discarded. fn runs on the engine goroutine, so
-	// a panic would take down the process; end only this sub instead.
-	q, err := func() (q Query, err error) {
-		defer recoverErr(&err)
-		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
-	}()
+	// joining sub's Query is discarded.
+	q, err := e.fn(ctx, i, sub, pub, ident)
 	if err != nil {
 		return e.a.toWireError(err, "publication "+sub.name)
 	}
@@ -743,18 +751,146 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 	return nil
 }
 
-// recheck runs sub's fn for ident. A panic, which would otherwise take down
-// the engine goroutine, becomes INTERNAL.
-func (e *engine) recheck(ctx context.Context, sub *subscription, ident *Identity) *Error {
-	pub := e.a.pubs[sub.name]
-	_, err := func() (q Query, err error) {
-		defer recoverErr(&err)
-		return pub.build(&SubCtx{Context: ctx, Identity: ident}, sub.args)
-	}()
+// recheck runs sub's fn for ident, for request i (fnKey).
+func (e *engine) recheck(ctx context.Context, i int, sub *subscription, ident *Identity) *Error {
+	_, err := e.fn(ctx, i, sub, e.a.pubs[sub.name], ident)
 	if err != nil {
 		return e.a.toWireError(err, "publication "+sub.name)
 	}
 	return nil
+}
+
+// fnKey names one fn call of a tick: the call request i makes for sub s
+// of c. A request makes at most one call per sub.
+type fnKey struct {
+	c *conn
+	s uint64
+	i int
+}
+
+type fnCall struct {
+	pub   *publication
+	args  json.RawMessage
+	ident *Identity
+	q     Query
+	err   error
+}
+
+// runFn calls pub's fn. A panic, which would otherwise take down the
+// goroutine it runs on, becomes an error that ends only this sub.
+func runFn(ctx context.Context, pub *publication, args json.RawMessage, ident *Identity) (q Query, err error) {
+	defer recoverErr(&err)
+	return pub.build(&SubCtx{Context: ctx, Identity: ident}, args)
+}
+
+// fn returns sub's fn result for request i: prefetchFns's, if it ran this
+// call for the same identity, or else from a call made now.
+func (e *engine) fn(ctx context.Context, i int, sub *subscription, pub *publication, ident *Identity) (Query, error) {
+	if call := e.fns[fnKey{sub.c, sub.s, i}]; call != nil && call.ident == ident {
+		return call.q, call.err
+	}
+	return runFn(ctx, pub, sub.args, ident)
+}
+
+// prefetchFns runs, concurrently and at most Config.FnWorkers at a time,
+// the fn calls handling reqs (and then reval, if doReval) will make, so a
+// tick waits for its slowest fn rather than for each in turn. handleReq
+// still applies the requests in order on the engine goroutine, and makes
+// any call the prediction missed itself: a miss costs time, never
+// correctness. Only calls handleReq is sure to make are predicted, so no
+// fn runs that would not have run anyway:
+//   - a sub's, past the closed, ended, duplicate, args and MaxSubs checks,
+//     counting every sub predicted before it (a sub whose fn then fails is
+//     still counted, which only makes a later prediction miss);
+//   - a rebind's or a re-check's, for subs bound before this drain and not
+//     touched by an earlier request in it. A sub, rebind, unsub or resume
+//     earlier in the drain decides whether a sub is still bound and to what.
+func (e *engine) prefetchFns(ctx context.Context, reqs []any, reval revalidateReq, doReval bool) {
+	type simSub struct {
+		name   string
+		args   json.RawMessage
+		userID string
+		old    bool // bound before this drain, untouched since
+	}
+	sims := map[*conn]map[uint64]*simSub{}
+	simFor := func(c *conn) map[uint64]*simSub {
+		m := sims[c]
+		if m == nil {
+			m = map[uint64]*simSub{}
+			for s, sub := range e.conns[c] {
+				m[s] = &simSub{name: sub.name, args: sub.args, userID: sub.userID, old: true}
+			}
+			sims[c] = m
+		}
+		return m
+	}
+	calls := map[fnKey]*fnCall{}
+	add := func(c *conn, s uint64, i int, name string, args json.RawMessage, ident *Identity) {
+		if pub := e.a.pubs[name]; pub != nil {
+			calls[fnKey{c, s, i}] = &fnCall{pub: pub, args: args, ident: ident}
+		}
+	}
+	for i, r := range reqs {
+		switch r := r.(type) {
+		case subReq:
+			if r.c.isClosed() || e.ended[r.c][r.s] {
+				continue
+			}
+			subs := simFor(r.c)
+			if subs[r.s] != nil || len(subs) >= e.a.cfg.MaxSubs {
+				continue
+			}
+			if _, err := canonicalJSON(r.args); err != nil {
+				continue
+			}
+			add(r.c, r.s, i, r.name, r.args, r.c.identity())
+			subs[r.s] = &simSub{}
+		case unsubReq:
+			delete(simFor(r.c), r.s)
+		case closeReq:
+			sims[r.c] = map[uint64]*simSub{}
+		case resumeReq:
+			subs := simFor(r.c)
+			for s := range subs {
+				if !r.keep[s] {
+					delete(subs, s)
+				}
+			}
+		case rebindReq:
+			for s, sub := range simFor(r.c) {
+				if sub.old {
+					add(r.c, s, i, sub.name, sub.args, r.ident)
+				}
+				sub.old = false
+			}
+		}
+	}
+	if doReval {
+		// Connections that existed before the drain: a new one's subs are
+		// all new.
+		for c := range e.conns {
+			ident := c.identity()
+			if c.isClosed() || (!reval.all && !reval.users[ident.userID()]) {
+				continue
+			}
+			for s, sub := range simFor(c) {
+				if sub.old && sub.userID == ident.userID() {
+					add(c, s, len(reqs), sub.name, sub.args, ident)
+				}
+			}
+		}
+	}
+	sem := make(chan struct{}, e.a.cfg.FnWorkers)
+	var wg sync.WaitGroup
+	for _, call := range calls {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			call.q, call.err = runFn(ctx, call.pub, call.args, call.ident)
+		})
+	}
+	wg.Wait()
+	e.fns = calls
 }
 
 func (e *engine) detach(sub *subscription) {
