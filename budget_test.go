@@ -199,3 +199,18 @@ func TestTickBudgetHoldsOnlyItsConnection(t *testing.T) {
 		t.Fatalf("a's 10 x 200ms observers all ran in %s: the budget did not split them", took)
 	}
 }
+
+// An observer that stops being due before it runs (its awaiting sub left)
+// drops its place in line, so a later change does not put it ahead of
+// observers that waited longer.
+func TestDueFromClearedWhenNoLongerDue(t *testing.T) {
+	e := fenceEngine()
+	sub := &subscription{s: 1}
+	obs := &observer{key: "k", pub: &publication{name: "p"}, res: &result{}, subs: map[*subscription]struct{}{sub: {}}, dueFrom: 5}
+	sub.obs = obs
+	e.observers[obs.key] = obs
+	e.tick(context.Background())
+	if obs.dueFrom != 0 {
+		t.Fatalf("dueFrom = %d after a tick where it was not due", obs.dueFrom)
+	}
+}
