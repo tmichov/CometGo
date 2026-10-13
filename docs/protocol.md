@@ -95,6 +95,8 @@ The handshake is **pipelined**: the client may send `sub`/`call` immediately aft
   - ends subs the new identity may not access (`end:{code:"FORBIDDEN"}`).
 
   `authRes` is sent **after** that `tx`. The UI moves from user A's world to user B's world in one render. **[later]**: minimal diff rebind instead of resets.
+
+  **[later]** With slow-observer detachment (§8.4), a re-bound sub whose observer is in flight, or deferred by the tick budget, cannot get its reset in that `tx`. `authRes` is then held under the same per-connection condition as a fence (§6.2): it is sent once every sub of the connection reflects the new identity. Several identity changes on one connection send their `authRes` messages in order.
 - **Failed auth** (the token is rejected with `UNAUTHENTICATED`, is not a string, or `Authenticate` fails, e.g. with `INTERNAL`) changes nothing: the server answers `{"t":"authRes","seq":…,"id":3,"ok":false,"err":{…}}` and keeps the current identity, its subscriptions and its expiry. A rejected new token says nothing about the old one, so a definitive `UNAUTHENTICATED` is treated the same as a transient error. The session is downgraded only when the old identity expires (`AUTH_EXPIRED`, below) or the client logs out with `token:null`. The client keeps its current user.
 - **In-flight calls** keep running under the identity they were received with.
 - **Expiry without refresh** is treated like logout. The server pushes an `authRes` with no `id`: `{"t":"authRes","seq":…,"ok":false,"err":{"code":"AUTH_EXPIRED"}}`. The client library refreshes proactively at about 80% of the token lifetime, when it can get a new token (a token function).
@@ -192,6 +194,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 - **Scope.** An event is addressed to one observer, `(pub, args, scope)`, and delivered once to every sub bound to it, each with its own `s`. The publication must enable events on the server.
 - **At-most-once.** An event reaches the subs bound when the server processes it, on sessions with an open socket that are not coalescing (§8.1). It is not stored: events sent while a client is away are never delivered, whether it resyncs (§7.1) or resumes (§7.2). An `evt` that was already sent when the socket dropped is in the replay buffer like any stateful message, so a resume can deliver it, once. A session whose `evt` cap differs from the resuming `hello`'s cannot be resumed.
 - **Ordering.** `evt` is stateful and carries `seq`. An event follows the `tx` reflecting every change committed before it was emitted. An event emitted inside a method's transaction is sent only if it commits, after the `tx` with the method's writes and before the method's `res` (unless the call used `noFence`).
+- **[later]** With slow-observer detachment (§8.4), an event for an observer that is still dirty from a change committed before the emit is held until that observer's result is sent, then delivered. A sub whose initial snapshot has not been sent yet does not get it (at-most-once). An emitting call's fence comes after its events, so its `res` still follows them.
 - **Size.** The encoded event is limited to 7,500 bytes; the server API rejects a larger one.
 - **Multi-node.** Events travel through `pg_notify` on the channel `comet_evt`, so an emit on any node reaches subscribers on every node.
 - The client drops events for subs it does not know or that have ended.
@@ -229,7 +232,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 3. **Monotonic per sub.** A sub never moves to an older snapshot.
 4. **Read-your-writes,** per §6.2.
 
-Consistency across subs holds within a `tx`. **[later]** With slow-observer detachment (§8.4), two subs on one connection may sit at different snapshots between `tx` messages, but only while one of them is detached.
+Consistency across subs holds within a `tx`. **[later]** With slow-observer detachment (§8.4), two subs on one connection may sit at different snapshots between `tx` messages: a sub whose observer is detached or deferred by the tick budget keeps its older result while its siblings move on. Guarantees 1–3 still hold: a detached observer's result goes out in its own `tx`, from its own single snapshot, and never older than what the sub already has. Two subs a UI reads together (a list and its count) can disagree until the slower one catches up, up to the hard query timeout. For an observer that is always slower than the soft deadline, that is the normal state, not a rare one.
 
 Guarantees hold per server node. In a multi-node deployment, each connection is served entirely by one node.
 
@@ -256,6 +259,8 @@ Postgres delivers a transaction's notifications together, after commit, in commi
 
 In v1-core, ticks are sequential and every dirty observer runs in each tick, so this reduces to sending `res` after the `tx` of the first tick that drained past `p`.
 
+**[later]** With slow-observer detachment and the tick budget (§8.4), a tick no longer runs every dirty observer, so the server applies the condition above per connection. A fence whose connection still has an observer dirty from `n ≤ p` is carried to later ticks; fences of other connections are released as before. In addition, a sub whose subscription has not been bound yet, or whose initial or reset snapshot has not been sent, holds the fence. A call on a connection subscribed to a slow publication therefore waits for that publication's next result, and gets `lag:true` if the result takes longer than the fence timeout. Calls on connections not subscribed to it are unaffected.
+
 **Edge cases:**
 
 | Situation | Behaviour |
@@ -263,7 +268,7 @@ In v1-core, ticks are sequential and every dirty observer runs in each tick, so 
 | Fence timeout (default 5 s) | `res` is sent with `"lag":true`. The promise resolves, and the client can tell the effects are not yet visible. The guarantee is never broken silently. |
 | Method failed or rolled back | The fence notify rolled back with it. The framework knows the commit failed and sends `res` immediately. |
 | Method wrote nothing (no transaction ID) | No fence: `res` is sent on commit, without waiting for a tick. |
-| Method wrote only to unwatched tables | The fence still forces a (cheap) tick. |
+| Method wrote only to unwatched tables | The fence still forces a (cheap) tick. **[later]** Under §8.4 it still waits for any of the connection's observers that are dirty from an earlier notification. |
 | Listener down when the method commits (server just started, or reconnecting) | The fence notification is lost (§11). The all-dirty tick that follows the next successful LISTEN re-runs every observer on a snapshot taken after the commit. That tick releases every fence whose transaction committed before that LISTEN, and sends the `res` after the tick's `tx`. The call resolves without `lag` once the listener is back. Fenced commits wait while LISTEN itself runs, so each commit falls clearly before or after it. A fence committed after the LISTEN is left to its own notification, so its events still precede its `res`. |
 | Writes outside `ctx.Tx` (another connection or pool) | No fence guarantee. This is documented. |
 | **[later]** logical replication | The fence becomes "the replication stream has processed past the commit LSN". The wire protocol is unchanged. |
@@ -377,12 +382,16 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 
 ### 8.4 [later] Slow observers
 
-A query that exceeds a 1 s soft deadline is **detached**, not cancelled:
+A query that exceeds a soft deadline (default 1 s) is **detached**, not cancelled:
 
-- It finishes on its own snapshot (an exported or dedicated REPEATABLE READ snapshot).
-- Its diff goes out in its own `tx`.
-- It is not re-run while it is in flight; notifications that arrive meanwhile keep it dirty.
-- Ticks and fences (per the §6.2 rule) proceed without it.
+- It finishes on the tick's snapshot, on its own database connection. The tick exports its snapshot, and the rest of the tick continues on a new connection that imports it, so every result produced by the tick, the detached one included, comes from that one snapshot.
+- Its result goes out later, in its own `tx`, to the subs that were bound to it before it was detached. Subs that bind while it is in flight wait for its next run, which starts on a snapshot taken after they bound, so a sub's first snapshot is never older than a write the client had already been told about (§6.2).
+- It is not re-run while it is in flight. Notifications that arrive meanwhile keep it dirty, and it runs again once it finishes.
+- Ticks proceed without it. Fences and identity changes on connections not subscribed to it proceed too (§6.2, §3.2).
+- An observer that was detached once starts on the tick only when a detach slot is free, so a known slow query never blocks a tick while the slots are full. A server holds a bounded number of detached queries at once; at the limit, a newly slow query blocks its tick as in v1-core.
+- **Tick budget.** A tick stops starting observer queries after twice the soft deadline. Observers it did not start stay dirty and go first in the next tick, ordered by how long they have been dirty. So many medium-slow queries cannot hold a tick open either.
+
+The soft deadline, the detach limit and the tick budget are server settings, not advertised.
 
 Cancel-and-retry is rejected because a query that always exceeds the deadline would never finish.
 
@@ -493,7 +502,7 @@ Every node receives every fence and ignores the tokens it does not own.
 
 **[later]**, all additive and behind `caps`:
 - **Engine and transport:**
-  - slow-observer detachment and parallel ticks with an exported snapshot
+  - slow-observer detachment with an exported snapshot, and the tick budget (§8.4)
   - minimal-diff identity rebind
   - logical replication
 - **Client and features:**
