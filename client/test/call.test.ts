@@ -632,3 +632,38 @@ test("a token function that keeps failing is retried with backoff and never conn
     assert.equal(calls, 3, "close() stops the retries");
   });
 });
+
+test("a token function set while the socket was opening that throws sends no anonymous hello; the client reconnects", async () => {
+  await withFakeTimers(async (flush) => {
+    let n = 0;
+    comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any, token: "A" });
+    await flush();
+    const ws = FakeWS.last;
+    ws.connect();
+    ws.recv({ t: "welcome", session: "s_1", hb: 25000, user: { id: "a" }, caps: ["resume"] });
+    ws.drop();
+    mock.timers.tick(500);
+    await flush();
+    const ws2 = FakeWS.last; // opening; #open resolved "A"
+    void comet.setToken(() => {
+      if (++n === 1) throw new Error("auth service down");
+      return "B";
+    });
+    const before = FakeWS.count;
+    ws2.connect();
+    await flush();
+    assert.equal(ws2.sent.length, 0, "no hello on the socket whose token failed");
+    assert.equal(ws2.readyState, 3, "that socket is closed");
+    assert.equal(comet.status, "disconnected");
+
+    mock.timers.tick(1000); // backoff after the second failed attempt
+    await flush();
+    assert.equal(FakeWS.count, before + 1);
+    const ws3 = FakeWS.last;
+    ws3.connect();
+    await flush();
+    const hello = ws3.of("hello")[0];
+    assert.equal(hello.auth?.token, "B");
+    assert.equal(hello.resume?.session, "s_1");
+  });
+});
