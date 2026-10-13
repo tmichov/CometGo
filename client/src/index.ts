@@ -45,12 +45,16 @@ interface WireEntry {
   end?: { code: string; msg?: string; details?: unknown };
 }
 
-interface PendingAuth {
-  token: string | null;
-  // The source setToken stored, and the one it replaced (restored if the
-  // server refuses the new one).
+// The source a setToken stored, and the one it replaced (restored if the
+// server refuses the new one).
+interface TokenChange {
   source: TokenSource;
   prev: TokenSource | undefined;
+}
+
+interface PendingAuth {
+  token: string | null;
+  change: TokenChange;
   // Sent on a socket that dropped; awaiting the resume outcome.
   held?: boolean;
   resolve: (u: unknown) => void;
@@ -168,6 +172,9 @@ export class Comet {
   #subs = new Map<number, Subscription<any>>();
   #calls = new Map<number, PendingCall>();
   #auths = new Map<number, PendingAuth>();
+  // Every unsettled setToken's change, from the call on: a refusal must
+  // reach one whose token function is still resolving, not yet in #auths.
+  #tokenChanges = new Set<TokenChange>();
   #nextId = 1;
   #nextSub = 1;
   #txParts: WireEntry[] = [];
@@ -263,17 +270,18 @@ export class Comet {
 
   /** Replaces the token (login, refresh) or logs out with null (§3.2). */
   setToken(token: TokenSource): Promise<unknown> {
-    const prev = this.#opts.token;
+    const change: TokenChange = { source: token, prev: this.#opts.token };
     this.#opts.token = token;
     if (!this.#isOpen()) return Promise.resolve(this.user);
+    this.#tokenChanges.add(change);
     return (async () => {
       const t = await resolveToken(token);
       const id = this.#nextId++;
       return new Promise((resolve, reject) => {
-        this.#auths.set(id, { token: t, source: token, prev, resolve, reject });
+        this.#auths.set(id, { token: t, change, resolve, reject });
         this.#send({ t: "auth", id, token: t });
       });
-    })();
+    })().finally(() => this.#tokenChanges.delete(change));
   }
 
   close(): void {
@@ -568,8 +576,10 @@ export class Comet {
             // The server kept the current user, so the next hello must not
             // send the refused token, unless a newer setToken replaced it.
             // A newer one still pending must not fall back to it either.
-            if (this.#opts.token === a.source) this.#opts.token = a.prev;
-            for (const p of this.#auths.values()) if (p.prev === a.source) p.prev = a.prev;
+            const { source, prev } = a.change;
+            this.#tokenChanges.delete(a.change);
+            if (this.#opts.token === source) this.#opts.token = prev;
+            for (const c of this.#tokenChanges) if (c.prev === source) c.prev = prev;
             a.reject(new CometError(msg.err));
           }
         }
