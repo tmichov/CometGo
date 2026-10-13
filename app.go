@@ -145,6 +145,11 @@ type Config struct {
 	// QueryTimeout is the hard per-observer query timeout. Default 30s.
 	QueryTimeout time.Duration
 
+	// SlowObserverAfter is the soft deadline for one publication query. A
+	// tick stops starting queries once twice this has passed since its
+	// snapshot began; the rest run first in the next tick. Default 1s.
+	SlowObserverAfter time.Duration
+
 	// IdempotencyTTL is how long the result of a call carrying an
 	// idempotency key is kept for retries. Default 24h.
 	IdempotencyTTL time.Duration
@@ -249,6 +254,7 @@ func New(cfg Config) *App {
 	def(&cfg.MinTickInterval, 20*time.Millisecond)
 	def(&cfg.FenceTimeout, 5*time.Second)
 	def(&cfg.QueryTimeout, 30*time.Second)
+	def(&cfg.SlowObserverAfter, time.Second)
 	def(&cfg.IdempotencyTTL, 24*time.Hour)
 	defi(&cfg.MaxSubs, 500)
 	defi(&cfg.MaxInflight, 32)

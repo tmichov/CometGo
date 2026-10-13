@@ -229,7 +229,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 3. **Monotonic per sub.** A sub never moves to an older snapshot.
 4. **Read-your-writes,** per §6.2.
 
-Consistency across subs holds within a `tx`. **[later]** With slow-observer detachment (§8.4), two subs on one connection may sit at different snapshots between `tx` messages, but only while one of them is detached.
+Consistency across subs holds within a `tx`. With the tick budget (§8.4), two subs on one connection may sit at different snapshots between `tx` messages: a sub whose observer the budget deferred keeps its older result while its siblings move on, until a later tick runs it. Guarantees 1–3 still hold: every `tx` comes from one snapshot, and a sub never moves to an older one. **[later]** Slow-observer detachment (§8.4) does the same while a query is detached.
 
 Guarantees hold per server node. In a multi-node deployment, each connection is served entirely by one node.
 
@@ -375,9 +375,11 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 | Open connections, total and per client IP | no limit | The upgrade is refused with HTTP 503 before any `welcome`; the client treats it as a failed connect and retries with backoff. Not advertised. |
 | **[later]** per-method rate limits | | Token bucket. |
 
-### 8.4 [later] Slow observers
+### 8.4 Slow observers
 
-A query that exceeds a 1 s soft deadline is **detached**, not cancelled:
+**Tick budget.** A tick stops starting observer queries once twice a soft deadline (default 1 s, a server setting, not advertised) has passed since its snapshot began. Observers it did not start stay dirty and go first in the next tick, ordered by how long they have been dirty, so many medium-slow queries cannot hold a tick open and none of them starves under constant writes. Their subs keep their last result until then. A fence or identity change on a connection with such a sub waits for it (§6.2, §3.2); other connections proceed. A query that has started still runs to completion, so one query slower than the budget still holds its tick.
+
+**[later]** A query that exceeds the soft deadline is **detached**, not cancelled:
 
 - It finishes on its own snapshot (an exported or dedicated REPEATABLE READ snapshot).
 - Its diff goes out in its own `tx`.

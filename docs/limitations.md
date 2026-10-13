@@ -6,7 +6,7 @@ These are properties of the current engine, not bugs. Several have planned fixes
 
 Each server runs one engine goroutine. It drains change notifications, runs every observer that needs re-running in one `REPEATABLE READ` snapshot, sends the diffs, and then starts the next tick. Everything a tick does happens one step after another, on that one goroutine:
 
-- **A slow publication query delays every subscription on the node.** No other observer is re-run until the slow one finishes or hits `QueryTimeout` (30 s by default).
+- **A slow publication query delays every subscription on the node.** No other observer is re-run until the slow one finishes or hits `QueryTimeout` (30 s by default). The tick budget (`SlowObserverAfter`) stops a tick from *starting* more queries after twice the soft deadline, so many medium-slow queries are spread over several ticks, but one query that is slower than the budget still holds its tick.
 - **A slow publication `fn` does the same.** `fn` runs on the engine loop for every new subscription, again when a connection's user changes, and on `Revalidate`. A database round trip in an access check costs that round trip per subscriber ([How a publication runs](server.md#how-a-publication-runs)).
 - **Call results wait too.** Methods run in their own goroutines, so a slow method does not hold up the engine. But a call's result is sent only after the tick that brings its writes to the caller's subscriptions. When ticks are slow, results are slow, or arrive with `lag: true` after `FenceTimeout`.
 
