@@ -128,3 +128,38 @@ func TestMetricsHookPanicIsContained(t *testing.T) {
 		}
 	}
 }
+
+// stale_seconds is reported once per result delivered after a change, and
+// not for the run that only snapshots a new sub.
+func TestMetricsStaleOncePerResult(t *testing.T) {
+	log := &metricLog{}
+	e := setupWith(t, func(c *Config) { c.Metrics = log.hook })
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	a.next()
+	count := func() (n int) {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		for _, m := range log.seen[MetricStale] {
+			if m.Pub != "items.all" || m.Value < 0 {
+				t.Fatalf("unexpected %+v", m)
+			}
+			n++
+		}
+		return n
+	}
+	if n := count(); n != 0 {
+		t.Fatalf("%d stale_seconds for the initial snapshot", n)
+	}
+	for i := 1; i <= 3; i++ {
+		a.send(map[string]any{"t": "call", "id": i, "m": "add", "args": map[string]any{"Owner": "a", "Name": "n"}})
+		a.next()
+		if r := a.next(); r["t"] != "res" || r["lag"] != nil {
+			t.Fatalf("res %v", r)
+		}
+		// Reported before the fence is released, so before the res.
+		if n := count(); n != i {
+			t.Fatalf("after %d writes: %d stale_seconds", i, n)
+		}
+	}
+}

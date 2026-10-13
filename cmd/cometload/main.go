@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,8 @@ type params struct {
 	scenario     string
 	slowObserver time.Duration
 	slowFn       time.Duration
+	slowPubFn    time.Duration
+	slowPubSubs  int
 	out          string
 	pgContainer  string
 }
@@ -70,9 +73,11 @@ func main() {
 	flag.IntVar(&p.calls, "calls", 200, "method calls per second, spread over random clients")
 	flag.DurationVar(&p.warmup, "warmup", 10*time.Second, "load before measuring")
 	flag.DurationVar(&p.duration, "duration", 60*time.Second, "measured load")
-	flag.StringVar(&p.scenario, "scenario", "base", `"base", or "slow" to add one slow observer and one slow fn`)
+	flag.StringVar(&p.scenario, "scenario", "base", `"base"; "slow" to add one slow observer and one slow fn; or "m3", the M3 exit-criterion setup: a 10s slow observer and a 100ms slow publication fn`)
 	flag.DurationVar(&p.slowObserver, "slow-observer", 500*time.Millisecond, "slow scenario: pg_sleep in the slow observer, re-run on every shared write")
 	flag.DurationVar(&p.slowFn, "slow-fn", 2*time.Second, "slow scenario: pg_sleep in the slow fn, called back to back by one client")
+	flag.DurationVar(&p.slowPubFn, "slow-pub-fn", 100*time.Millisecond, "m3 scenario: pg_sleep in the slow publication's fn, per sub")
+	flag.IntVar(&p.slowPubSubs, "slow-pub-subs", 50, "m3 scenario: clients that each subscribe to the slow publication when measuring starts")
 	flag.StringVar(&p.out, "out", "", "also write the Markdown report to this file")
 	flag.StringVar(&p.pgContainer, "pg-container", "", `Postgres container for DB CPU (default: "docker compose ps -q postgres")`)
 	flag.Parse()
@@ -85,7 +90,19 @@ func main() {
 		}
 		return
 	}
-	if p.scenario != "base" && p.scenario != "slow" {
+	switch p.scenario {
+	case "base", "slow":
+	case "m3":
+		// The exit criterion's setup, unless overridden by an explicit flag.
+		set := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		if !set["slow-observer"] {
+			p.slowObserver = 10 * time.Second
+		}
+		if !set["slow-pub-fn"] {
+			p.slowPubFn = 100 * time.Millisecond
+		}
+	default:
 		log.Fatalf("unknown -scenario %q", p.scenario)
 	}
 	if p.subs < 1 || p.clients < 1 || p.users < 1 || p.groups < 1 || p.rows < 1 {
@@ -364,7 +381,7 @@ func drive(ctx context.Context, p params) (*report, error) {
 	rep.rssLoaded = rss(srv.cmd.Process.Pid)
 
 	var slowClient *client
-	if p.scenario == "slow" {
+	if p.scenario == "slow" || p.scenario == "m3" {
 		// Its own callStats: slow.fn must not count with the other calls.
 		slowClient, err = dial(ctx, url, "slow", []map[string]any{{"name": "slow.observer", "args": map[string]any{}}}, &callStats{})
 		if err != nil {
@@ -379,7 +396,7 @@ func drive(ctx context.Context, p params) (*report, error) {
 	load.Go(func() { writeLoad(loadCtx, pool, p, &writesDone, &writesSkipped) })
 	load.Go(func() { callLoad(loadCtx, clients, p, &callsSkipped) })
 	slowFns := &slowFnStats{}
-	if slowClient != nil {
+	if p.scenario == "slow" {
 		load.Go(func() { slowFnLoad(loadCtx, slowClient, slowFns) })
 	}
 
@@ -396,6 +413,10 @@ func drive(ctx context.Context, p params) (*report, error) {
 	stats.begin()
 	slowFns.begin()
 	measureStart := time.Now()
+	slowPubs := &slowPubStats{}
+	if p.scenario == "m3" {
+		go slowPubLoad(ctx, url, p, slowPubs)
+	}
 
 	select {
 	case <-time.After(p.duration):
@@ -416,6 +437,7 @@ func drive(ctx context.Context, p params) (*report, error) {
 	rep.writesSkipped = writesSkipped.Load() - writesSkipped0
 	rep.callsSkipped = callsSkipped.Load() - callsSkipped0
 	rep.slowFn = slowFns.snapshot()
+	rep.slowPub = slowPubs.snapshot()
 	stopLoad()
 	load.Wait()
 
@@ -570,6 +592,44 @@ func slowFnLoad(ctx context.Context, c *client, s *slowFnStats) {
 	}
 }
 
+type slowPubStats struct {
+	mu     sync.Mutex
+	ready  []float64 // seconds from dial to ready
+	failed int       // dial failed, or the sub was ended
+}
+
+func (s *slowPubStats) snapshot() *slowPubStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &slowPubStats{ready: slices.Clone(s.ready), failed: s.failed}
+}
+
+// slowPubLoad opens p.slowPubSubs clients at once, each subscribing to
+// slow.pubfn with its own args, so each sub binds its own observer and runs
+// the slow fn. It records how long each took to become ready.
+func slowPubLoad(ctx context.Context, url string, p params, s *slowPubStats) {
+	for i := range p.slowPubSubs {
+		go func() {
+			start := time.Now()
+			c, err := dial(ctx, url, fmt.Sprintf("slowpub%d", i), []map[string]any{{"name": "slow.pubfn", "args": map[string]any{"g": i % p.groups, "k": i}}}, &callStats{})
+			if err == nil {
+				select {
+				case <-c.ready:
+				case <-ctx.Done():
+					return
+				}
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if err != nil || c.ended.Load() > 0 {
+				s.failed++
+				return
+			}
+			s.ready = append(s.ready, time.Since(start).Seconds())
+		}()
+	}
+}
+
 type server struct {
 	cmd  *exec.Cmd
 	addr string
@@ -582,7 +642,7 @@ func startServer(ctx context.Context, p params) (*server, error) {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, exe, "-serve", "-db", p.dsn,
-		"-slow-observer", p.slowObserver.String(), "-slow-fn", p.slowFn.String())
+		"-slow-observer", p.slowObserver.String(), "-slow-fn", p.slowFn.String(), "-slow-pub-fn", p.slowPubFn.String())
 	cmd.Stderr = os.Stderr
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	out, err := cmd.StdoutPipe()

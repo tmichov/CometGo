@@ -31,6 +31,7 @@ type report struct {
 	callsSent     int
 	callsAnswered int
 	slowFn        *slowFnStats
+	slowPub       *slowPubStats
 	server        *serverStats
 	dbCPU         float64 // percent of one core
 	dbCPUErr      string
@@ -89,9 +90,14 @@ func (r *report) markdown() string {
 	w("| Shared groups / rows per result | %d / %d |\n", p.groups, p.rows)
 	w("| Direct writes | %d/s target, %.0f/s done |\n", p.writes, float64(r.writes)/secs)
 	w("| Calls | %d/s target, %.0f/s sent |\n", p.calls, float64(r.callsSent)/secs)
-	if p.scenario == "slow" {
+	if p.scenario != "base" {
 		w("| Slow observer | pg_sleep %s, re-run on every shared write |\n", p.slowObserver)
+	}
+	if p.scenario == "slow" {
 		w("| Slow fn | pg_sleep %s, one in flight at all times |\n", p.slowFn)
+	}
+	if p.scenario == "m3" {
+		w("| Slow publication fn | pg_sleep %s per sub, %d clients subscribing as measuring starts |\n", p.slowPubFn, p.slowPubSubs)
 	}
 	w("| Warmup / measured | %s / %s |\n\n", p.warmup, r.measured.Round(time.Millisecond))
 
@@ -127,6 +133,11 @@ func (r *report) markdown() string {
 	if r.slowFn != nil && p.scenario == "slow" {
 		w("Slow fn: %d calls, p50 %s, max %s, %d failed.\n\n", len(r.slowFn.latency), ms(pct(r.slowFn.latency, .5)), ms(pct(r.slowFn.latency, 1)), r.slowFn.failed)
 	}
+	if r.slowPub != nil && p.scenario == "m3" {
+		sp := r.slowPub
+		w("Slow publication subs: %d of %d ready, dial to ready p50 %s, max %s, %d failed.\n\n",
+			len(sp.ready), p.slowPubSubs, ms(pct(sp.ready, .5)), ms(pct(sp.ready, 1)), sp.failed)
+	}
 
 	s := r.server
 	w("## Engine\n\n")
@@ -135,6 +146,18 @@ func (r *report) markdown() string {
 	w("| Tick duration p50 / p99 / max | %s / %s / %s |\n", ms(pct(s.Ticks, .5)), ms(pct(s.Ticks, .99)), ms(pct(s.Ticks, 1)))
 	w("| Runs per tick mean / p99 / max | %.1f / %.0f / %.0f |\n", mean(s.Runs), pct(s.Runs, .99), pct(s.Runs, 1))
 	w("| Fence wait p50 / p99 | %s / %s |\n", ms(pct(s.FenceWait, .5)), ms(pct(s.FenceWait, .99)))
+	var other []float64
+	for pub, xs := range s.Stale {
+		if pub != "slow.observer" && pub != "slow.pubfn" {
+			other = append(other, xs...)
+		}
+	}
+	w("| Staleness p50 / p99, other publications | %s / %s |\n", ms(pct(other, .5)), ms(pct(other, .99)))
+	if p.scenario != "base" {
+		for _, pub := range []string{"slow.observer", "slow.pubfn"} {
+			w("| Staleness p50 / p99, %s | %s / %s |\n", pub, ms(pct(s.Stale[pub], .5)), ms(pct(s.Stale[pub], .99)))
+		}
+	}
 	w("| Observers / subscriptions | %.0f / %.0f |\n", s.Observers, s.Subscriptions)
 	w("| Max queued bytes / coalescing conns | %.0f / %.0f |\n", s.MaxQueuedBytes, s.MaxCoalescing)
 	w("| Slow-consumer closes / listener reconnects / dropped clients | %d / %d / %d |\n", s.SlowCloses, s.ListenReconnects, r.dropped)

@@ -109,6 +109,9 @@ type observer struct {
 
 	subs  map[*subscription]struct{}
 	dirty bool
+	// dirtyAt is when the first notification not yet reflected in res was
+	// drained, for MetricStale; zero when fresh or without Config.Metrics.
+	dirtyAt time.Time
 
 	// Per-tick output.
 	ops      []op
@@ -347,6 +350,10 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		}
 	}
 	e.mu.Unlock()
+	var drained time.Time
+	if e.a.cfg.Metrics != nil {
+		drained = time.Now()
+	}
 
 	changes := map[string]*tableChange{}
 	for _, n := range notes {
@@ -435,7 +442,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		if !allDirty && !obs.dirty && !obs.awaitsInit() && obs.filterable(changes[obs.tables[0]]) {
 			cands = append(cands, obs)
 		} else {
-			obs.dirty = true
+			obs.markDirty(drained)
 		}
 	}
 
@@ -449,14 +456,14 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		}
 	}
 	if len(toRun) > 0 || len(cands) > 0 {
-		if err := e.runObservers(ctx, toRun, cands, changes); err != nil {
+		if err := e.runObservers(ctx, toRun, cands, changes, drained); err != nil {
 			e.a.log.Warn("tick snapshot failed, retrying", "err", err)
 			// Observers stay dirty; fences wait for a tick that actually
 			// reflects their writes. Requests already applied stay applied.
 			// Candidates lose the keys that made them candidates, so they
 			// re-run in full.
 			for _, obs := range cands {
-				obs.dirty = true
+				obs.markDirty(drained)
 			}
 			e.carryFences = fences
 			e.carryEvts = evts
@@ -522,6 +529,16 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		obs.ops, obs.snapJSON = nil, nil
 	}
 	e.flush(out)
+	if e.a.cfg.Metrics != nil {
+		// Every observer that ran this tick is clean now; one still dirty
+		// did not run. Errored observers were removed above.
+		for _, obs := range e.observers {
+			if !obs.dirty && !obs.dirtyAt.IsZero() {
+				e.a.metric(MetricStale, obs.pub.name, time.Since(obs.dirtyAt).Seconds())
+				obs.dirtyAt = time.Time{}
+			}
+		}
+	}
 	for c := range snapped {
 		// Arms the drain signal that ends the raised limit.
 		q, _ := c.queuedBytes(lowWaterBytes)
@@ -785,7 +802,7 @@ type runResult struct {
 // candidate the changed rows can affect. Results are staged and applied only
 // once the snapshot transaction has committed, so a failure leaves every
 // observer exactly as it was.
-func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange) (err error) {
+func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange, drained time.Time) (err error) {
 	// Pool hooks and tracers (BeforeAcquire, PrepareConn, ConnConfig.Tracer)
 	// run user code in BeginTx, the SET LOCAL and the candidate filter. A
 	// panic there fails the tick, which tick retries like a lost snapshot.
@@ -816,6 +833,13 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		affected, err := e.filterCandidates(ctx, tx, cands, changes)
 		if err != nil {
 			return err
+		}
+		// Affected candidates were dirtied by this drain. A failed tick
+		// marks every candidate dirty, keeping this time.
+		for _, obs := range affected {
+			if obs.dirtyAt.IsZero() {
+				obs.dirtyAt = drained
+			}
 		}
 		toRun = append(toRun, affected...)
 	}
@@ -900,6 +924,15 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
 	}
 	return nil
+}
+
+// markDirty marks obs to run, keeping the drain time of the first
+// notification it does not yet reflect.
+func (obs *observer) markDirty(drained time.Time) {
+	obs.dirty = true
+	if obs.dirtyAt.IsZero() {
+		obs.dirtyAt = drained
+	}
 }
 
 func (obs *observer) awaitsInit() bool {
