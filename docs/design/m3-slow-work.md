@@ -40,7 +40,7 @@ Rules:
 
 - **Match candidates.** A candidate the in-snapshot filter finds unaffected becomes fresh as of that snapshot. If the filter fails, it stays stale and dirty, as today.
 - **Assembly.** It emits entries, both snapshots and ops, only for observers with `resTick` equal to the current tick. A sub with `needInit` or `needsReset` on any other observer waits. This keeps §6.1.1 once ticks stop running every observer.
-- **Fence release.** A fence `f(p, C)` is released when every sub of C has an observer that is not stale at or before `p`, and has no `needInit`, `needsReset` or unbound state. Otherwise the fence is carried to the next tick. A fence dropped by `FenceTimeout` also leaves the carry list.
+- **Fence release.** A fence `f(p, C)` is released when every sub of C has an observer that is not stale at or before `p`, and has no `needInit` or `needsReset`. (Subs are never left unbound across ticks: §2 keeps `fn` within one tick.) Otherwise the fence is carried to the next tick. A fence dropped by `FenceTimeout` also leaves the carry list.
 - **`authRes` after a rebind.** It is held under the same condition. A connection's `after` messages form a FIFO and always go out in order.
 - **Events.** An event with number `n` for observer O is held until O is fresh past `n`. It then goes only to subs whose snapshot has been sent. Events are delivered before fences are checked, so an emitting call's `res` (fence `p > n`) still follows its events.
 - **Revalidation.** It becomes a numbered notification, stamped by the listener under `e.mu` like the others. The ends it produces are applied in the tick that drains it, before fences.

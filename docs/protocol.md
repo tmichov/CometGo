@@ -259,7 +259,7 @@ Postgres delivers a transaction's notifications together, after commit, in commi
 
 In v1-core, ticks are sequential and every dirty observer runs in each tick, so this reduces to sending `res` after the `tx` of the first tick that drained past `p`.
 
-**[later]** With slow-observer detachment and the tick budget (§8.4), a tick no longer runs every dirty observer, so the server applies the condition above per connection. A fence whose connection still has an observer dirty from `n ≤ p` is carried to later ticks; fences of other connections are released as before. In addition, a sub whose subscription has not been bound yet, or whose initial or reset snapshot has not been sent, holds the fence. A call on a connection subscribed to a slow publication therefore waits for that publication's next result, and gets `lag:true` if the result takes longer than the fence timeout. Calls on connections not subscribed to it are unaffected.
+**[later]** With slow-observer detachment and the tick budget (§8.4), a tick no longer runs every dirty observer, so the server applies the condition above per connection. A fence whose connection still has an observer dirty from `n ≤ p` is carried to later ticks; fences of other connections are released as before. In addition, a sub whose initial or reset snapshot has not been sent holds the fence. A call on a connection subscribed to a slow publication therefore waits for that publication's next result, and gets `lag:true` if the result takes longer than the fence timeout. Calls on connections not subscribed to it are unaffected.
 
 **Edge cases:**
 
