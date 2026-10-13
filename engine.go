@@ -540,12 +540,14 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	// a fresh snapshot with a cached result from an older one (assembly
 	// emits only results of this tick). A candidate owing a reset runs in
 	// full.
-	var toRun []*observer
-	for _, obs := range e.observers {
-		if resetFor[obs] && !obs.dirty && slices.Contains(cands, obs) {
-			cands = slices.DeleteFunc(cands, func(o *observer) bool { return o == obs })
+	cands = slices.DeleteFunc(cands, func(obs *observer) bool {
+		if resetFor[obs] {
 			obs.markDirty(drained)
 		}
+		return resetFor[obs]
+	})
+	var toRun []*observer
+	for _, obs := range e.observers {
 		if (obs.dirty || obs.res == nil || obs.awaitsInit() || resetFor[obs]) && !isDeferred(obs) {
 			toRun = append(toRun, obs)
 		}
