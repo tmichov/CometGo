@@ -303,3 +303,28 @@ func TestDetachRebindIsJoiner(t *testing.T) {
 		t.Fatalf("expected authRes, got %v", m)
 	}
 }
+
+// A detached run reports stale_seconds once, when its result is applied,
+// not when it detaches.
+func TestDetachedRunReportsStaleOnApply(t *testing.T) {
+	log := &metricLog{}
+	e := setupFull(t, func(c *Config) {
+		fastDetach(c)
+		c.Metrics = log.hook
+	}, slowQ)
+	a, _ := e.dial(t, nil)
+	settleListen(t, e, a)
+	subSlowQ(t, a, 1, 1500, 0)
+	n0, _ := log.count(MetricStale, "slowq")
+	insertName(t, e, "w")
+	time.Sleep(800 * time.Millisecond) // detached, not finished
+	if n, _ := log.count(MetricStale, "slowq"); n != n0 {
+		t.Fatalf("stale_seconds reported while the run was in flight")
+	}
+	if names := rowNames(nextWithin(t, a, 10*time.Second), 1); len(names) != 1 {
+		t.Fatalf("detached result %v", names)
+	}
+	if n, v := log.count(MetricStale, "slowq"); n != n0+1 || v < 1.2 {
+		t.Fatalf("stale_seconds: %d reports (want %d), last %.2fs (want over the 1.5s run)", n-n0, 1, v)
+	}
+}
