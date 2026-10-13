@@ -9,7 +9,7 @@ import (
 // seconds; counts and gauges are plain numbers.
 type Metric struct {
 	Name  string  // one of the Metric* constants
-	Pub   string  // the publication, for MetricPubRun; "" otherwise
+	Pub   string  // the publication, for MetricPubRun and MetricStale; "" otherwise
 	Value float64 //
 }
 
@@ -28,6 +28,7 @@ const (
 	MetricSlowClose       = "slow_closes"        // counter: a socket closed with 4429
 	MetricListenReconnect = "listen_reconnects"  // counter: the LISTEN connection dropped
 	MetricPubRun          = "pub_run_seconds"    // duration of one observer query, with Pub
+	MetricStale           = "stale_seconds"      // duration: notification drained to its observer's result delivered, with Pub
 )
 
 // metric reports v under name if a hook is set. A panicking hook is logged

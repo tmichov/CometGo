@@ -128,3 +128,133 @@ func TestMetricsHookPanicIsContained(t *testing.T) {
 		}
 	}
 }
+
+// stale_seconds is reported once per result delivered after a change, and
+// not for the run that only snapshots a new sub.
+func TestMetricsStaleOncePerResult(t *testing.T) {
+	log := &metricLog{}
+	e := setupWith(t, func(c *Config) { c.Metrics = log.hook })
+	a, _ := e.dial(t, nil)
+	settleListen(t, e, a)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.all"})
+	a.next()
+	count := func() (n int) {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		for _, m := range log.seen[MetricStale] {
+			if m.Pub != "items.all" || m.Value < 0 {
+				t.Fatalf("unexpected %+v", m)
+			}
+			n++
+		}
+		return n
+	}
+	if n := count(); n != 0 {
+		t.Fatalf("%d stale_seconds for the initial snapshot", n)
+	}
+	for i := 1; i <= 3; i++ {
+		a.send(map[string]any{"t": "call", "id": i, "m": "add", "args": map[string]any{"Owner": "a", "Name": "n"}})
+		a.next()
+		if r := a.next(); r["t"] != "res" || r["lag"] != nil {
+			t.Fatalf("res %v", r)
+		}
+		// Reported before the fence is released, so before the res.
+		if n := count(); n != i {
+			t.Fatalf("after %d writes: %d stale_seconds", i, n)
+		}
+	}
+}
+
+// settleListen waits until the tick after the first LISTEN has run, whose
+// all-dirty notification would otherwise re-run (and report) observers
+// subscribed after it. A fenced call's res follows a tick that drained
+// past that notification.
+func settleListen(t *testing.T, e *testEnv, a *client) {
+	t.Helper()
+	e.waitListening(t)
+	a.send(map[string]any{"t": "call", "id": 99, "m": "add", "args": map[string]any{"Owner": "settle", "Name": "n"}})
+	if r := a.next(); r["t"] != "res" {
+		t.Fatalf("res %v", r)
+	}
+}
+
+// ownedPub registers "items.owned", the rows of one owner, declaring Match
+// so a write to another owner leaves it out of the tick (pkfilter.go).
+func ownedPub(env *testEnv, app *App) {
+	Publish(app, "items.owned", PubOptions{Tables: []string{env.table}, Scope: ScopeShared},
+		func(c *SubCtx, a struct{ Owner string }) (Query, error) {
+			return Query{
+				SQL:   "SELECT id, name FROM " + env.table + " WHERE owner = $1 ORDER BY id",
+				Args:  []any{a.Owner},
+				Match: map[string]any{"owner": a.Owner},
+			}, nil
+		})
+}
+
+func (l *metricLog) count(name, pub string) (n int, last float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, m := range l.seen[name] {
+		if m.Pub == pub {
+			n, last = n+1, m.Value
+		}
+	}
+	return n, last
+}
+
+// A Match candidate the change cannot affect reports nothing; one it does
+// affect reports once, before the call's res.
+func TestMetricsStaleMatchCandidate(t *testing.T) {
+	log := &metricLog{}
+	e := setupFull(t, func(c *Config) { c.Metrics = log.hook }, ownedPub)
+	a, _ := e.dial(t, nil)
+	settleListen(t, e, a)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.owned", "args": map[string]any{"Owner": "zed"}})
+	a.next()
+
+	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
+	if r := a.next(); r["t"] != "res" {
+		t.Fatalf("expected res with no tx, got %v", r)
+	}
+	if n, _ := log.count(MetricStale, "items.owned"); n != 0 {
+		t.Fatalf("%d stale_seconds for an unaffected candidate", n)
+	}
+	a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "zed", "Name": "n"}})
+	a.next()
+	if r := a.next(); r["t"] != "res" {
+		t.Fatalf("res %v", r)
+	}
+	if n, _ := log.count(MetricStale, "items.owned"); n != 1 {
+		t.Fatalf("%d stale_seconds for one affected run, want 1", n)
+	}
+}
+
+// A candidate whose tick fails is run in full by the retry, and its
+// stale_seconds spans from the first drain, so it includes the retry
+// backoff (at least 250 ms).
+func TestMetricsStaleAcrossFailedTick(t *testing.T) {
+	log := &metricLog{}
+	tr := &panicTracer{prefix: "SET LOCAL statement_timeout"}
+	e := setupFull(t, func(c *Config) {
+		tracedPool(t, tr, &errLogs{})(c)
+		c.Metrics = log.hook
+	}, ownedPub)
+	a, _ := e.dial(t, nil)
+	settleListen(t, e, a)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.owned", "args": map[string]any{"Owner": "zed"}})
+	a.next()
+
+	tr.armed.Store(true)
+	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "zed", "Name": "n"}})
+	a.next()
+	if r := a.next(); r["t"] != "res" {
+		t.Fatalf("res %v", r)
+	}
+	if tr.armed.Load() {
+		t.Fatal("the tick never failed")
+	}
+	n, v := log.count(MetricStale, "items.owned")
+	if n != 1 || v < 0.25 {
+		t.Fatalf("stale_seconds reported %d times, last %.3fs; want once, at least the 250ms backoff", n, v)
+	}
+}
