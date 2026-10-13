@@ -184,6 +184,9 @@ export class Comet {
   #pinged = false;
   #closed = false;
   #reconnectTimer?: ReturnType<typeof setTimeout>;
+  // Proactive refresh of a function token source before its authExp (§3.2).
+  #refreshTimer?: ReturnType<typeof setTimeout>;
+  #authExp?: number; // the current identity's expiry, Unix seconds
   #hbTimer?: ReturnType<typeof setInterval>;
   #statusListeners = new Set<() => void>();
   // Session resume (§7.2): the session to resume, whether the server offers
@@ -194,6 +197,7 @@ export class Comet {
   #seq = 0;
   #acked = 0;
   #welcomed = false; // the current socket's welcome has arrived
+  #helloSent = false; // the current socket's hello has gone out
   #unackedBytes = 0;
   // retryInMs of a goaway on the current socket (§7.3): the server is
   // shutting down, so new calls wait for the next connection, which is
@@ -272,10 +276,14 @@ export class Comet {
   setToken(token: TokenSource): Promise<unknown> {
     const change: TokenChange = { source: token, prev: this.#opts.token };
     this.#opts.token = token;
+    // The next hello sends the stored token, even if its socket is already
+    // opening (see #open).
     if (!this.#isOpen()) return Promise.resolve(this.user);
     this.#tokenChanges.add(change);
     return (async () => {
       const t = await resolveToken(token);
+      // The socket dropped meanwhile: the stored token goes in the next hello.
+      if (!this.#isOpen()) throw lost();
       const id = this.#nextId++;
       return new Promise((resolve, reject) => {
         this.#auths.set(id, { token: t, change, resolve, reject });
@@ -291,6 +299,7 @@ export class Comet {
       document.removeEventListener("visibilitychange", this.#onVisible);
     }
     clearTimeout(this.#reconnectTimer);
+    clearTimeout(this.#refreshTimer);
     clearInterval(this.#hbTimer);
     this.#ws?.close(1000);
     this.#rejectSent(); // calls kept for a resume that will not happen
@@ -304,16 +313,19 @@ export class Comet {
 
   // ---- connection ----
 
+  // Open and past hello: only then may anything else be sent.
   #isOpen(): boolean {
-    return this.#ws?.readyState === 1;
+    return this.#ws?.readyState === 1 && this.#helloSent;
   }
 
   async #open(): Promise<void> {
     if (this.#closed) return;
     this.#setStatus("connecting");
-    let token: string | null = null;
+    // #credential inlined: one microtask fewer before the socket exists, which
+    // the tests' handshake helpers count on.
+    let cred = { source: this.#opts.token, token: null as string | null };
     try {
-      token = await resolveToken(this.#opts.token);
+      cred.token = await resolveToken(cred.source);
     } catch (e) {
       console.warn("cometgo: token source failed", e);
     }
@@ -323,15 +335,23 @@ export class Comet {
     const WS = this.#opts.WebSocket ?? WebSocket;
     const ws = new WS(this.#opts.url ?? defaultUrl(), [SUBPROTOCOL]);
     this.#ws = ws;
-    ws.onopen = () => {
+    this.#helloSent = false;
+    ws.onopen = async () => {
       // Pipelined handshake (§3.1): no need to wait for welcome. Calls that
       // were sent before the drop wait for it, though: they are re-sent only
       // if the session resumes (§7.2).
       this.#lastRecv = Date.now();
       this.#welcomed = false;
       this.#goaway = undefined;
+      // A setToken while the socket was opening: hello carries its token.
+      while (cred.source !== this.#opts.token) {
+        cred = await this.#credential();
+        if (this.#ws !== ws || ws.readyState !== 1) return;
+      }
+      const { token } = cred;
       const resume = this.#resumable() ? { resume: { session: this.#session, seq: this.#seq, subs: [...this.#subs.keys()] } } : {};
       this.#send({ t: "hello", v: 1, caps: ["resume", "evt", "ik"], ...(token ? { auth: { token } } : {}), ...(this.#opts.build ? { build: this.#opts.build } : {}), ...resume });
+      this.#helloSent = true;
       for (const sub of this.#subs.values()) this.#sendSub(sub);
       for (const c of this.#calls.values()) if (!c.sent) this.#sendCall(c);
     };
@@ -354,8 +374,35 @@ export class Comet {
     };
   }
 
+  // The stored token source and its token.
+  async #credential(): Promise<{ source: TokenSource | undefined; token: string | null }> {
+    const source = this.#opts.token;
+    try {
+      return { source, token: await resolveToken(source) };
+    } catch (e) {
+      console.warn("cometgo: token source failed", e);
+      return { source, token: null };
+    }
+  }
+
+  // Calls setToken again with a function token source at about 80% of the
+  // identity's remaining lifetime, so it never reaches AUTH_EXPIRED (§3.2).
+  // shortcut: the 5 s floor stops a refresh loop when the client clock runs
+  // ahead of authExp, but then refreshes every 5 s; measure skew if that bites.
+  #scheduleRefresh(authExp: unknown): void {
+    clearTimeout(this.#refreshTimer);
+    this.#authExp = typeof authExp === "number" ? authExp : undefined;
+    const source = this.#opts.token;
+    if (typeof authExp !== "number" || typeof source !== "function") return;
+    const delay = Math.min(2 ** 31 - 1, Math.max(5_000, 0.8 * (authExp * 1000 - Date.now())));
+    this.#refreshTimer = setTimeout(() => {
+      if (this.#opts.token === source && this.#isOpen()) this.setToken(source).catch(() => {});
+    }, delay);
+  }
+
   #onDisconnect(code: number, reason: string): void {
     this.#ws = undefined;
+    clearTimeout(this.#refreshTimer); // the next welcome reschedules it
     this.#txParts = []; // a partial tx is replayed whole: #seq never counted it
     // With a resumable session, sent calls are held until the reconnect:
     // resumed, they are re-sent; otherwise they are rejected then (§7.2).
@@ -507,6 +554,7 @@ export class Comet {
         this.#session = msg.session;
         this.#welcomed = true;
         this.#canResume = Array.isArray(msg.caps) && msg.caps.includes("resume");
+        this.#scheduleRefresh(msg.authExp);
         if (msg.resumed) {
           // Missed messages follow as a replay. Unanswered calls and auths
           // go out again with their original ids; the server runs each
@@ -583,6 +631,9 @@ export class Comet {
             a.reject(new CometError(msg.err));
           }
         }
+        // After the restore above: a refused setToken keeps the current
+        // identity and its expiry, and a refused refresh is retried.
+        this.#scheduleRefresh(msg.ok || msg.id === undefined ? msg.authExp : this.#authExp);
         this.#emit();
         return;
       }

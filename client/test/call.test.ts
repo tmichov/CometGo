@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, test } from "node:test";
+import { afterEach, beforeEach, mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { connect, CometError, type Comet } from "../src/index.ts";
 
@@ -366,4 +366,121 @@ test("a setToken lost with the connection stays stored: the server may have acce
   ws2.connect();
   await tick();
   assert.equal(ws2.of("hello")[0].auth?.token, "B");
+});
+
+test("a setToken while the socket is opening goes in its hello", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  ws.drop();
+  const ws2 = await nextSocket(ws); // #open already resolved the old (null) token
+  assert.equal(comet.setToken("B") instanceof Promise, true);
+  ws2.connect();
+  await tick();
+  assert.equal(ws2.of("hello")[0].auth?.token, "B");
+  ws2.recv({ t: "welcome", hb: 25000, user: { id: "bob" }, caps: [] });
+  assert.deepEqual(comet.user, { id: "bob" });
+});
+
+test("hello waits for a token function set while the socket was opening; nothing goes before it", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  ws.drop();
+  const ws2 = await nextSocket(ws);
+  let release!: (t: string) => void;
+  void comet.setToken(() => new Promise<string>((r) => (release = r)));
+  ws2.connect();
+  comet.subscribe("tasks");
+  comet.call("m").catch(() => {}); // rejected by close() in afterEach
+  await tick();
+  assert.equal(ws2.sent.length, 0, "nothing before hello");
+  release("C");
+  await tick();
+  assert.deepEqual(
+    ws2.sent.map((m) => m.t),
+    ["hello", "sub", "call"],
+  );
+  assert.equal(ws2.sent[0].auth?.token, "C");
+});
+
+test("a setToken whose token function resolves after a drop rejects with CONNECTION_LOST and stays stored", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const b = comet.setToken(() => gate.then(() => "B"));
+  ws.drop();
+  release();
+  await lostConnection(b);
+  const ws2 = await nextSocket(ws);
+  ws2.connect();
+  await tick();
+  assert.equal(ws2.of("hello")[0].auth?.token, "B");
+  ws2.recv({ t: "welcome", hb: 25000, user: { id: "bob" }, caps: [] });
+  assert.equal(ws2.of("auth").length, 0, "no leaked auth re-sent");
+});
+
+test("a function token source is refreshed at about 80% of its lifetime, retried if refused, and close() stops it", async () => {
+  comet.close();
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000_000 });
+  try {
+    const flush = async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    };
+    let n = 0;
+    comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any, token: () => `t${++n}` });
+    await flush();
+    const ws = FakeWS.last;
+    ws.connect();
+    await flush();
+    assert.equal(ws.of("hello")[0].auth?.token, "t1");
+    const exp = (now: number, s: number) => Math.floor(now / 1000) + s;
+    ws.recv({ t: "welcome", hb: 25000, user: { id: "a" }, caps: [], authExp: exp(Date.now(), 100) });
+
+    mock.timers.tick(79_000);
+    await flush();
+    assert.equal(ws.of("auth").length, 0, "not before 80%");
+    mock.timers.tick(2_000);
+    await flush();
+    const [refresh] = ws.of("auth");
+    assert.equal(refresh.token, "t2");
+
+    // Refused: the identity keeps its expiry and the refresh is retried.
+    ws.recv({ t: "authRes", seq: 1, id: refresh.id, ok: false, err: { code: "INTERNAL" } });
+    await flush();
+    assert.deepEqual(comet.user, { id: "a" });
+    mock.timers.tick(16_000); // 80% of the ~19 s left
+    await flush();
+    const retry = ws.of("auth")[1];
+    assert.equal(retry.token, "t3");
+    ws.recv({ t: "authRes", seq: 2, id: retry.id, ok: true, user: { id: "a" }, authExp: exp(Date.now(), 100) });
+    await flush();
+
+    comet.close();
+    mock.timers.tick(1_000_000);
+    await flush();
+    assert.equal(ws.of("auth").length, 2, "close() cancels the refresh");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("a string token source is not refreshed", async () => {
+  comet.close();
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000_000 });
+  try {
+    const flush = async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    };
+    comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any, token: "A" });
+    await flush();
+    const ws = FakeWS.last;
+    ws.connect();
+    await flush();
+    ws.recv({ t: "welcome", hb: 25000, user: { id: "a" }, caps: [], authExp: Math.floor(Date.now() / 1000) + 100 });
+    mock.timers.tick(200_000);
+    await flush();
+    assert.equal(ws.of("auth").length, 0);
+  } finally {
+    mock.timers.reset();
+  }
 });

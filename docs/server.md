@@ -392,7 +392,7 @@ Called with the upgrade request, so it can read session cookies. Its result is u
 
 ### Expiry: `Identity.ExpiresAt`
 
-If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The client should call `setToken` with a fresh token before then. Proactive refresh by the client library and the HTTP refresh endpoint are *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
+If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The TypeScript client refreshes on its own before then when its token source is a function ([client Auth](client.md#auth)); with a string token the app should call `setToken` with a fresh one. The HTTP refresh endpoint is *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
 
 ### Revoking access: `Revalidate`
 
