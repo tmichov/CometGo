@@ -72,6 +72,8 @@ type serverStats struct {
 	Subscriptions    float64   `json:"subscriptions"`
 	MaxQueuedBytes   float64   `json:"maxQueuedBytes"`
 	MaxCoalescing    float64   `json:"maxCoalescing"`
+	// Stale is stale_seconds per publication.
+	Stale map[string][]float64 `json:"stale"`
 }
 
 func (s *serverStats) record(m cometgo.Metric) {
@@ -98,6 +100,11 @@ func (s *serverStats) record(m cometgo.Metric) {
 		s.MaxQueuedBytes = max(s.MaxQueuedBytes, m.Value)
 	case cometgo.MetricCoalescing:
 		s.MaxCoalescing = max(s.MaxCoalescing, m.Value)
+	case cometgo.MetricStale:
+		if s.Stale == nil {
+			s.Stale = map[string][]float64{}
+		}
+		s.Stale[m.Pub] = append(s.Stale[m.Pub], m.Value)
 	}
 }
 
@@ -108,6 +115,7 @@ func (s *serverStats) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.Ticks, s.Runs, s.FenceWait = nil, nil, nil
 		s.FenceLag, s.SlowCloses, s.ListenReconnects = 0, 0, 0
 		s.MaxQueuedBytes, s.MaxCoalescing = 0, 0
+		s.Stale = nil
 	}
 	json.NewEncoder(w).Encode(s)
 }
@@ -166,6 +174,24 @@ func serve(ctx context.Context, p params) error {
 			return cometgo.Query{
 				SQL:  `SELECT i.id, i.title, i.n FROM cometload.shared_items i, pg_sleep($1::float8) WHERE i.grp = 0 ORDER BY i.id`,
 				Args: []any{p.slowObserver.Seconds()},
+			}, nil
+		})
+
+	// The slow publication fn sleeps on the app's pool before returning its
+	// Query, on every sub. Each sub has its own k, so each binds its own
+	// observer; the query itself is cheap and re-runs on group g's writes.
+	cometgo.Publish(app, "slow.pubfn", cometgo.PubOptions{Tables: []string{"cometload.shared_items"}, Scope: cometgo.ScopeShared},
+		func(c *cometgo.SubCtx, a struct {
+			G int `json:"g"`
+			K int `json:"k"`
+		}) (cometgo.Query, error) {
+			if _, err := pool.Exec(c.Context, `SELECT pg_sleep($1::float8)`, p.slowPubFn.Seconds()); err != nil {
+				return cometgo.Query{}, err
+			}
+			return cometgo.Query{
+				SQL:   `SELECT id, title, n FROM cometload.shared_items WHERE grp = $1 ORDER BY id`,
+				Args:  []any{a.G},
+				Match: map[string]any{"grp": a.G},
 			}, nil
 		})
 

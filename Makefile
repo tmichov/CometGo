@@ -32,3 +32,4 @@ chaos:
 bench:
 	go run ./cmd/cometload -out docs/bench/base.md
 	go run ./cmd/cometload -scenario slow -out docs/bench/slow.md
+	go run ./cmd/cometload -scenario m3 -out docs/bench/m3-before.md

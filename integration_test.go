@@ -572,3 +572,33 @@ func TestLargeReorderResets(t *testing.T) {
 		t.Fatalf("reset not in the new order: first op %v", first)
 	}
 }
+
+// Auth messages sent back to back apply in the order sent, even when the
+// first one's Authenticate is slower: the session ends as the last token,
+// and the authRes messages answer in order.
+func TestBackToBackAuthKeepsOrder(t *testing.T) {
+	e := setupWith(t, func(c *Config) {
+		auth := c.Authenticate
+		c.Authenticate = func(ctx context.Context, token string) (*Identity, error) {
+			if token == "bob" {
+				time.Sleep(50 * time.Millisecond)
+			}
+			return auth(ctx, token)
+		}
+	})
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	a.send(map[string]any{"t": "auth", "id": 2, "token": "bob"})
+	a.send(map[string]any{"t": "auth", "id": 3, "token": "alice"})
+	for _, want := range []struct {
+		id   float64
+		user string
+	}{{2, "bob"}, {3, "alice"}} {
+		m := a.next()
+		if m["t"] != "authRes" || m["id"] != want.id || fmt.Sprint(m["user"]) != "map[id:"+want.user+"]" {
+			t.Fatalf("expected authRes %v for %s, got %v", want.id, want.user, m)
+		}
+	}
+	if u := e.app.liveConns()[0].identity().userID(); u != "alice" {
+		t.Fatalf("session ended as %q, want alice", u)
+	}
+}

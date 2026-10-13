@@ -96,7 +96,7 @@ cometgo.Publish(app, "tasks.byProject", cometgo.PubOptions{Tables: []string{"tas
 Each distinct `(publication, args, scope)` combination has one server-side **observer**, shared by every subscription that matches it. `fn` is called for **every** subscription, with that subscriber's `SubCtx`, so an access check in `fn` applies to each caller. Only the first call's `Query`, the one that created the observer, is used. It is reused for every re-run until the last subscription to the observer goes away, and the `Query` from later calls is discarded. So:
 
 - Everything the query depends on must be in `Query.SQL` and `Query.Args`, and the scope must separate callers whose queries would differ (see [Scope](#scope)).
-- `fn` runs on the engine's loop, so keep it fast. Doing an access check against the database there delays every subscription on the server.
+- `fn` runs on the engine's loop, so keep it fast. Doing an access check against the database there delays every subscription on the server. *Planned (M3):* the `fn` calls of one tick will run concurrently, so a tick waits for its slowest `fn` rather than for all of them in turn ([design](design/m3-slow-work.md)).
 - `fn` is the access check for a subscription when it starts, and when the connection's principal changes (log in, log out, switch user, switch `ScopeKey`, or an expired identity), because every subscription is re-bound then. It is **not** re-run when a token refresh or session resume keeps the same `UserID` and `ScopeKey`, even if `Identity.Data` (a role, say) changed, and not by itself when access changes in the database, so neither ends a live subscription. After such a change, call [`Revalidate`](#revoking-access-revalidate) to re-run it, or put the check in the query ([Authorization](#authorization)).
 - `fn` runs once per subscription, and again for each of a connection's subscriptions when its user changes. An access check that queries the database therefore costs one round trip per subscriber on the engine's loop. Keep it cheap or cached, especially for a `ScopeShared` publication with many subscribers.
 - Returning an error from `fn` ends that subscription only, with that error. Other subscriptions to the same observer keep streaming. Return a `*cometgo.Error` (e.g. `ErrForbidden`) to choose what the client sees; any other error becomes `INTERNAL`.
@@ -105,7 +105,7 @@ Each distinct `(publication, args, scope)` combination has one server-side **obs
 - A panic in the pool's tracer (`ConnConfig.Tracer`) is recovered wherever the framework queries, and logged with its stack trace. While the engine reads its snapshot, the tick is retried with backoff, as when the database is unreachable, and subscriptions keep their last data until a tick succeeds. In a method call (begin, idempotency key, commit), the call fails with `INTERNAL`. On the `LISTEN` connection, the listener reconnects. The connection in use goes back to the pool. Panics in the pool's `BeforeAcquire` or `PrepareConn` hooks are recovered the same way, but pgxpool keeps the connection it was preparing, so each such panic takes one connection out of the pool for good. Don't panic in those hooks. When `Query.Args` panics, pgx never calls the tracer's `TraceQueryEnd` for that query, and the framework cannot do it instead, because the tracer's span lives in the context that `TraceQueryStart` returned to pgx. A span or timer started there is never ended.
 - Bad args (wrong types, unknown fields) end the subscription with `BAD_REQUEST`. An unknown publication name ends it with `NOT_FOUND`.
 
-All observers that need re-running in one tick run inside one `REPEATABLE READ READ ONLY` transaction, so every update a client receives comes from one consistent database snapshot.
+All observers that need re-running in one tick run inside one `REPEATABLE READ READ ONLY` transaction, so every update a client receives comes from one consistent database snapshot. *Planned (M3):* a query slower than a soft deadline will be detached and deliver its result later in its own update. Each update will still come from one snapshot, but two subscriptions on one connection may then sit at different snapshots for a while ([protocol §6.1, §8.4](protocol.md#84-later-slow-observers)).
 
 ### PubOptions
 
@@ -500,7 +500,7 @@ Set `Config.Metrics` to receive health measurements, for example to feed Prometh
 ```go
 type Metric struct {
 	Name  string  // one of the Metric* constants below
-	Pub   string  // the publication, for MetricPubRun; "" otherwise
+	Pub   string  // the publication, for MetricPubRun and MetricStale; "" otherwise
 	Value float64 // seconds for durations, a number otherwise
 }
 ```
@@ -518,6 +518,7 @@ type Metric struct {
 | `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed as a slow consumer: its queue went over 8 MiB, or a write timed out. A write that fails because the peer went away also closes with 4429, but is not counted |
 | `MetricListenReconnect` (`listen_reconnects`) | counter | 1 per failed `LISTEN` attempt: each drop, and each failed reconnect during an outage (retried with backoff up to 10 s) |
 | `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` set, reported once the tick's snapshot commits |
+| `MetricStale` (`stale_seconds`) | duration | per observer result delivered after a change, with `Pub` set: from the tick that drained the first notification the observer's old result did not reflect, until its new result was enqueued to its subscribers (or held for a [coalescing](#slow-clients) connection). A run only to snapshot a new subscription, or a Match candidate the change cannot affect, reports nothing |
 
 Gauges are the current value, so map them to a gauge and set it; a counter is reported as `1` per occurrence; a duration is one observation, for a histogram. A tick happens only when there is work (a change, a request, a timer), so an idle server reports no gauges until something happens.
 
