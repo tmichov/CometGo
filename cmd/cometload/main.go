@@ -249,8 +249,11 @@ func (s *callStats) result(p pending, m inMsg, took time.Duration) {
 	}
 }
 
-// call sends a call without waiting for its result.
-func (c *client) call(ctx context.Context, method string, args any) error {
+// call sends a call without waiting for its result. The write gets its own
+// timeout rather than the load's context: coder/websocket closes the socket
+// when a write's context is cancelled, which would turn the end of the load
+// into dropped clients and lost calls.
+func (c *client) call(method string, args any) error {
 	c.stats.mu.Lock()
 	measured := c.stats.measuring
 	if measured {
@@ -262,7 +265,21 @@ func (c *client) call(ctx context.Context, method string, args any) error {
 	id := c.nextID
 	c.pending[id] = pending{method: method, start: time.Now(), measured: measured}
 	c.mu.Unlock()
-	return c.send(ctx, map[string]any{"t": "call", "id": id, "m": method, "args": args})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := c.send(ctx, map[string]any{"t": "call", "id": id, "m": method, "args": args})
+	if err != nil {
+		// Never sent, so it must not count as sent or wait for a res.
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		if measured {
+			c.stats.mu.Lock()
+			c.stats.sent--
+			c.stats.mu.Unlock()
+		}
+	}
+	return err
 }
 
 func (c *client) inflight() int {
@@ -493,13 +510,13 @@ func callLoad(ctx context.Context, clients []*client, p params, skipped *atomic.
 		var err error
 		switch r := rand.IntN(10); {
 		case r < 3:
-			err = c.call(ctx, "shared.bump", idArgs{ID: int64(rand.IntN(p.groups*p.rows) + 1)})
+			err = c.call("shared.bump", idArgs{ID: int64(rand.IntN(p.groups*p.rows) + 1)})
 		case r < 6 && p.userSubs() > 0:
-			err = c.call(ctx, "user.bump", bucketArgs{B: rand.IntN(p.userSubs())})
+			err = c.call("user.bump", bucketArgs{B: rand.IntN(p.userSubs())})
 		case r < 8 && p.userSubs() > 0:
-			err = c.call(ctx, "user.add", bucketArgs{B: rand.IntN(p.userSubs())})
+			err = c.call("user.add", bucketArgs{B: rand.IntN(p.userSubs())})
 		default:
-			err = c.call(ctx, "ping", struct{}{})
+			err = c.call("ping", struct{}{})
 		}
 		if err != nil {
 			skipped.Add(1)
@@ -532,7 +549,7 @@ func slowFnLoad(ctx context.Context, c *client, s *slowFnStats) {
 	for ctx.Err() == nil && !c.closed.Load() {
 		c.stats.begin()
 		start := time.Now()
-		if err := c.call(ctx, "slow.fn", struct{}{}); err != nil {
+		if err := c.call("slow.fn", struct{}{}); err != nil {
 			return
 		}
 		for c.inflight() > 0 && ctx.Err() == nil && !c.closed.Load() {
