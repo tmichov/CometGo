@@ -51,6 +51,9 @@ type params struct {
 	pgContainer  string
 }
 
+// maxRate caps -writes and -calls; far above what one harness can drive anyway.
+const maxRate = 100000
+
 // sharedSubs is how many of each client's subs are shared publications; the
 // rest are per-user.
 func (p params) sharedSubs() int { return int(float64(p.subs)*p.sharedRatio + 0.5) }
@@ -90,6 +93,14 @@ func main() {
 	}
 	if p.subs < 1 || p.clients < 1 || p.users < 1 || p.groups < 1 || p.rows < 1 {
 		log.Fatal("-clients, -subs, -users, -groups and -rows must be at least 1")
+	}
+	// Written as a negated range so NaN fails it too.
+	if !(p.sharedRatio >= 0 && p.sharedRatio <= 1) {
+		log.Fatalf("-shared must be between 0 and 1, got %v", p.sharedRatio)
+	}
+	// Above 1e9 a second divided by the rate is zero and NewTicker panics.
+	if p.writes > maxRate || p.calls > maxRate {
+		log.Fatalf("-writes and -calls must be at most %d per second", maxRate)
 	}
 	rep, err := drive(ctx, p)
 	if err != nil {
