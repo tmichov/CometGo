@@ -36,7 +36,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 
 | Field | Default | Meaning |
 |---|---|---|
-| `DB *pgxpool.Pool` | required | Pool used for publication queries, method transactions and the `LISTEN` connection. Needs `MaxConns` of at least 2 (`pool_max_conns`): a tick holds one connection while it looks up column types on another. |
+| `DB *pgxpool.Pool` | required | Pool used for publication queries and method transactions. The `LISTEN` connection is opened separately with the pool's connection config, so it is not one of the pool's connections and does not count against `MaxConns`. Needs `MaxConns` of at least 2 (`pool_max_conns`): a tick holds one connection while it looks up column types on another. |
 | `Authenticate` | nil | Validates bearer tokens. See [Authentication](#authentication). If nil, every token is rejected with `UNAUTHENTICATED`. |
 | `AuthenticateRequest` | nil | Resolves a cookie-session identity at WebSocket upgrade. See [Authentication](#authentication). |
 | `Build string` | `""` | Identifies the current client build. Sent to clients in `welcome`, where the client exposes it as `comet.serverBuild`. The server does not compare it with anything. |
