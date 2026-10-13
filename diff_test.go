@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -252,5 +253,34 @@ func TestWriteDiffVectors(t *testing.T) {
 	}
 	if err := os.WriteFile("client/test/diff_vectors.json", b, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// BenchmarkDiffReorder diffs 10,000 rows where 45% swap places among
+// themselves: just under the reset threshold, so every move is diffed.
+func BenchmarkDiffReorder(b *testing.B) {
+	keys := make([]string, 10000)
+	for i := range keys {
+		keys[i] = strconv.Itoa(i)
+	}
+	old := mkResult(keys, func(k string) string { return "v" })
+	newKeys := slices.Clone(keys)
+	var at []int
+	for i := range newKeys {
+		if i%20 < 9 {
+			at = append(at, i)
+		}
+	}
+	rng := rand.New(rand.NewPCG(1, 1))
+	perm := rng.Perm(len(at))
+	for i, p := range perm {
+		newKeys[at[i]] = keys[at[p]]
+	}
+	new := mkResult(newKeys, func(k string) string { return "v" })
+	if ops, reset := diffResults(old, new, true); reset || len(ops) < 4000 {
+		b.Fatalf("reset %v, %d ops", reset, len(ops))
+	}
+	for b.Loop() {
+		diffResults(old, new, true)
 	}
 }

@@ -3,7 +3,6 @@ package cometgo
 import (
 	"bytes"
 	"encoding/json"
-	"slices"
 	"strconv"
 )
 
@@ -84,8 +83,8 @@ func snapshotOps(r *result, ordered bool) []op {
 }
 
 // resetMoves is the fewest moved rows for which diffResults resets instead
-// of diffing, when they are also most of the surviving rows. Below it moves
-// are cheap, and smaller on the wire than a snapshot.
+// of diffing, when they are also most of the surviving rows. Below it the
+// moves are few, and cheaper to send than a snapshot.
 const resetMoves = 64
 
 // diffResults returns ops that transform old into new.
@@ -99,9 +98,15 @@ const resetMoves = 64
 // placed row stays adjacent to its predecessor because later placements only
 // ever go after their own predecessor, so the sequence ends exactly at new.
 //
-// Each move costs O(len(old)) here and in the client, so when most rows move
-// (see resetMoves) diffResults returns reset instead of ops: the caller
-// sends a fresh snapshot, which is linear to build and apply.
+// That also fixes every row's place among the others in advance: the rows
+// placed between stable row s and the next stable row form one run directly
+// after s, ahead of any not-yet-moved row that sat after s. So each row gets
+// a fixed slot, and a row's current index is a count of occupied slots
+// before it (a Fenwick tree), O(log n) per placement.
+//
+// When most rows move (see resetMoves) diffResults returns reset instead of
+// ops: the caller sends a fresh snapshot, which is linear to build and
+// apply.
 func diffResults(old, new *result, ordered bool) (ops []op, reset bool) {
 	cur := make([]string, 0, len(old.keys))
 	for _, k := range old.keys {
@@ -136,27 +141,61 @@ func diffResults(old, new *result, ordered bool) (ops []op, reset bool) {
 	if moved := len(cur) - len(keep); moved >= resetMoves && moved > len(cur)/2 {
 		return nil, true
 	}
-	stable := make(map[string]bool, len(cur))
+	curIdx := make(map[string]int, len(cur))
+	for i, k := range cur {
+		curIdx[k] = i
+	}
+	stable := make([]bool, len(cur))
 	for _, i := range keep {
-		stable[cur[i]] = true
+		stable[i] = true
+	}
+	stableAt := func(k string) (int, bool) {
+		i, ok := curIdx[k]
+		return i, ok && stable[i]
 	}
 
+	// Slots, in cur order: the run placed before the first stable row, then
+	// each old row (stable or moved) followed by the run placed after it if
+	// it is stable. run[i+1] is the length of the run after cur[i].
+	run := make([]int, len(cur)+1)
+	anchor := -1
+	for _, k := range new.keys {
+		if i, ok := stableAt(k); ok {
+			anchor = i
+		} else {
+			run[anchor+1]++
+		}
+	}
+	oldSlot := make([]int, len(cur))
+	n := run[0]
+	for i := range cur {
+		oldSlot[i] = n
+		n += 1 + run[i+1]
+	}
+	occupied := newFenwick(n)
+	for i := range cur {
+		occupied.add(oldSlot[i], 1)
+	}
+
+	slot := -1 // slot of new.keys[j-1]
 	for j, k := range new.keys {
 		oldRow, existed := old.rows[k]
-		if existed && stable[k] {
+		if i, ok := stableAt(k); ok {
+			slot = oldSlot[i]
 			if p := patchOf(k, oldRow, new.rows[k]); p != nil {
 				ops = append(ops, *p)
 			}
 			continue
 		}
 		if existed {
-			cur = slices.Delete(cur, slices.Index(cur, k), slices.Index(cur, k)+1)
+			occupied.add(oldSlot[curIdx[k]], -1)
 		}
 		at := 0
 		if j > 0 {
-			at = slices.Index(cur, new.keys[j-1]) + 1
+			at = occupied.prefix(slot) // index of the predecessor, plus one
 		}
-		cur = slices.Insert(cur, at, k)
+		slot++ // the run after the predecessor
+		occupied.add(slot, 1)
 		switch {
 		case !existed:
 			ops = append(ops, op{kind: opInsert, key: k, row: new.rows[k], idx: at, hasIdx: true})
@@ -220,4 +259,24 @@ func lis(s []int) []int {
 		out[i] = k
 	}
 	return out
+}
+
+// fenwick counts occupied slots: add marks or clears one, prefix counts those
+// at or before a slot. Both are O(log n).
+type fenwick []int
+
+func newFenwick(n int) fenwick { return make(fenwick, n+1) }
+
+func (f fenwick) add(i, d int) {
+	for i++; i < len(f); i += i & -i {
+		f[i] += d
+	}
+}
+
+func (f fenwick) prefix(i int) int {
+	s := 0
+	for i++; i > 0; i -= i & -i {
+		s += f[i]
+	}
+	return s
 }

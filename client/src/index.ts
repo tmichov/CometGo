@@ -728,7 +728,7 @@ export class Subscription<T> {
     // in at ready, so stale rows stay visible meanwhile (§4.4).
     if (e.reset || (e.init && this.#set.keys.length > 0)) this.#pending = new RowSet<T>();
     const target = this.#pending ?? this.#set;
-    for (const op of e.ops ?? []) target.apply(op);
+    if (e.ops) target.applyAll(e.ops);
     if (e.ready) {
       if (this.#pending) {
         this.#set.adopt(this.#pending);
