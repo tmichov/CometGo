@@ -302,9 +302,6 @@ func TestAuthResWaitsForDeferredReset(t *testing.T) {
 	d.set("items.mine", true)
 
 	a.send(map[string]any{"t": "auth", "id": 2, "token": "bob"})
-	// Each auth is handled on its own goroutine; let the first one queue its
-	// rebind before the second starts.
-	time.Sleep(100 * time.Millisecond)
 	a.send(map[string]any{"t": "auth", "id": 3, "token": "alice"})
 	as.none(300 * time.Millisecond)
 	d.set("items.mine", false)
