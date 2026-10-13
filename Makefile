@@ -1,4 +1,4 @@
-.PHONY: db todo test chaos build gen gen-check
+.PHONY: db todo test chaos build gen gen-check bench
 
 db:
 	docker compose up -d
@@ -26,3 +26,9 @@ test:
 # Fault-injection tests, as CI runs them (needs the db and COMETGO_TEST_DATABASE_URL).
 chaos:
 	COMETGO_TEST_PG_RESTART="docker compose restart postgres" go test -race -count=3 -run TestChaos .
+
+# Load harness (needs the db): runs the base and slow scenarios and writes
+# their reports to docs/bench/. See docs/bench/README.md.
+bench:
+	go run ./cmd/cometload -out docs/bench/base.md
+	go run ./cmd/cometload -scenario slow -out docs/bench/slow.md
