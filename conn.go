@@ -41,6 +41,10 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
 		return
 	}
+	if !a.serving.Load() {
+		http.Error(w, "not started", http.StatusServiceUnavailable)
+		return
+	}
 	if !offersSubprotocol(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUpgradeRequired)

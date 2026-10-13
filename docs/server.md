@@ -24,7 +24,7 @@ Register every publication and method before `Start` and before serving requests
 | Identifier | Description |
 |---|---|
 | `New(cfg Config) *App` | Creates an app and applies defaults to `cfg`. Panics if `cfg.DB` is nil or its `MaxConns` is below 2. |
-| `(*App) Start(ctx) error` | Checks every publication's `Tables` (see [Table checks at Start](#table-checks-at-start)), then starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. If the check fails, it returns the error and starts nothing, and `Start` may be called again. Panics if called again after succeeding. |
+| `(*App) Start(ctx) error` | Checks every publication's `Tables` (see [Table checks at Start](#table-checks-at-start)), then starts the Postgres listener, the tick engine and the [idempotency-key](#idempotency-keys) cleanup in background goroutines; they run until `ctx` is done or `Shutdown` stops them. If the check fails, it returns the error and starts nothing, and `Start` may be called again. Panics if called again after succeeding. Until `Start` succeeds, the app's `ServeHTTP` answers every request with 503 (`not started`); clients retry with backoff. |
 | `(*App) Shutdown(ctx) error` | Stops the server gracefully: see [Graceful shutdown](#graceful-shutdown). |
 | `(*App) Revalidate(ctx, userID)` | Re-checks a user's live subscriptions, on every node, after a permission change: see [Revoking access](#revoking-access-revalidate). |
 | `(*App) ServeHTTP(w, r)` | `App` is an `http.Handler`. It upgrades the request to a CometGo WebSocket. Mount it at `/_comet`, the client's default URL. |
