@@ -484,3 +484,28 @@ test("a string token source is not refreshed", async () => {
     mock.timers.reset();
   }
 });
+
+
+test("close() rejects a call queued while disconnected with CANCELED", async () => {
+  const ws = FakeWS.last;
+  ws.drop();
+  const p = comet.call("m");
+  comet.close();
+  await assert.rejects(p, (e: unknown) => e instanceof CometError && e.code === "CANCELED");
+});
+
+test("a call after close() rejects at once and is never sent", async () => {
+  const ws = FakeWS.last;
+  comet.close();
+  await assert.rejects(comet.call("m"), (e: unknown) => e instanceof CometError && e.code === "CANCELED");
+  assert.equal(ws.of("call").length, 0);
+});
+
+test("close() during a goaway rejects the held-back call with CANCELED", async () => {
+  const ws = FakeWS.last;
+  ws.recv({ t: "goaway", retryInMs: 1000 });
+  const p = comet.call("m");
+  assert.equal(ws.of("call").length, 0);
+  comet.close();
+  await assert.rejects(p, (e: unknown) => e instanceof CometError && e.code === "CANCELED");
+});

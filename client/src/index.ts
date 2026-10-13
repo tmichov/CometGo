@@ -242,7 +242,7 @@ export class Comet {
   callWithStatus<R = unknown>(m: string, args?: unknown, opts: CallOptions = {}): Promise<{ value: R; lag: boolean }> {
     return new Promise((resolve, reject) => {
       const { signal } = opts;
-      if (signal?.aborted) {
+      if (signal?.aborted || this.#closed) {
         reject(canceled());
         return;
       }
@@ -303,6 +303,9 @@ export class Comet {
     clearInterval(this.#hbTimer);
     this.#ws?.close(1000);
     this.#rejectSent(); // calls kept for a resume that will not happen
+    // The rest were never sent, so never ran.
+    for (const c of this.#calls.values()) c.reject(canceled());
+    this.#calls.clear();
   }
 
   // ---- internals used by Subscription ----
