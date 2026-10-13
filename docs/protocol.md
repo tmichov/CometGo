@@ -232,7 +232,7 @@ Ephemeral server→client messages for things that do not belong in a table: pro
 3. **Monotonic per sub.** A sub never moves to an older snapshot.
 4. **Read-your-writes,** per §6.2.
 
-Consistency across subs holds within a `tx`. **[later]** With slow-observer detachment (§8.4), two subs on one connection may sit at different snapshots between `tx` messages: a sub whose observer is detached or deferred by the tick budget keeps its older result while its siblings move on. Guarantees 1–3 still hold: a detached observer's result goes out in its own `tx`, from its own single snapshot, and never older than what the sub already has. Two subs a UI reads together (a list and its count) can disagree until the slower one catches up, up to the hard query timeout. For an observer that is always slower than the soft deadline, that is the normal state, not a rare one.
+Consistency across subs holds within a `tx`. With the tick budget (§8.4), two subs on one connection may sit at different snapshots between `tx` messages: a sub whose observer the budget deferred keeps its older result while its siblings move on, until a later tick runs it. **[later]** Slow-observer detachment (§8.4) does the same for a sub whose observer is detached. Guarantees 1–3 still hold: every `tx` comes from one snapshot (a detached observer's result goes out in its own `tx`, from its own single snapshot), and a sub never moves to an older one. Two subs a UI reads together (a list and its count) can disagree until the slower one catches up, up to the hard query timeout. For an observer that is always slower than the soft deadline, that is the normal state, not a rare one.
 
 Guarantees hold per server node. In a multi-node deployment, each connection is served entirely by one node.
 
@@ -380,16 +380,17 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 | Open connections, total and per client IP | no limit | The upgrade is refused with HTTP 503 before any `welcome`; the client treats it as a failed connect and retries with backoff. Not advertised. |
 | **[later]** per-method rate limits | | Token bucket. |
 
-### 8.4 [later] Slow observers
+### 8.4 Slow observers
 
-A query that exceeds a soft deadline (default 1 s) is **detached**, not cancelled:
+**Tick budget.** A tick stops starting observer queries once twice a soft deadline (default 1 s, a server setting, not advertised) has passed since its snapshot began. Observers it did not start stay dirty and go first in the next tick, ordered by how long they have been dirty, so many medium-slow queries cannot hold a tick open and none of them starves under constant writes. Their subs keep their last result until then. A fence or identity change on a connection with such a sub waits for it (§6.2, §3.2); other connections proceed. A query that has started still runs to completion, so one query slower than the budget still holds its tick.
+
+**[later]** A query that exceeds the soft deadline is **detached**, not cancelled:
 
 - It finishes on the tick's snapshot, on its own database connection. The tick exports its snapshot, and the rest of the tick continues on a new connection that imports it, so every result produced by the tick, the detached one included, comes from that one snapshot.
 - Its result goes out later, in its own `tx`, to the subs that were bound to it before it was detached. Subs that bind while it is in flight wait for its next run, which starts on a snapshot taken after they bound, so a sub's first snapshot is never older than a write the client had already been told about (§6.2).
 - It is not re-run while it is in flight. Notifications that arrive meanwhile keep it dirty, and it runs again once it finishes.
 - Ticks proceed without it. Fences and identity changes on connections not subscribed to it proceed too (§6.2, §3.2).
 - An observer that was detached once starts on the tick only when a detach slot is free, so a known slow query never blocks a tick while the slots are full. A server holds a bounded number of detached queries at once; at the limit, a newly slow query blocks its tick as in v1-core.
-- **Tick budget.** A tick stops starting observer queries after twice the soft deadline. Observers it did not start stay dirty and go first in the next tick, ordered by how long they have been dirty. So many medium-slow queries cannot hold a tick open either.
 
 The soft deadline, the detach limit and the tick budget are server settings, not advertised.
 
