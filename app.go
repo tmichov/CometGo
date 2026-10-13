@@ -218,6 +218,11 @@ type App struct {
 	startMu  sync.Mutex         // guards started and stop
 	stop     context.CancelFunc // stops what Start runs
 	running  sync.WaitGroup
+
+	// serving is set once Start has started the engine. Until then
+	// ServeHTTP refuses connections, so no connection reads pubs or methods
+	// while they may still be registered.
+	serving atomic.Bool
 }
 
 // New creates an App. Register publications and methods, then call Start.
@@ -305,6 +310,7 @@ func (a *App) Start(ctx context.Context) error {
 		return err
 	}
 	a.started = true
+	a.serving.Store(true)
 	ctx, a.stop = context.WithCancel(ctx)
 	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
 		a.running.Add(1)
