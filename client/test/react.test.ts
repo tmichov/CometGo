@@ -242,6 +242,39 @@ test("a sub the server ended is requested again by a newly mounted component", (
   assert.equal(ws.of("sub").length, 2, "the new component re-subscribes");
 });
 
+test("a mounted component whose sub ended re-subscribes after a login, without remounting", async () => {
+  render(h(List, { name: "todos.mine" }));
+  server({ t: "tx", seq: 1, subs: [snapshot(1, [["1", "a"]])] });
+  server({ t: "authRes", seq: 2, ok: true, user: { id: "alice" } });
+  // Expiry: the server ends the protected sub, then downgrades the user.
+  server({ t: "tx", seq: 3, subs: [{ s: 1, end: { code: "FORBIDDEN" } }] });
+  server({ t: "authRes", seq: 4, ok: false, err: { code: "AUTH_EXPIRED" } });
+  await tick();
+  assert.equal(container.querySelector("ul")!.dataset.status, "ended");
+  assert.equal(ws.of("sub").length, 1, "a logout does not re-subscribe");
+
+  const login = comet.setToken("B");
+  await tick();
+  server({ t: "authRes", seq: 5, id: ws.of("auth")[0].id, ok: true, user: { id: "alice" } });
+  await act(() => login);
+  await tick();
+  assert.deepEqual(ws.of("sub").at(-1), { t: "sub", s: 2, name: "todos.mine", args: null });
+  server({ t: "tx", seq: 6, subs: [snapshot(2, [["1", "a"], ["2", "b"]])] });
+  assert.equal(container.querySelector("ul")!.dataset.status, "ready");
+  assert.deepEqual(text(), ["a", "b"]);
+});
+
+test("a live sub is not re-subscribed when the same user refreshes the token", async () => {
+  render(h(List, { name: "todos.mine" }));
+  server({ t: "authRes", seq: 1, ok: true, user: { id: "alice" } });
+  server({ t: "tx", seq: 2, subs: [snapshot(1, [["1", "a"]])] });
+  server({ t: "authRes", seq: 3, ok: true, user: { id: "alice" }, authExp: 2_000_000_000 });
+  server({ t: "authRes", seq: 4, ok: true, user: { id: "bob" } }); // a different user, sub still live
+  await tick();
+  assert.equal(ws.of("sub").length, 1);
+  assert.deepEqual(text(), ["a"]);
+});
+
 test("hooks outside a provider throw", () => {
   const orig = console.error;
   console.error = () => {}; // React logs the uncaught render error

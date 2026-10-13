@@ -83,7 +83,7 @@ Subscribes to a publication while the component is mounted and re-renders when i
 - **Changing args keeps the old rows.** When `args` change, the hook subscribes to the new args but keeps returning the old rows until the new subscription is ready or ends, then switches in one render and stops the old one. Paging through results does not blank the list in between. While it waits, `status` is the old subscription's (normally `"ready"`), and there is no separate flag saying the rows belong to the previous args.
 - **StrictMode-safe.** Stopping is deferred by one macrotask, so React's development double-mount (and any unmount followed by a remount of the same subscription) reuses the subscription instead of sending `unsub` and `sub` again.
 
-A subscription the server ended (for example with `FORBIDDEN`) stays ended for the components already showing it. A component that mounts afterwards, or one whose args change to it, subscribes again, so after logging in, remounting the page is enough to retry.
+A subscription the server ended (for example with `FORBIDDEN` after a logout or an expired token) stays ended until the user changes. When `comet.user` later becomes a different, non-null user (a `setToken` that logs in), every mounted component showing an ended subscription subscribes again, without remounting. It keeps showing the ended state until the new subscription is ready. A logout, or a token refresh for the same user, does not resubscribe. A component that mounts afterwards, or one whose args change to it, also subscribes again.
 
 If a component is hidden by `<Activity>` or its provider gets a different `client`, its subscription is released. When it shows again it starts from `"loading"` rather than showing the stopped subscription's rows.
 
