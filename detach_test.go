@@ -270,3 +270,36 @@ func TestMaxDetachedOffBlocksTick(t *testing.T) {
 		t.Fatal("a got no update")
 	}
 }
+
+// A sub rebound by an identity change while its shared observer is in
+// flight is a joiner: its reset comes from the next run, which holds a
+// write committed before the rebind, never from the detached result.
+func TestDetachRebindIsJoiner(t *testing.T) {
+	e := setupFull(t, fastDetach, slowQ)
+	e.waitListening(t)
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	subSlowQ(t, a, 1, 1500, 0)
+	// b keeps the observer alive across a's rebind, so a rebinds to it.
+	b, _ := e.dial(t, nil)
+	subSlowQ(t, b, 1, 1500, 0)
+	insertName(t, e, "w1")
+	time.Sleep(600 * time.Millisecond) // w1's run is detached by now
+	insertName(t, e, "w2")
+	a.send(map[string]any{"t": "auth", "id": 2, "token": "bob"})
+	for {
+		m := nextWithin(t, a, 10*time.Second)
+		if m["t"] == "authRes" {
+			t.Fatal("authRes before the rebound sub's reset")
+		}
+		en := entries(m)
+		if en[0]["reset"] == true {
+			if names := rowNames(m, 1); len(names) != 2 {
+				t.Fatalf("rebound sub's reset should hold w1 and w2: %v", names)
+			}
+			break
+		}
+	}
+	if m := nextWithin(t, a, 10*time.Second); m["t"] != "authRes" {
+		t.Fatalf("expected authRes, got %v", m)
+	}
+}

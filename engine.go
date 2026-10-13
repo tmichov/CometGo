@@ -83,6 +83,7 @@ type engine struct {
 	retryBackoff time.Duration
 	// detachedN counts detached runs not yet applied (Config.MaxDetached).
 	detachedN int
+	bindSeq   uint64
 	// typesMu guards pgTypes: detached queries read and fill it too.
 	typesMu sync.Mutex
 	// deferObs, set by tests, keeps the observers it returns true for out
@@ -163,6 +164,9 @@ type subscription struct {
 	argsKey string
 	obs     *observer
 	userID  string // the UserID it was last bound for
+	// bindSeq numbers each bind (engine.bindSeq), so a detached result can
+	// tell a sub bound before it from one rebound since (applyDetached).
+	bindSeq uint64
 	// needInit: send init + full snapshot next tick. holds: the client
 	// already has data for the sub (an earlier snapshot, or have on sub), so
 	// that snapshot goes out as a reset.
@@ -915,7 +919,8 @@ func (e *engine) bind(ctx context.Context, sub *subscription, ident *Identity) *
 		e.observers[key] = obs
 	}
 	obs.subs[sub] = struct{}{}
-	sub.obs, sub.userID = obs, ident.userID()
+	e.bindSeq++
+	sub.obs, sub.userID, sub.bindSeq = obs, ident.userID(), e.bindSeq
 	return nil
 }
 
@@ -1217,8 +1222,8 @@ func (e *engine) openLane(ctx context.Context, snap string) (l *lane, err error)
 type detachedDone struct {
 	obs  *observer
 	out  queryOut
-	subs []*subscription // bound when it detached
-	tick uint64          // the tick whose snapshot it ran on
+	subs map[*subscription]uint64 // bound when it detached, with their bindSeq
+	tick uint64                   // the tick whose snapshot it ran on
 }
 
 // detachRun hands obs's running query, and l whose transaction it runs in,
@@ -1227,9 +1232,9 @@ type detachedDone struct {
 func (e *engine) detachRun(obs *observer, l *lane, done <-chan queryOut) {
 	e.detachedN++
 	obs.inFlight, obs.knownSlow, obs.dirty = true, true, false
-	d := detachedDone{obs: obs, tick: e.tickN}
+	d := detachedDone{obs: obs, tick: e.tickN, subs: map[*subscription]uint64{}}
 	for sub := range obs.subs {
-		d.subs = append(d.subs, sub)
+		d.subs[sub] = sub.bindSeq
 	}
 	go func() {
 		d.out = <-done
@@ -1267,8 +1272,10 @@ func (e *engine) applyDetached(d detachedDone) {
 	obs.staleFrom, obs.dirtySince, obs.dueFrom = obs.dirtySince, 0, 0
 	obs.resTick = d.tick // not this tick's: assembly sends nothing for it
 	subs := map[*subscription]struct{}{}
-	for _, sub := range d.subs {
-		if sub.obs == obs && e.conns[sub.c][sub.s] == sub {
+	for sub, seq := range d.subs {
+		// Rebound since (an identity change), even to this observer, it is
+		// a joiner: it waits for the next run.
+		if sub.obs == obs && sub.bindSeq == seq && e.conns[sub.c][sub.s] == sub {
 			subs[sub] = struct{}{}
 		}
 	}
