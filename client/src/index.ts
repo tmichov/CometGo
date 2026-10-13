@@ -330,7 +330,13 @@ export class Comet {
     try {
       cred.token = await resolveToken(cred.source);
     } catch (e) {
-      console.warn("cometgo: token source failed", e);
+      // Connecting anonymously would end a resumable session and look like a
+      // logout (§7.2), so retry with backoff instead.
+      console.warn("cometgo: token source failed; retrying", e);
+      if (this.#closed || this.#ws) return;
+      this.#setStatus("disconnected");
+      this.#scheduleReconnect();
+      return;
     }
     // While the token resolved, close() may have run, or #reconnectNow may
     // have started another #open that already has its socket.
@@ -436,10 +442,15 @@ export class Comet {
     this.#setStatus("disconnected");
     if (code >= 4400 && code < 4500 && reason) console.warn("cometgo: closed", code, reason);
     if (this.#closed) return;
-    // After a goaway, the server's delay spreads reconnects out; otherwise
-    // exponential backoff with full jitter.
+    this.#scheduleReconnect();
+  }
+
+  // After a goaway, the server's delay spreads reconnects out; otherwise
+  // exponential backoff with full jitter.
+  #scheduleReconnect(): void {
     const delay = this.#goaway ?? Math.random() * Math.min(30_000, 500 * 2 ** this.#attempt++);
     this.#goaway = undefined;
+    clearTimeout(this.#reconnectTimer); // two #opens can fail at once (#reconnectNow)
     this.#reconnectTimer = setTimeout(() => void this.#open(), delay);
   }
 

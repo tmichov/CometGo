@@ -40,7 +40,7 @@ Creates a `Comet` and starts connecting immediately. With a schema generated fro
 type TokenSource = string | null | (() => string | null | Promise<string | null>);
 ```
 
-A function token source is called on every (re)connect, so it can return a freshly refreshed token. It is also called before the identity expires, to refresh it (see [Auth](#auth)). If it throws, the client logs a warning and connects anonymously.
+A function token source is called on every (re)connect, so it can return a freshly refreshed token. It is also called before the identity expires, to refresh it (see [Auth](#auth)). If it throws, the client logs a warning and does not connect: it tries again (calling the function again) with the usual reconnect backoff, and `status` stays `"disconnected"` meanwhile. Connecting anonymously instead would end a resumable session and look like a logout. So throw only for failures worth retrying (a network error reaching your auth service), and return `null` when there is no token and the client should connect anonymously.
 
 `SUBPROTOCOL` is the WebSocket subprotocol the client offers, `"cometgo.1.json"`.
 
