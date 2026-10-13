@@ -3,6 +3,7 @@ package cometgo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -22,6 +23,11 @@ import (
 // catalog on its own connection rather than in the tick's snapshot, so a
 // type created since that snapshot began is still found. A type the
 // catalog does not return is not cached and is looked up again next time.
+//
+// The callers already hold a connection, so with the pool exhausted (two
+// overlapping callers on a two-connection pool, or user code holding the
+// rest) the Acquire would wait on the others forever: it is bounded by
+// Config.QueryTimeout. Every failure wraps errTypeLookup.
 func (e *engine) resolveTypes(ctx context.Context, m *pgtype.Map, fds []pgconn.FieldDescription) error {
 	var oids []uint32
 	for _, fd := range fds {
@@ -35,11 +41,24 @@ func (e *engine) resolveTypes(ctx context.Context, m *pgtype.Map, fds []pgconn.F
 	if len(oids) == 0 {
 		return nil
 	}
+	if err := e.lookupTypes(ctx, oids); err != nil {
+		return fmt.Errorf("%w: %w", errTypeLookup, err)
+	}
+	return nil
+}
+
+// errTypeLookup marks a failed catalog lookup in resolveTypes: a problem
+// with the pool or the catalog, not with the query being described.
+var errTypeLookup = errors.New("look up column types")
+
+func (e *engine) lookupTypes(ctx context.Context, oids []uint32) error {
+	ctx, cancel := context.WithTimeout(ctx, e.a.cfg.QueryTimeout)
+	defer cancel()
 	// Acquired explicitly: pgxpool's Query leaks its connection when a
 	// tracer panics, and the callers recover such panics.
 	pc, err := e.a.db.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("look up column types: %w", err)
+		return err
 	}
 	defer pc.Release()
 	rows, err := pc.Query(ctx, `
@@ -49,7 +68,7 @@ func (e *engine) resolveTypes(ctx context.Context, m *pgtype.Map, fds []pgconn.F
 		LEFT JOIN pg_type base ON base.oid = el.typbasetype AND el.typtype = 'd'
 		WHERE t.oid = ANY($1)`, oids)
 	if err != nil {
-		return fmt.Errorf("look up column types: %w", err)
+		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
