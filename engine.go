@@ -557,12 +557,14 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	// full. An observer in flight is never in the run list: it runs again
 	// once it completes. runObservers starts them oldest first, within the
 	// tick budget.
-	var toRun []*observer
-	for _, obs := range e.observers {
-		if resetFor[obs] && !obs.dirty && slices.Contains(cands, obs) {
-			cands = slices.DeleteFunc(cands, func(o *observer) bool { return o == obs })
+	cands = slices.DeleteFunc(cands, func(obs *observer) bool {
+		if resetFor[obs] {
 			obs.markDirty(drained)
 		}
+		return resetFor[obs]
+	})
+	var toRun []*observer
+	for _, obs := range e.observers {
 		if (obs.dirty || obs.res == nil || obs.awaitsInit() || resetFor[obs]) && !obs.inFlight && !isDeferred(obs) {
 			if obs.staleFrom == 0 && obs.dueFrom == 0 {
 				obs.dueFrom = cutoff + 1
