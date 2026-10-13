@@ -40,7 +40,7 @@ Creates a `Comet` and starts connecting immediately. With a schema generated fro
 type TokenSource = string | null | (() => string | null | Promise<string | null>);
 ```
 
-A function token source is called on every (re)connect, so it can return a freshly refreshed token. If it throws, the client logs a warning and connects anonymously.
+A function token source is called on every (re)connect, so it can return a freshly refreshed token. It is also called before the identity expires, to refresh it (see [Auth](#auth)). If it throws, the client logs a warning and connects anonymously.
 
 `SUBPROTOCOL` is the WebSocket subprotocol the client offers, `"cometgo.1.json"`.
 
@@ -138,13 +138,13 @@ await comet.setToken(accessToken); // log in, or refresh; resolves with comet.us
 await comet.setToken(null);        // log out
 ```
 
-`setToken` resolves with the new `comet.user`, or rejects with a `CometError` such as `UNAUTHENTICATED`. A rejected token changes nothing on the connection: the current user stays logged in, with the same subscriptions, until their identity expires or you call `setToken(null)`. The rejected token is not kept either: the client goes back to the token it had before, and a reconnect sends that one. A `setToken` made while an earlier one is still waiting is never undone by the earlier one's rejection. If the connection drops before the server answers, `setToken` rejects with `CONNECTION_LOST` and the new token stays stored, because the server may have accepted it. If the client is not connected, `setToken` only stores the token for the next connection and resolves with the current `user`.
+`setToken` resolves with the new `comet.user`, or rejects with a `CometError` such as `UNAUTHENTICATED`. A rejected token changes nothing on the connection: the current user stays logged in, with the same subscriptions, until their identity expires or you call `setToken(null)`. The rejected token is not kept either: the client goes back to the token it had before, and a reconnect sends that one. A `setToken` made while an earlier one is still waiting is never undone by the earlier one's rejection. If the connection drops before the server answers, `setToken` rejects with `CONNECTION_LOST` and the new token stays stored, because the server may have accepted it. If the client is not connected, `setToken` only stores the token for the next connection and resolves with the current `user`. That includes a connection that is still opening: its `hello` carries the new token, and `comet.user` changes when the server's welcome arrives (`onChange` fires).
 
 When the user changes, the server resets every subscription to the new user's data in one update; subscriptions the new user may not read end with an error.
 
 **Cookie sessions.** Omit `token`. The server reads the session cookie when the WebSocket opens (`AuthenticateRequest`). If the server refuses the session it closes the connection with 4401. The client treats that like any other drop and keeps reconnecting with backoff, and each attempt is refused again: queued calls stay pending and subscriptions stay `loading` or `resyncing`. There is no dedicated signal for it in v1-core, so if a cookie session can expire, check it over HTTP (or watch `comet.status` stay `"disconnected"`) and send the user to log in.
 
-**Expiry.** If the server's identity has an expiry and no new token arrives in time, the connection becomes anonymous: `comet.user` becomes `null`, `onChange` fires, and subscriptions are reset as for a logout. In v1-core the client does not refresh tokens on its own: call `setToken` before the token expires. Automatic refresh is *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
+**Expiry.** If the server's identity has an expiry and no new token arrives in time, the connection becomes anonymous: `comet.user` becomes `null`, `onChange` fires, and subscriptions are reset as for a logout. When `token` (from `connect` or the last `setToken`) is a function and the server reports the identity's expiry (`authExp`), the client calls it again at about 80% of the time left and sends the result as `setToken` would. A refused refresh keeps the current user and is retried at 80% of the time then left (at least 5 s apart). With a string token the client cannot get a new one, so call `setToken` yourself before it expires. The refresh stops on `close()`.
 
 ## CometError
 
