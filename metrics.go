@@ -28,6 +28,7 @@ const (
 	MetricSlowClose       = "slow_closes"        // counter: a socket closed with 4429
 	MetricListenReconnect = "listen_reconnects"  // counter: the LISTEN connection dropped
 	MetricPubRun          = "pub_run_seconds"    // duration of one observer query, with Pub
+	MetricDetached        = "detached_observers" // gauge: observer queries running detached from their tick
 )
 
 // metric reports v under name if a hook is set. A panicking hook is logged
@@ -64,4 +65,5 @@ func (e *engine) tickMetrics(start time.Time, runs int64) {
 	a.metric(MetricSubscriptions, "", float64(subs))
 	a.metric(MetricQueuedBytes, "", float64(queued))
 	a.metric(MetricCoalescing, "", float64(len(e.coalescing)))
+	a.metric(MetricDetached, "", float64(e.detachedN))
 }
