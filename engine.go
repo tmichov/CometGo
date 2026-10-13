@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The engine owns all observers and subscriptions. Only its run goroutine
@@ -79,6 +81,11 @@ type engine struct {
 	carryEvts    []heldEvt
 	carryOut     map[*conn]*connOut
 	retryBackoff time.Duration
+	// detachedN counts detached runs not yet applied (Config.MaxDetached).
+	detachedN int
+	bindSeq   uint64
+	// typesMu guards pgTypes: detached queries read and fill it too.
+	typesMu sync.Mutex
 	// fns holds the fn calls prefetchFns made for the requests being
 	// handled; nil outside the request phase.
 	fns map[fnKey]*fnCall
@@ -128,6 +135,9 @@ type observer struct {
 	// dirtyAt is when the first notification not yet reflected in res was
 	// drained, for MetricStale; zero when fresh or without Config.Metrics.
 	dirtyAt time.Time
+	// dirtySinceAt is dirtyAt for changes drained while it is in flight;
+	// it becomes dirtyAt when the detached result is applied.
+	dirtySinceAt time.Time
 
 	// staleFrom is the smallest drained notification number its delivered
 	// result does not reflect; 0 when fresh. dirtySince is the same for
@@ -142,9 +152,10 @@ type observer struct {
 	// owing a snapshot): the drain cutoff + 1 of the tick it first became
 	// due in; 0 once it runs.
 	dueFrom uint64
-	// inFlight: its query outlives the tick that started it (detach, M3).
-	// Never set yet. Such an observer is in no tick's run list.
-	inFlight bool
+	// inFlight: its query was detached and outlives the tick that started
+	// it. Such an observer is in no tick's run list. knownSlow: it has been
+	// detached before, so it starts only when a detach slot is free.
+	inFlight, knownSlow bool
 	// evts are events waiting for this observer to reflect their n.
 	evts []heldEvt
 
@@ -162,6 +173,9 @@ type subscription struct {
 	argsKey string
 	obs     *observer
 	userID  string // the UserID it was last bound for
+	// bindSeq numbers each bind (engine.bindSeq), so a detached result can
+	// tell a sub bound before it from one rebound since (applyDetached).
+	bindSeq uint64
 	// needInit: send init + full snapshot next tick. holds: the client
 	// already has data for the sub (an earlier snapshot, or have on sub), so
 	// that snapshot goes out as a reset.
@@ -499,6 +513,9 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			if obs.dirtySince == 0 || from < obs.dirtySince {
 				obs.dirtySince = from
 			}
+			if obs.dirtySinceAt.IsZero() {
+				obs.dirtySinceAt = drained
+			}
 			continue
 		}
 		obs.markStale(from)
@@ -519,7 +536,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	forced := map[*conn]bool{}
 	expected := func(c *conn) bool {
 		for _, sub := range e.conns[c] {
-			if !sub.obs.freshPast(cutoff) && isDeferred(sub.obs) {
+			if !sub.obs.freshPast(cutoff) && (sub.obs.inFlight || isDeferred(sub.obs)) {
 				return false
 			}
 		}
@@ -668,7 +685,8 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		// Every observer that ran this tick is clean now; one still dirty
 		// did not run. Errored observers were removed above.
 		for _, obs := range e.observers {
-			if !obs.dirty && !obs.dirtyAt.IsZero() {
+			// A detached observer reports when its result is applied.
+			if !obs.dirty && !obs.inFlight && !obs.dirtyAt.IsZero() {
 				e.a.metric(MetricStale, obs.pub.name, time.Since(obs.dirtyAt).Seconds())
 				obs.dirtyAt = time.Time{}
 			}
@@ -868,6 +886,9 @@ func (e *engine) handleReq(ctx context.Context, i int, r any, outFor func(*conn)
 			}
 		}
 
+	case detachedDone:
+		e.applyDetached(r)
+
 	case revalidateReq:
 		// Not a rebind: the observers stay as they are; fn only re-checks
 		// access, so its Query is discarded.
@@ -934,7 +955,8 @@ func (e *engine) bind(ctx context.Context, i int, sub *subscription, ident *Iden
 		e.observers[key] = obs
 	}
 	obs.subs[sub] = struct{}{}
-	sub.obs, sub.userID = obs, ident.userID()
+	e.bindSeq++
+	sub.obs, sub.userID, sub.bindSeq = obs, ident.userID(), e.bindSeq
 	return nil
 }
 
@@ -1120,25 +1142,22 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	// stack each time, while methods keep answering (with lag). Observers
 	// applied before the panic keep their ops for the next good tick.
 	defer recoverErr(&err)
-	// Acquired explicitly so a panic during BEGIN releases the connection
-	// (pgxpool's BeginTx would leak it).
-	pc, err := e.a.db.Acquire(ctx)
+	// cur is the lane: the connection whose transaction holds the tick's
+	// snapshot. A detach hands it to the detached run and moves the tick to
+	// a new lane on the same snapshot.
+	cur, err := e.openLane(ctx, "")
 	if err != nil {
 		return err
 	}
-	defer pc.Release()
-	tx, err := pc.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(context.Background())
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", e.a.cfg.QueryTimeout.Milliseconds())); err != nil {
-		return err
-	}
+	defer func() {
+		if cur != nil {
+			cur.close()
+		}
+	}()
 	snapStart := time.Now()
 	var affected []*observer
 	if len(cands) > 0 {
-		if affected, err = e.filterCandidates(ctx, tx, cands, changes); err != nil {
+		if affected, err = e.filterCandidates(ctx, cur.tx, cands, changes); err != nil {
 			return err
 		}
 		// Affected candidates were dirtied by this drain. A failed tick
@@ -1150,13 +1169,21 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}
 		toRun = append(toRun, affected...)
 	}
+	maxDetached := e.a.cfg.MaxDetached
+	if maxDetached > 0 {
+		// At top level, outside any savepoint, so it can be imported.
+		if err := cur.tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&cur.snap); err != nil {
+			return err
+		}
+	}
 	// Oldest first, so observers a budget left unstarted go first next
 	// tick and none starves under constant writes.
 	slices.SortStableFunc(toRun, func(a, b *observer) int { return cmp.Compare(a.age(), b.age()) })
 	budget := 2 * e.a.cfg.SlowObserverAfter
 	staged := make([]runResult, 0, len(toRun))
+	started := false
 	for i, obs := range toRun {
-		if i > 0 && time.Since(snapStart) >= budget {
+		if started && time.Since(snapStart) >= budget {
 			// The rest stay due (dirty, stale or awaiting init) and their
 			// connections' fences carry. An affected candidate becomes dirty.
 			// Nothing else may wake the engine for them, so tick again.
@@ -1166,48 +1193,75 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 			e.signal()
 			break
 		}
+		if obs.knownSlow && e.detachedN >= maxDetached {
+			// It would block the tick: wait for a slot, whose completion
+			// wakes the engine.
+			obs.dirty = true
+			continue
+		}
+		started = true
 		e.runs.Add(1)
 		// A savepoint per observer keeps one failing query from poisoning
 		// the snapshot for the rest.
-		sp, err := tx.Begin(ctx)
+		sp, err := cur.tx.Begin(ctx)
 		if err != nil {
 			return err
 		}
-		r := runResult{obs: obs}
-		var qerr error
-		var start time.Time
-		if e.a.cfg.Metrics != nil {
-			start = time.Now()
-		}
-		func() {
-			// Encoding Query.Args runs user code (driver.Valuer, pgx
-			// encoders) on the engine goroutine; a panic there fails only
-			// this observer. pgx encodes before sending, so sp is still
-			// usable for the rollback. A panic after sending (decoding
-			// rows) is caught too; rows.Close drains the result first, and
-			// if the rollback fails anyway the tick retries.
-			defer recoverErr(&qerr)
-			r.cols, r.keyIdx, r.res, qerr = e.query(ctx, sp, obs)
+		done := make(chan queryOut, 1)
+		go func() {
+			start := time.Now()
+			var o queryOut
+			func() {
+				// Encoding Query.Args runs user code (driver.Valuer, pgx
+				// encoders); a panic there fails only this observer. pgx
+				// encodes before sending, so sp is still usable for the
+				// rollback. A panic after sending (decoding rows) is caught
+				// too; rows.Close drains the result first, and if the
+				// rollback fails anyway the tick retries.
+				defer recoverErr(&o.err)
+				o.cols, o.keyIdx, o.res, o.err = e.query(ctx, sp, obs)
+			}()
+			o.took = time.Since(start)
+			done <- o
 		}()
-		if e.a.cfg.Metrics != nil {
-			r.took = time.Since(start)
+		var o queryOut
+		if maxDetached > 0 {
+			timer := time.NewTimer(e.a.cfg.SlowObserverAfter)
+			select {
+			case o = <-done:
+				timer.Stop()
+			case <-timer.C:
+				if e.detachedN < maxDetached {
+					next, err := e.openLane(ctx, cur.snap)
+					if err == nil {
+						e.detachRun(obs, cur, done)
+						cur = next
+						continue
+					}
+					e.a.log.Warn("could not detach a slow observer; the tick waits for it", "pub", obs.pub.name, "err", err)
+				}
+				o = <-done
+			}
+		} else {
+			o = <-done
 		}
-		if errors.Is(qerr, errTypeLookup) {
+		r := runResult{obs: obs, cols: o.cols, keyIdx: o.keyIdx, res: o.res, took: o.took}
+		if errors.Is(o.err, errTypeLookup) {
 			// Not this observer's fault (e.g. the pool is exhausted): retry
 			// the tick rather than end its subs.
-			return qerr
+			return o.err
 		}
-		if qerr != nil {
+		if o.err != nil {
 			if err := sp.Rollback(ctx); err != nil {
 				return err
 			}
-			r.err = e.queryError(obs, qerr)
+			r.err = e.queryError(obs, o.err)
 		} else if err := sp.Commit(ctx); err != nil {
 			return err
 		}
 		staged = append(staged, r)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := cur.tx.Commit(ctx); err != nil {
 		return err
 	}
 	// Applied only once the snapshot commits: a failed tick leaves them
@@ -1236,27 +1290,215 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 			obs.err = r.err
 			continue
 		}
-		switch {
-		case obs.res == nil:
-			// Fresh observer: subs get the snapshot via needInit.
-		case !sameCols(obs.cols, r.cols):
-			// Result shape changed (e.g. migration): reset every sub.
-			for sub := range obs.subs {
-				sub.needInit = true
-			}
-		default:
-			var reset bool
-			obs.ops, reset = diffResults(obs.res, r.res, !obs.pub.opts.Unordered)
-			if reset {
-				// Most rows moved: a snapshot is cheaper than the moves.
-				for sub := range obs.subs {
-					sub.needInit = true
-				}
-			}
-		}
-		obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
+		obs.ops = e.newResult(obs, r, obs.subs)
 	}
 	return nil
+}
+
+// newResult installs r as obs's result and returns the ops from the old one.
+// Subs in subs get needInit when the change is a reset.
+func (e *engine) newResult(obs *observer, r runResult, subs map[*subscription]struct{}) []op {
+	var ops []op
+	switch {
+	case obs.res == nil:
+		// Fresh observer: subs get the snapshot via needInit.
+	case !sameCols(obs.cols, r.cols):
+		// Result shape changed (e.g. migration): reset every sub.
+		for sub := range subs {
+			sub.needInit = true
+		}
+	default:
+		var reset bool
+		ops, reset = diffResults(obs.res, r.res, !obs.pub.opts.Unordered)
+		if reset {
+			// Most rows moved: a snapshot is cheaper than the moves.
+			for sub := range subs {
+				sub.needInit = true
+			}
+			ops = nil
+		}
+	}
+	obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
+	return ops
+}
+
+// queryOut is one observer query's outcome, from its goroutine.
+type queryOut struct {
+	cols   []colSpec
+	keyIdx []int
+	res    *result
+	err    error
+	took   time.Duration
+}
+
+// lane is a REPEATABLE READ READ ONLY transaction holding a tick's
+// snapshot. snap is its exported snapshot id, when detaching is enabled.
+type lane struct {
+	pc   *pgxpool.Conn
+	tx   pgx.Tx
+	snap string
+}
+
+func (l *lane) close() {
+	l.tx.Rollback(context.Background())
+	l.pc.Release()
+}
+
+// openLane begins a lane. With snap, it imports that snapshot and exports
+// it again, so the new id outlives the exporting transaction: in that
+// order, before its SET LOCAL.
+func (e *engine) openLane(ctx context.Context, snap string) (l *lane, err error) {
+	actx := ctx
+	if snap != "" {
+		// A detach waits for this: don't hang the tick on an exhausted
+		// pool, block on the slow query instead.
+		var cancel context.CancelFunc
+		actx, cancel = context.WithTimeout(ctx, e.a.cfg.SlowObserverAfter)
+		defer cancel()
+	}
+	// Acquired explicitly so a panic during BEGIN releases the connection
+	// (pgxpool's BeginTx would leak it).
+	pc, err := e.a.db.Acquire(actx)
+	if err != nil {
+		return nil, err
+	}
+	var tx pgx.Tx
+	defer func() {
+		if l == nil { // an error or a panic
+			if tx != nil {
+				tx.Rollback(context.Background())
+			}
+			pc.Release()
+		}
+	}()
+	if tx, err = pc.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}); err != nil {
+		return nil, err
+	}
+	next := &lane{pc: pc, tx: tx}
+	if snap != "" {
+		if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT '"+strings.ReplaceAll(snap, "'", "''")+"'"); err != nil {
+			return nil, err
+		}
+		if err := tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&next.snap); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", e.a.cfg.QueryTimeout.Milliseconds())); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+// detachedDone is a detached run's outcome, applied as a request.
+type detachedDone struct {
+	obs  *observer
+	out  queryOut
+	subs map[*subscription]uint64 // bound when it detached, with their bindSeq
+	tick uint64                   // the tick whose snapshot it ran on
+}
+
+// detachRun hands obs's running query, and l whose transaction it runs in,
+// to a goroutine. The tick's next lane has already imported l's snapshot,
+// so l may end as soon as the query does.
+func (e *engine) detachRun(obs *observer, l *lane, done <-chan queryOut) {
+	e.detachedN++
+	obs.inFlight, obs.knownSlow, obs.dirty = true, true, false
+	d := detachedDone{obs: obs, tick: e.tickN, subs: map[*subscription]uint64{}}
+	for sub := range obs.subs {
+		d.subs[sub] = sub.bindSeq
+	}
+	go func() {
+		d.out = <-done
+		func() {
+			// Pool hooks and tracers run user code here too.
+			defer func() {
+				if p := recover(); p != nil {
+					e.a.log.Error("ending a detached observer's transaction panicked", "panic", p, "stack", string(debug.Stack()))
+				}
+			}()
+			l.close()
+		}()
+		e.enqueue(d)
+	}()
+}
+
+// applyDetached applies a detached run's outcome, in its own tx per
+// connection, to the subs bound before it detached that are still bound
+// to it. Subs that joined meanwhile wait for the next run, whose snapshot
+// follows their bind.
+func (e *engine) applyDetached(d detachedDone) {
+	e.detachedN--
+	obs := d.obs
+	if e.observers[obs.key] != obs {
+		return // unsubscribed, or re-created, while in flight
+	}
+	obs.inFlight = false
+	if errors.Is(d.out.err, errTypeLookup) {
+		obs.dirty = true // not its fault: run it again
+		return
+	}
+	if e.a.cfg.Metrics != nil {
+		e.a.metric(MetricPubRun, obs.pub.name, d.out.took.Seconds())
+	}
+	staleAt := obs.dirtyAt
+	obs.dirtyAt, obs.dirtySinceAt = obs.dirtySinceAt, time.Time{}
+	obs.staleFrom, obs.dirtySince, obs.dueFrom = obs.dirtySince, 0, 0
+	obs.resTick = d.tick // not this tick's: assembly sends nothing for it
+	subs := map[*subscription]struct{}{}
+	for sub, seq := range d.subs {
+		// Rebound since (an identity change), even to this observer, it is
+		// a joiner: it waits for the next run.
+		if sub.obs == obs && sub.bindSeq == seq && e.conns[sub.c][sub.s] == sub {
+			subs[sub] = struct{}{}
+		}
+	}
+	out := map[*conn]*connOut{}
+	outFor := func(c *conn) *connOut {
+		if out[c] == nil {
+			out[c] = &connOut{}
+		}
+		return out[c]
+	}
+	if d.out.err != nil {
+		werr := e.queryError(obs, d.out.err)
+		for sub := range subs {
+			outFor(sub.c).entries = append(outFor(sub.c).entries, subEntry{S: sub.s, End: werr})
+			delete(e.conns[sub.c], sub.s)
+			e.detach(sub)
+		}
+		e.flush(out)
+		return
+	}
+	if e.a.cfg.Metrics != nil && !staleAt.IsZero() {
+		e.a.metric(MetricStale, obs.pub.name, time.Since(staleAt).Seconds())
+	}
+	ops := e.newResult(obs, runResult{cols: d.out.cols, keyIdx: d.out.keyIdx, res: d.out.res}, subs)
+	var opsJSON []json.RawMessage
+	snapped := map[*conn]bool{}
+	for sub := range subs {
+		held := e.coalescing[sub.c]
+		switch {
+		case sub.needInit && held:
+			sub.needInit, sub.needsReset = false, true
+		case sub.needInit:
+			outFor(sub.c).entries = append(outFor(sub.c).entries, e.snapshotEntry(sub))
+			sub.needInit, sub.holds = false, true
+			snapped[sub.c] = true
+		case len(ops) > 0 && held:
+			sub.needsReset = true
+		case len(ops) > 0:
+			if opsJSON == nil {
+				opsJSON = marshalOps(ops)
+			}
+			outFor(sub.c).entries = append(outFor(sub.c).entries, subEntry{S: sub.s, Ops: opsJSON})
+		}
+	}
+	obs.snapJSON = nil
+	e.flush(out)
+	for c := range snapped {
+		q, _ := c.queuedBytes(lowWaterBytes)
+		e.snapshotted[c] = q
+	}
 }
 
 // age orders due observers: the first notification it does not reflect,
@@ -1318,6 +1560,14 @@ func (e *engine) query(ctx context.Context, tx pgx.Tx, obs *observer) ([]colSpec
 	defer rows.Close()
 	m := tx.Conn().TypeMap()
 	fds := rows.FieldDescriptions()
+	if len(fds) == 0 {
+		// The query failed before describing its result (e.g. the
+		// statement timeout): report that, not a missing key column.
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 	// Types pgx does not know, such as user enums: ask the catalog, once
 	// per type, before the row loop.
 	if err := e.resolveTypes(ctx, m, fds); err != nil {

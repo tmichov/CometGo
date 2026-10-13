@@ -148,7 +148,14 @@ type Config struct {
 	// SlowObserverAfter is the soft deadline for one publication query. A
 	// tick stops starting queries once twice this has passed since its
 	// snapshot began; the rest run first in the next tick. Default 1s.
+	// A query still running after it is detached (MaxDetached).
 	SlowObserverAfter time.Duration
+
+	// MaxDetached caps the slow observer queries that run detached from
+	// their tick at once, each on its own pool connection. 0 means the
+	// default, min(2, pool MaxConns - 4), at least 0; negative disables
+	// detaching. With none, a slow query holds its tick, and Start warns.
+	MaxDetached int
 
 	// IdempotencyTTL is how long the result of a call carrying an
 	// idempotency key is kept for retries. Default 24h.
@@ -259,6 +266,12 @@ func New(cfg Config) *App {
 	def(&cfg.FenceTimeout, 5*time.Second)
 	def(&cfg.QueryTimeout, 30*time.Second)
 	def(&cfg.SlowObserverAfter, time.Second)
+	switch {
+	case cfg.MaxDetached == 0:
+		cfg.MaxDetached = min(max(int(cfg.DB.Config().MaxConns)-4, 0), 2)
+	case cfg.MaxDetached < 0:
+		cfg.MaxDetached = 0
+	}
 	def(&cfg.IdempotencyTTL, 24*time.Hour)
 	defi(&cfg.FnWorkers, 8)
 	defi(&cfg.MaxSubs, 500)
@@ -322,6 +335,9 @@ func (a *App) Start(ctx context.Context) error {
 	}
 	a.started = true
 	a.serving.Store(true)
+	if a.cfg.MaxDetached == 0 {
+		a.log.Warn("slow publication queries will not be detached: each one holds its tick (Config.MaxDetached is off, or the pool has fewer than 5 connections)")
+	}
 	ctx, a.stop = context.WithCancel(ctx)
 	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
 		a.running.Add(1)

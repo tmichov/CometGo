@@ -34,7 +34,10 @@ func (e *engine) resolveTypes(ctx context.Context, m *pgtype.Map, fds []pgconn.F
 		if _, known := m.TypeForOID(fd.DataTypeOID); known {
 			continue
 		}
-		if _, cached := e.pgTypes[fd.DataTypeOID]; !cached {
+		e.typesMu.Lock()
+		_, cached := e.pgTypes[fd.DataTypeOID]
+		e.typesMu.Unlock()
+		if !cached {
 			oids = append(oids, fd.DataTypeOID)
 		}
 	}
@@ -86,7 +89,9 @@ func (e *engine) lookupTypes(ctx context.Context, oids []uint32) error {
 			// domain column already arrives as its base type).
 			code = "[]enum"
 		}
+		e.typesMu.Lock()
 		e.pgTypes[oid] = code
+		e.typesMu.Unlock()
 	}
 	return rows.Err()
 }
@@ -94,7 +99,10 @@ func (e *engine) lookupTypes(ctx context.Context, oids []uint32) error {
 // colCode is typeCode with the catalog's answer for types pgx does not know.
 func (e *engine) colCode(m *pgtype.Map, oid uint32) string {
 	if _, known := m.TypeForOID(oid); !known {
-		if code := e.pgTypes[oid]; code != "" {
+		e.typesMu.Lock()
+		code := e.pgTypes[oid]
+		e.typesMu.Unlock()
+		if code != "" {
 			return code
 		}
 	}

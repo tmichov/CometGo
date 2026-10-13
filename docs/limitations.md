@@ -4,13 +4,13 @@ These are properties of the current engine, not bugs. Several have planned fixes
 
 ## One engine loop per node
 
-Each server runs one engine goroutine. It drains change notifications, runs every observer that needs re-running in one `REPEATABLE READ` snapshot, sends the diffs, and then starts the next tick. Everything a tick does happens one step after another, on that one goroutine:
+Each server runs one engine goroutine. It drains change notifications, runs every observer that needs re-running in one `REPEATABLE READ` snapshot, sends the diffs, and then starts the next tick. A tick's steps run one after another:
 
-- **A slow publication query delays every subscription on the node.** No other observer is re-run until the slow one finishes or hits `QueryTimeout` (30 s by default). The tick budget (`SlowObserverAfter`) stops a tick from *starting* more queries after twice the soft deadline, so many medium-slow queries are spread over several ticks, but one query that is slower than the budget still holds its tick.
+- **A slow publication query delays its own subscribers, and costs a connection.** A query still running after `SlowObserverAfter` (1 s) is detached: the tick goes on without it, and only connections subscribed to it wait for its result. Each detached query holds a pool connection and keeps its snapshot open until it finishes, so at most `MaxDetached` (2) run that way. Past that limit, or with detaching off (a pool under 5 connections), a query that turns out slow holds the whole tick again until it finishes or hits `QueryTimeout` (30 s). A subscription to an always-slow query lags its siblings on the same connection by that query's run time.
 - **A slow publication `fn` delays a whole tick.** `fn` runs for every new subscription, again when a connection's user changes, and on `Revalidate`. A tick runs those calls concurrently, `FnWorkers` (8) at a time, and waits for all of them, so one slow `fn` holds every subscription on the node for as long as it takes, and many slow ones for about their number divided by `FnWorkers` ([How a publication runs](server.md#how-a-publication-runs)).
 - **Call results wait too.** Methods run in their own goroutines, so a slow method does not hold up the engine. But a call's result is sent only after the tick that brings its writes to the caller's subscriptions. When ticks are slow, results are slow, or arrive with `lag: true` after `FenceTimeout`.
 
-Slow-work isolation, which removes most of this, is *planned* for M3 ([design](design/m3-slow-work.md)). Until then, keep publication queries indexed and cheap, and keep `fn` free of slow I/O. The `tick_seconds`, `tick_runs` and `pub_run_seconds` [metrics](server.md#metrics) show when ticks get long and which publication is slow.
+Keep publication queries indexed and cheap, and keep `fn` free of slow I/O ([M3 design](design/m3-slow-work.md)). The `detached_observers` metric shows when slow queries are running detached. The `tick_seconds`, `tick_runs` and `pub_run_seconds` [metrics](server.md#metrics) show when ticks get long and which publication is slow.
 
 ## The change feed uses Postgres NOTIFY
 
