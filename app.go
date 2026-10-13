@@ -388,6 +388,7 @@ type publication struct {
 // Publish registers a publication. Args are decoded from the client's sub
 // args into A; a decode failure ends the sub with BAD_REQUEST.
 func Publish[A any](a *App, name string, opts PubOptions, fn func(c *SubCtx, args A) (Query, error)) {
+	a.checkNotStarted()
 	if _, dup := a.pubs[name]; dup {
 		panic("cometgo: duplicate publication " + name)
 	}
@@ -431,6 +432,7 @@ type method struct {
 // Method registers a server method. Args are decoded into A; the handler's
 // result R is JSON-encoded into res.val. Returning an error rolls back Tx.
 func Method[A, R any](a *App, name string, fn func(c *Call, args A) (R, error)) {
+	a.checkNotStarted()
 	if _, dup := a.methods[name]; dup {
 		panic("cometgo: duplicate method " + name)
 	}
@@ -441,6 +443,16 @@ func Method[A, R any](a *App, name string, fn func(c *Call, args A) (R, error)) 
 		}
 		return fn(c, args)
 	}}
+}
+
+// checkNotStarted panics once Start has run: the engine and connections read
+// a.pubs and a.methods without a lock, so a later write is a fatal map race.
+func (a *App) checkNotStarted() {
+	a.startMu.Lock()
+	defer a.startMu.Unlock()
+	if a.started {
+		panic("cometgo: register publications and methods before Start")
+	}
 }
 
 func decodeArgs(raw json.RawMessage, dst any) error {

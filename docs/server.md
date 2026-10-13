@@ -69,7 +69,7 @@ func Publish[A any](a *App, name string, opts PubOptions, fn func(c *SubCtx, arg
 
 `Publish` registers a live query under `name`. When a client subscribes, the subscription's args are JSON-decoded into `A` (unknown fields are rejected) and `fn` returns the SQL to run. The query's result is sent as the subscription's initial snapshot, and it is re-run and diffed every time one of `opts.Tables` changes.
 
-`Publish` panics if `name` is already registered or `opts.Tables` is empty.
+`Publish` panics if `name` is already registered, if `opts.Tables` is empty, or if it is called after `Start`. Register every publication and method before `Start`.
 
 ```go
 type projectArgs struct {
@@ -212,7 +212,7 @@ Notifications that arrive between the start of a tick and its snapshot are folde
 func Method[A, R any](a *App, name string, fn func(c *Call, args A) (R, error))
 ```
 
-`Method` registers a server function under `name`. The call's args are JSON-decoded into `A` (unknown fields are rejected with `BAD_REQUEST`), and the returned `R` is JSON-encoded as the call's result. `Method` panics if `name` is already registered.
+`Method` registers a server function under `name`. The call's args are JSON-decoded into `A` (unknown fields are rejected with `BAD_REQUEST`), and the returned `R` is JSON-encoded as the call's result. `Method` panics if `name` is already registered, or if it is called after `Start`.
 
 ```go
 type Call struct {
