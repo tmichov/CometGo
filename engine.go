@@ -135,6 +135,13 @@ type observer struct {
 	staleFrom  uint64
 	dirtySince uint64
 	resTick    uint64
+	// dueFrom orders a due observer that is not stale (a new one, or one
+	// owing a snapshot): the drain cutoff + 1 of the tick it first became
+	// due in; 0 once it runs.
+	dueFrom uint64
+	// inFlight: its query outlives the tick that started it (detach, M3).
+	// Never set yet. Such an observer is in no tick's run list.
+	inFlight bool
 	// evts are events waiting for this observer to reflect their n.
 	evts []heldEvt
 
@@ -480,6 +487,14 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		if from == 0 {
 			continue
 		}
+		if obs.inFlight {
+			// Its run's cutoff is past: it re-runs once that run completes.
+			obs.dirty = true
+			if obs.dirtySince == 0 || from < obs.dirtySince {
+				obs.dirtySince = from
+			}
+			continue
+		}
 		obs.markStale(from)
 		if allN == 0 && !obs.dirty && !obs.awaitsInit() && obs.filterable(changes[obs.tables[0]]) && !isDeferred(obs) {
 			cands = append(cands, obs)
@@ -539,7 +554,9 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	// Observers with subs awaiting a snapshot also run, so a tx never pairs
 	// a fresh snapshot with a cached result from an older one (assembly
 	// emits only results of this tick). A candidate owing a reset runs in
-	// full.
+	// full. An observer in flight is never in the run list: it runs again
+	// once it completes. runObservers starts them oldest first, within the
+	// tick budget.
 	cands = slices.DeleteFunc(cands, func(obs *observer) bool {
 		if resetFor[obs] {
 			obs.markDirty(drained)
@@ -548,7 +565,10 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	})
 	var toRun []*observer
 	for _, obs := range e.observers {
-		if (obs.dirty || obs.res == nil || obs.awaitsInit() || resetFor[obs]) && !isDeferred(obs) {
+		if (obs.dirty || obs.res == nil || obs.awaitsInit() || resetFor[obs]) && !obs.inFlight && !isDeferred(obs) {
+			if obs.staleFrom == 0 && obs.dueFrom == 0 {
+				obs.dueFrom = cutoff + 1
+			}
 			toRun = append(toRun, obs)
 		}
 	}
@@ -977,6 +997,7 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", e.a.cfg.QueryTimeout.Milliseconds())); err != nil {
 		return err
 	}
+	snapStart := time.Now()
 	var affected []*observer
 	if len(cands) > 0 {
 		if affected, err = e.filterCandidates(ctx, tx, cands, changes); err != nil {
@@ -991,8 +1012,22 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}
 		toRun = append(toRun, affected...)
 	}
+	// Oldest first, so observers a budget left unstarted go first next
+	// tick and none starves under constant writes.
+	slices.SortStableFunc(toRun, func(a, b *observer) int { return cmp.Compare(a.age(), b.age()) })
+	budget := 2 * e.a.cfg.SlowObserverAfter
 	staged := make([]runResult, 0, len(toRun))
-	for _, obs := range toRun {
+	for i, obs := range toRun {
+		if i > 0 && time.Since(snapStart) >= budget {
+			// The rest stay due (dirty, stale or awaiting init) and their
+			// connections' fences carry. An affected candidate becomes dirty.
+			// Nothing else may wake the engine for them, so tick again.
+			for _, obs := range toRun[i:] {
+				obs.dirty = true
+			}
+			e.signal()
+			break
+		}
 		e.runs.Add(1)
 		// A savepoint per observer keeps one failing query from poisoning
 		// the snapshot for the rest.
@@ -1058,7 +1093,7 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	for _, r := range staged {
 		obs := r.obs
 		obs.dirty = false
-		obs.staleFrom, obs.dirtySince, obs.resTick = obs.dirtySince, 0, e.tickN
+		obs.staleFrom, obs.dirtySince, obs.resTick, obs.dueFrom = obs.dirtySince, 0, e.tickN, 0
 		if r.err != nil {
 			obs.err = r.err
 			continue
@@ -1084,6 +1119,15 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
 	}
 	return nil
+}
+
+// age orders due observers: the first notification it does not reflect,
+// or the cutoff it became due at, whichever is older.
+func (obs *observer) age() uint64 {
+	if obs.staleFrom != 0 && (obs.dueFrom == 0 || obs.staleFrom < obs.dueFrom) {
+		return obs.staleFrom
+	}
+	return obs.dueFrom
 }
 
 // markStale records that obs does not reflect notification n.
