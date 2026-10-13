@@ -667,3 +667,29 @@ test("a token function set while the socket was opening that throws sends no ano
     assert.equal(hello.resume?.session, "s_1");
   });
 });
+
+
+test("subscribe() after close() returns an ended sub whose ready rejects with CANCELED", async () => {
+  const ws = FakeWS.last;
+  comet.close();
+  const sub = comet.subscribe("todos");
+  assert.equal(sub.status, "ended");
+  assert.equal(sub.error?.code, "CANCELED");
+  await assert.rejects(sub.ready, (e: unknown) => e instanceof CometError && e.code === "CANCELED");
+  assert.equal(ws.of("sub").length, 0);
+});
+
+test("close() ends a loading sub with CANCELED and keeps a ready sub's rows", async () => {
+  const ws = FakeWS.last;
+  const init = { cols: [["id", "i8"]], key: [0], ordered: true };
+  const ready = comet.subscribe("a");
+  ws.recv({ t: "tx", seq: 1, subs: [{ s: ready.id, init, ops: [["i", "1", [1], 0]], ready: true }] });
+  const loading = comet.subscribe("b");
+  let notified = 0;
+  loading.subscribe(() => notified++);
+  comet.close();
+  assert.equal(loading.status, "ended");
+  assert.equal(notified, 1, "listeners hear about the end");
+  await assert.rejects(loading.ready, (e: unknown) => e instanceof CometError && e.code === "CANCELED");
+  assert.deepEqual(ready.rows, [{ id: 1 }]);
+});

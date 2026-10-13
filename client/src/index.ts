@@ -228,6 +228,10 @@ export class Comet {
 
   subscribe<T = Record<string, unknown>>(name: string, args?: unknown): Subscription<T> {
     const sub = new Subscription<T>(this, this.#nextSub++, name, args);
+    if (this.#closed) {
+      endClosed(sub);
+      return sub;
+    }
     this.#subs.set(sub.id, sub);
     if (this.#isOpen()) this.#sendSub(sub);
     return sub;
@@ -306,6 +310,9 @@ export class Comet {
     // The rest were never sent, so never ran.
     for (const c of this.#calls.values()) c.reject(canceled());
     this.#calls.clear();
+    // A sub still loading would never get its first snapshot, so its ready
+    // would never settle. Subs with data keep it on screen.
+    for (const sub of this.#subs.values()) if (sub.status === "loading") endClosed(sub);
   }
 
   // ---- internals used by Subscription ----
@@ -854,6 +861,12 @@ function uuid(): string {
   b[8] = (b[8]! & 0x3f) | 0x80;
   const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+// Ends a sub the closed client will never serve, as a server end would.
+function endClosed(sub: Subscription<any>): void {
+  sub._entry({ s: sub.id, end: { code: "CANCELED", msg: "client closed" } });
+  sub._flush();
 }
 
 function canceled(): CometError {
