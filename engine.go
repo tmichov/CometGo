@@ -897,16 +897,6 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	return nil
 }
 
-// sortedSubs returns obs's subs ordered by connection and sub id, so
-// per-observer output has a stable order.
-func (obs *observer) sortedSubs() []*subscription {
-	subs := slices.Collect(maps.Keys(obs.subs))
-	slices.SortFunc(subs, func(a, b *subscription) int {
-		return cmp.Or(strings.Compare(a.c.session, b.c.session), cmp.Compare(a.s, b.s))
-	})
-	return subs
-}
-
 func (obs *observer) awaitsInit() bool {
 	for sub := range obs.subs {
 		if sub.needInit {
