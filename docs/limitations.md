@@ -10,7 +10,7 @@ Each server runs one engine goroutine. It drains change notifications, runs ever
 - **A slow publication `fn` delays a whole tick.** `fn` runs for every new subscription, again when a connection's user changes, and on `Revalidate`. A tick runs those calls concurrently, `FnWorkers` (8) at a time, and waits for all of them, so one slow `fn` holds every subscription on the node for as long as it takes, and many slow ones for about their number divided by `FnWorkers` ([How a publication runs](server.md#how-a-publication-runs)).
 - **Call results wait too.** Methods run in their own goroutines, so a slow method does not hold up the engine. But a call's result is sent only after the tick that brings its writes to the caller's subscriptions. When ticks are slow, results are slow, or arrive with `lag: true` after `FenceTimeout`.
 
-Keep publication queries indexed and cheap, and keep `fn` free of slow I/O. The `tick_seconds`, `tick_runs` and `pub_run_seconds` [metrics](server.md#metrics) show when ticks get long and which publication is slow.
+Slow-work isolation, which removes most of this, is *planned* for M3 ([design](design/m3-slow-work.md)). Until then, keep publication queries indexed and cheap, and keep `fn` free of slow I/O. The `tick_seconds`, `tick_runs` and `pub_run_seconds` [metrics](server.md#metrics) show when ticks get long and which publication is slow.
 
 ## The change feed uses Postgres NOTIFY
 

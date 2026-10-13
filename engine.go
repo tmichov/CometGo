@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -69,14 +68,23 @@ type engine struct {
 	snapshotted map[*conn]int
 	// pgTypes caches the wire code the catalog gives types pgx does not
 	// know, by OID: "enum", "[]enum", or "" for the default (types.go).
-	pgTypes      map[uint32]string
-	carryFences  []*fence
-	carryEvts    []*evtNote
+	pgTypes map[uint32]string
+	// tickN numbers ticks; an observer's resTick is the tick of its result.
+	tickN uint64
+	// afters holds, per connection, the after messages of its rebinds in
+	// order, until the connection is settled (§3.2).
+	afters map[*conn][]pendingAfter
+	// heldEvts are the observers with events waiting for their data.
+	heldEvts     map[*observer]bool
+	carryEvts    []heldEvt
 	carryOut     map[*conn]*connOut
 	retryBackoff time.Duration
 	// fns holds the fn calls prefetchFns made for the requests being
 	// handled; nil outside the request phase.
 	fns map[fnKey]*fnCall
+	// deferObs, set by tests, keeps the observers it returns true for out
+	// of a tick's run list, as the tick budget will (M3).
+	deferObs func(*observer) bool
 }
 
 type notification struct {
@@ -89,11 +97,16 @@ type notification struct {
 	keys   string // r notifications: JSON array of PK arrays
 	token  string // fence
 	evt    *evtNote
+	reval  string // comet_reval: the user ID to re-check
 }
 
 type fence struct {
+	token    string
 	released chan struct{}
 	c        *conn // the connection whose res waits on it
+	// p is the number of the notification that drained the fence (its own,
+	// or a reconnect's all-dirty one); 0 until then. Engine mutex.
+	p uint64
 	// committed is set once the method's transaction has committed, and gen
 	// is listenGen at that moment (commitFenced).
 	committed bool
@@ -112,6 +125,21 @@ type observer struct {
 
 	subs  map[*subscription]struct{}
 	dirty bool
+	// dirtyAt is when the first notification not yet reflected in res was
+	// drained, for MetricStale; zero when fresh or without Config.Metrics.
+	dirtyAt time.Time
+
+	// staleFrom is the smallest drained notification number its delivered
+	// result does not reflect; 0 when fresh. dirtySince is the same for
+	// notifications drained while a run is in flight, after that run's
+	// cutoff; it becomes staleFrom when the run completes. Runs never
+	// outlive their tick yet, so it stays 0 until detach (M3). resTick is
+	// the tick whose snapshot produced res.
+	staleFrom  uint64
+	dirtySince uint64
+	resTick    uint64
+	// evts are events waiting for this observer to reflect their n.
+	evts []heldEvt
 
 	// Per-tick output.
 	ops      []op
@@ -170,8 +198,9 @@ type rebindReq struct {
 
 // revalidateReq re-runs fn for every sub of every session whose identity's
 // UserID is in users (every session, if all), ending those it now rejects.
-// tick merges a drain's requests into one, so each sub is re-checked at most
-// once per tick however many Revalidate calls named its user.
+// tick merges a drain's comet_reval notifications into one, so each sub is
+// re-checked at most once per tick however many Revalidate calls named its
+// user.
 type revalidateReq struct {
 	users map[string]bool
 	all   bool
@@ -189,6 +218,8 @@ func newEngine(a *App) *engine {
 		coalescing:  map[*conn]bool{},
 		snapshotted: map[*conn]int{},
 		pgTypes:     map[uint32]string{},
+		afters:      map[*conn][]pendingAfter{},
+		heldEvts:    map[*observer]bool{},
 		listenIdle:  30 * time.Second,
 		listenProbe: 5 * time.Second,
 		// Under the OS TCP connect timeout (about 2 min on Linux), so a
@@ -227,7 +258,7 @@ func (e *engine) registerFence(c *conn) (string, *fence) {
 	defer e.mu.Unlock()
 	e.fenceN++
 	token := e.a.nodeID + ":" + strconv.FormatUint(e.fenceN, 10)
-	f := &fence{released: make(chan struct{}), c: c}
+	f := &fence{token: token, released: make(chan struct{}), c: c}
 	e.fences[token] = f
 	return token, f
 }
@@ -306,57 +337,89 @@ func (e *engine) run(ctx context.Context) {
 
 type connOut struct {
 	entries []subEntry
-	after   []sequenced
+}
+
+// pendingAfter is a message sent once its connection is settled as of p
+// (settled), such as a rebind's authRes (§3.2).
+type pendingAfter struct {
+	p uint64
+	m sequenced
+}
+
+// heldEvt is an event with its notification number: it goes out once its
+// observer reflects every change notified before it.
+type heldEvt struct {
+	n    uint64
+	note *evtNote
 }
 
 // tick runs one engine round (PROTOCOL.md §0). It reports whether it must be
 // retried because the snapshot could not be taken.
 func (e *engine) tick(ctx context.Context) (retry bool) {
+	e.tickN++
 	// 1. Drain notifications (cutoff p) and requests, before the snapshot.
 	e.mu.Lock()
 	notes, reqs := e.pending, e.reqs
 	e.pending, e.reqs = nil, nil
-	fences, evts := e.carryFences, e.carryEvts
-	e.carryFences, e.carryEvts = nil, nil
-	allDirty := false
-	var listened uint64
+	cutoff := e.nextN
+	evts := e.carryEvts
+	e.carryEvts = nil
+	reval := revalidateReq{users: map[string]bool{}}
+	var listened, listenN, allN uint64
 	for _, n := range notes {
 		if n.evt != nil {
-			evts = append(evts, n.evt)
+			evts = append(evts, heldEvt{n: n.n, note: n.evt})
+		}
+		if n.reval != "" {
+			reval.users[n.reval] = true
 		}
 		if n.token != "" {
-			if f := e.fences[n.token]; f != nil {
-				delete(e.fences, n.token)
-				fences = append(fences, f)
+			if f := e.fences[n.token]; f != nil && f.p == 0 {
+				f.p = n.n
 			}
 		}
-		allDirty = allDirty || n.all
-		listened = max(listened, n.listen)
+		if n.all && allN == 0 {
+			allN = n.n
+		}
+		if n.listen > listened {
+			listened, listenN = n.listen, n.n
+		}
 	}
 	// A fence committed before listener generation `listened` issued LISTEN
 	// (listenMu) never reaches that connection: its notifications were
 	// either received earlier, and so are in this drain or an earlier one,
-	// or lost. This all-dirty tick re-runs every observer on a snapshot
-	// taken after this drain, so it covers the fence's writes, and the
-	// fence's events, if received, go out before its res (step 5). A fence
-	// committed later is left to its own notification: releasing it here
-	// could send its res ahead of its events.
+	// or lost. The all-dirty notification of that LISTEN makes every
+	// observer stale from listenN, so the fence is released once they
+	// reflect it, and the fence's events, if received, go out before its
+	// res. A fence committed later is left to its own notification:
+	// releasing it here could send its res ahead of its events.
 	if listened > 0 {
-		for token, f := range e.fences {
-			if f.committed && f.gen < listened {
-				delete(e.fences, token)
-				fences = append(fences, f)
+		for _, f := range e.fences {
+			if f.committed && f.gen < listened && f.p == 0 {
+				f.p = listenN
 			}
 		}
 	}
+	// Drained fences stay registered until released, so FenceTimeout's
+	// dropFence takes a carried one out too.
+	var fences []*fence
+	for _, f := range e.fences {
+		if f.p != 0 {
+			fences = append(fences, f)
+		}
+	}
 	e.mu.Unlock()
+	var drained time.Time
+	if e.a.cfg.Metrics != nil {
+		drained = time.Now()
+	}
 
 	changes := map[string]*tableChange{}
 	for _, n := range notes {
 		if n.table != "" {
 			tc := changes[n.table]
 			if tc == nil {
-				tc = &tableChange{}
+				tc = &tableChange{n: n.n}
 				changes[n.table] = tc
 			}
 			tc.add(n)
@@ -384,48 +447,92 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	// is bound to its connection's current identity, and before fences are
 	// released, so an end still precedes the res of the method that caused
 	// it.
-	reval := revalidateReq{users: map[string]bool{}, all: listened > 0}
-	var rest []any
-	for _, r := range reqs {
-		if rv, ok := r.(revalidateReq); ok {
-			maps.Copy(reval.users, rv.users)
-			reval.all = reval.all || rv.all
-			continue
-		}
-		rest = append(rest, r)
-	}
+	reval.all = listened > 0
 	doReval := reval.all || len(reval.users) > 0
-	e.prefetchFns(ctx, rest, reval, doReval)
-	for i, r := range rest {
-		e.handleReq(ctx, i, r, outFor)
+	e.prefetchFns(ctx, reqs, reval, doReval)
+	for i, r := range reqs {
+		e.handleReq(ctx, i, r, outFor, cutoff)
 	}
 	if doReval {
-		e.handleReq(ctx, len(rest), reval, outFor)
+		e.handleReq(ctx, len(reqs), reval, outFor, cutoff)
 	}
 	e.fns = nil
 
+	deferred := map[*observer]bool{}
+	isDeferred := func(obs *observer) bool {
+		if e.deferObs == nil {
+			return false
+		}
+		d, ok := deferred[obs]
+		if !ok {
+			d = e.deferObs(obs)
+			deferred[obs] = d
+		}
+		return d
+	}
+
+	// Observers on a changed table become stale from the first notification
+	// that changed it. Those whose query declares Match and whose table only
+	// reported changed keys are candidates: they run only if those keys can
+	// affect them, decided inside the snapshot (pkfilter.go).
+	var cands []*observer
+	for _, obs := range e.observers {
+		from := allN
+		for _, t := range obs.tables {
+			if tc := changes[t]; tc != nil && (from == 0 || tc.n < from) {
+				from = tc.n
+			}
+		}
+		if from == 0 {
+			continue
+		}
+		obs.markStale(from)
+		if allN == 0 && !obs.dirty && !obs.awaitsInit() && obs.filterable(changes[obs.tables[0]]) && !isDeferred(obs) {
+			cands = append(cands, obs)
+		} else {
+			obs.markDirty(drained)
+		}
+	}
+
 	// Coalescing connections (§8.1) get their held resets once their queue
-	// has drained, and right away when this tick releases one of their
-	// fences or sends them an after message: a res or authRes must follow a
-	// tx reflecting current data for every sub (§3.2, §6.2). Both happen
-	// before the snapshot, so the resets are built from it.
+	// has drained, and right away when one of their fences or after
+	// messages is expected to be released this tick: a res or authRes must
+	// follow a tx reflecting current data for every sub (§3.2, §6.2). That
+	// is expected when every stale observer of the connection runs this
+	// tick. The resets are built from this tick's snapshot; a held sub whose
+	// observer does not run stays held.
 	forced := map[*conn]bool{}
+	expected := func(c *conn) bool {
+		for _, sub := range e.conns[c] {
+			if !sub.obs.freshPast(cutoff) && isDeferred(sub.obs) {
+				return false
+			}
+		}
+		return true
+	}
 	for _, f := range fences {
-		if f.c != nil {
+		if f.c != nil && !forced[f.c] && expected(f.c) {
 			forced[f.c] = true
 		}
 	}
-	for c, o := range out {
-		if len(o.after) > 0 {
+	for c := range e.afters {
+		if !forced[c] && expected(c) {
 			forced[c] = true
 		}
 	}
 	// A session without a live socket stays held: releasing it would put
 	// every held snapshot into the replay buffer, which can end the session.
 	// After a resume the next tick checks the new socket.
+	releasing := map[*conn]bool{}
+	resetFor := map[*observer]bool{}
 	for c := range e.coalescing {
 		if q, live := c.queuedBytes(lowWaterBytes); forced[c] || live && q < lowWaterBytes {
-			e.release(c)
+			releasing[c] = true
+			for _, sub := range e.conns[c] {
+				if sub.needsReset {
+					resetFor[sub.obs] = true
+				}
+			}
 		}
 	}
 	for c := range e.snapshotted {
@@ -434,54 +541,51 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		}
 	}
 
-	// Observers whose query declares Match and whose table only reported
-	// changed keys are candidates: they run only if those keys can affect
-	// them, decided inside the snapshot (pkfilter.go).
-	var cands []*observer
-	for _, obs := range e.observers {
-		if !allDirty && !slices.ContainsFunc(obs.tables, func(t string) bool { return changes[t] != nil }) {
-			continue
-		}
-		if !allDirty && !obs.dirty && !obs.awaitsInit() && obs.filterable(changes[obs.tables[0]]) {
-			cands = append(cands, obs)
-		} else {
-			obs.dirty = true
-		}
-	}
-
 	// 2–3. One REPEATABLE READ snapshot for every observer that must run.
 	// Observers with subs awaiting a snapshot also run, so a tx never pairs
-	// a fresh snapshot with a cached result from an older one.
+	// a fresh snapshot with a cached result from an older one (assembly
+	// emits only results of this tick). A candidate owing a reset runs in
+	// full.
+	cands = slices.DeleteFunc(cands, func(obs *observer) bool {
+		if resetFor[obs] {
+			obs.markDirty(drained)
+		}
+		return resetFor[obs]
+	})
 	var toRun []*observer
 	for _, obs := range e.observers {
-		if obs.dirty || obs.res == nil || obs.awaitsInit() {
+		if (obs.dirty || obs.res == nil || obs.awaitsInit() || resetFor[obs]) && !isDeferred(obs) {
 			toRun = append(toRun, obs)
 		}
 	}
 	if len(toRun) > 0 || len(cands) > 0 {
-		if err := e.runObservers(ctx, toRun, cands, changes); err != nil {
+		if err := e.runObservers(ctx, toRun, cands, changes, drained); err != nil {
 			e.a.log.Warn("tick snapshot failed, retrying", "err", err)
 			// Observers stay dirty; fences wait for a tick that actually
 			// reflects their writes. Requests already applied stay applied.
 			// Candidates lose the keys that made them candidates, so they
 			// re-run in full.
 			for _, obs := range cands {
-				obs.dirty = true
+				obs.markDirty(drained)
 			}
-			e.carryFences = fences
 			e.carryEvts = evts
 			e.carryOut = out
 			return true
 		}
 	}
+	for c := range releasing {
+		e.release(c)
+	}
 
 	// 4. Assemble one tx per connection. A connection over the soft limit
 	// starts coalescing: its subs' changes are held, not serialized.
 	// Decided once per connection, so the queue draining mid-assembly
-	// cannot split one connection's subs between the two modes.
+	// cannot split one connection's subs between the two modes. A
+	// connection forced or released this tick holds nothing, even while it
+	// stays coalescing for a sub whose observer did not run.
 	decided := map[*conn]bool{}
 	hold := func(c *conn) bool {
-		if forced[c] {
+		if forced[c] || releasing[c] {
 			return false
 		}
 		if !decided[c] && !e.coalescing[c] {
@@ -508,8 +612,10 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			delete(e.observers, obs.key)
 			continue
 		}
-		if obs.res == nil {
-			continue // still pending (e.g. retried tick)
+		// Only results of this tick's snapshot go out (§6.1.1). Subs of
+		// an observer that did not run keep waiting.
+		if obs.res == nil || obs.resTick != e.tickN {
+			continue
 		}
 		var opsJSON []json.RawMessage
 		for sub := range obs.subs {
@@ -532,24 +638,69 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		obs.ops, obs.snapJSON = nil, nil
 	}
 	e.flush(out)
+	if e.a.cfg.Metrics != nil {
+		// Every observer that ran this tick is clean now; one still dirty
+		// did not run. Errored observers were removed above.
+		for _, obs := range e.observers {
+			if !obs.dirty && !obs.dirtyAt.IsZero() {
+				e.a.metric(MetricStale, obs.pub.name, time.Since(obs.dirtyAt).Seconds())
+				obs.dirtyAt = time.Time{}
+			}
+		}
+	}
 	for c := range snapped {
 		// Arms the drain signal that ends the raised limit.
 		q, _ := c.queuedBytes(lowWaterBytes)
 		e.snapshotted[c] = q
 	}
 
-	// Events drained this tick follow the tx reflecting every change
-	// notified before them, and precede the res of the call that emitted
-	// them (its fence is notified after its events).
+	// After messages go out in order, each once its connection is settled.
+	for c, q := range e.afters {
+		for len(q) > 0 && e.settled(c, q[0].p) {
+			c.send(q[0].m)
+			q = q[1:]
+		}
+		if len(q) == 0 {
+			delete(e.afters, c)
+		} else {
+			e.afters[c] = q
+		}
+	}
+
+	// Events go out once their observer reflects every change notified
+	// before them, and precede the res of the call that emitted them (its
+	// fence is notified after its events).
 	e.deliverEvents(evts)
 
-	// 5. Release fences satisfied by this tick: their writes were drained
-	// before the snapshot, every dirty observer ran, and the resulting tx is
-	// already enqueued ahead of the method's res.
+	// 5. Release each fence whose connection is settled as of its
+	// notification: every sub reflects its writes, and the tx carrying them
+	// is already enqueued ahead of the method's res. The others carry.
 	for _, f := range fences {
-		close(f.released)
+		if e.settled(f.c, f.p) {
+			e.releaseFence(f)
+		}
 	}
 	return false
+}
+
+// settled reports whether every sub of c has had its snapshot sent and has
+// an observer that reflects every notification up to p (§6.2).
+func (e *engine) settled(c *conn, p uint64) bool {
+	for _, sub := range e.conns[c] {
+		if sub.needInit || sub.needsReset || !sub.obs.freshPast(p) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *engine) releaseFence(f *fence) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.fences[f.token] == f { // not dropped by FenceTimeout
+		delete(e.fences, f.token)
+		close(f.released)
+	}
 }
 
 func (e *engine) flush(out map[*conn]*connOut) {
@@ -568,22 +719,29 @@ func (e *engine) flush(out map[*conn]*connOut) {
 		if len(o.entries) > 0 {
 			c.sendTx(o.entries)
 		}
-		for _, m := range o.after {
-			c.send(m)
-		}
 	}
 }
 
-// release ends coalescing for c: every held sub gets its snapshot in this
-// tick, as a reset where the client holds data for it. The snapshot
-// is this tick's, newer than anything c was sent, so no sub goes back.
+// release ends coalescing for c as far as this tick's snapshot allows:
+// every held sub whose observer ran gets its snapshot in this tick, as a
+// reset where the client holds data for it. The snapshot is this tick's,
+// newer than anything c was sent, so no sub goes back. c stays coalescing
+// while a sub's observer did not run.
 func (e *engine) release(c *conn) {
-	delete(e.coalescing, c)
-	c.coalescing.Store(false)
+	held := false
 	for _, sub := range e.conns[c] {
-		if sub.needsReset {
-			sub.needsReset, sub.needInit = false, true
+		if !sub.needsReset {
+			continue
 		}
+		if sub.obs.resTick == e.tickN {
+			sub.needsReset, sub.needInit = false, true
+		} else {
+			held = true
+		}
+	}
+	if !held {
+		delete(e.coalescing, c)
+		c.coalescing.Store(false)
 	}
 }
 
@@ -617,8 +775,10 @@ func marshalOps(ops []op) []json.RawMessage {
 	return out
 }
 
-// handleReq applies request i of the tick (fnKey).
-func (e *engine) handleReq(ctx context.Context, i int, r any, outFor func(*conn) *connOut) {
+// handleReq applies request i of the tick (fnKey). cutoff is the tick's
+// drain cutoff: a rebind's after message waits until the connection
+// reflects it.
+func (e *engine) handleReq(ctx context.Context, i int, r any, outFor func(*conn) *connOut, cutoff uint64) {
 	end := func(c *conn, s uint64, err *Error) {
 		outFor(c).entries = append(outFor(c).entries, subEntry{S: s, End: err})
 	}
@@ -672,6 +832,7 @@ func (e *engine) handleReq(ctx context.Context, i int, r any, outFor func(*conn)
 		delete(e.ended, r.c)
 		delete(e.coalescing, r.c)
 		delete(e.snapshotted, r.c)
+		delete(e.afters, r.c)
 
 	case resumeReq:
 		for s, sub := range e.conns[r.c] {
@@ -717,7 +878,7 @@ func (e *engine) handleReq(ctx context.Context, i int, r any, outFor func(*conn)
 				delete(e.conns[r.c], s)
 			}
 		}
-		outFor(r.c).after = append(outFor(r.c).after, r.after)
+		e.afters[r.c] = append(e.afters[r.c], pendingAfter{p: cutoff, m: r.after})
 	}
 }
 
@@ -921,7 +1082,7 @@ type runResult struct {
 // candidate the changed rows can affect. Results are staged and applied only
 // once the snapshot transaction has committed, so a failure leaves every
 // observer exactly as it was.
-func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange) (err error) {
+func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, changes map[string]*tableChange, drained time.Time) (err error) {
 	// Pool hooks and tracers (BeforeAcquire, PrepareConn, ConnConfig.Tracer)
 	// run user code in BeginTx, the SET LOCAL and the candidate filter. A
 	// panic there fails the tick, which tick retries like a lost snapshot.
@@ -948,10 +1109,17 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", e.a.cfg.QueryTimeout.Milliseconds())); err != nil {
 		return err
 	}
+	var affected []*observer
 	if len(cands) > 0 {
-		affected, err := e.filterCandidates(ctx, tx, cands, changes)
-		if err != nil {
+		if affected, err = e.filterCandidates(ctx, tx, cands, changes); err != nil {
 			return err
+		}
+		// Affected candidates were dirtied by this drain. A failed tick
+		// marks every candidate dirty, keeping this time.
+		for _, obs := range affected {
+			if obs.dirtyAt.IsZero() {
+				obs.dirtyAt = drained
+			}
 		}
 		toRun = append(toRun, affected...)
 	}
@@ -1001,6 +1169,17 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
+	// Applied only once the snapshot commits: a failed tick leaves them
+	// stale and dirty.
+	ran := make(map[*observer]bool, len(affected))
+	for _, obs := range affected {
+		ran[obs] = true
+	}
+	for _, obs := range cands {
+		if !ran[obs] {
+			obs.staleFrom = 0 // fresh as of this snapshot
+		}
+	}
 	if e.a.cfg.Metrics != nil {
 		// Reported after the commit: runs of a failed snapshot are retried
 		// and would be counted twice.
@@ -1011,6 +1190,7 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	for _, r := range staged {
 		obs := r.obs
 		obs.dirty = false
+		obs.staleFrom, obs.dirtySince, obs.resTick = obs.dirtySince, 0, e.tickN
 		if r.err != nil {
 			obs.err = r.err
 			continue
@@ -1036,6 +1216,28 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		obs.cols, obs.keyIdx, obs.res = r.cols, r.keyIdx, r.res
 	}
 	return nil
+}
+
+// markStale records that obs does not reflect notification n.
+func (obs *observer) markStale(n uint64) {
+	if obs.staleFrom == 0 || n < obs.staleFrom {
+		obs.staleFrom = n
+	}
+}
+
+// freshPast reports whether obs's result reflects every notification up
+// to p. An observer with no result reflects nothing.
+func (obs *observer) freshPast(p uint64) bool {
+	return obs.res != nil && (obs.staleFrom == 0 || obs.staleFrom > p)
+}
+
+// markDirty marks obs to run, keeping the drain time of the first
+// notification it does not yet reflect.
+func (obs *observer) markDirty(drained time.Time) {
+	obs.dirty = true
+	if obs.dirtyAt.IsZero() {
+		obs.dirtyAt = drained
+	}
 }
 
 func (obs *observer) awaitsInit() bool {
@@ -1220,10 +1422,10 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 			}
 			continue
 		case revalChannel:
-			// Enqueued before a fence notified later on this connection, so
+			// Numbered before a fence notified later on this connection, so
 			// the re-check runs no later than the tick releasing the fence.
 			if n.Payload != "" {
-				e.enqueue(revalidateReq{users: map[string]bool{n.Payload: true}})
+				e.notify(notification{reval: n.Payload})
 			}
 			continue
 		}

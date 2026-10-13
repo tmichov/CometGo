@@ -106,7 +106,7 @@ Each distinct `(publication, args, scope)` combination has one server-side **obs
 - A panic in the pool's tracer (`ConnConfig.Tracer`) is recovered wherever the framework queries, and logged with its stack trace. While the engine reads its snapshot, the tick is retried with backoff, as when the database is unreachable, and subscriptions keep their last data until a tick succeeds. In a method call (begin, idempotency key, commit), the call fails with `INTERNAL`. On the `LISTEN` connection, the listener reconnects. The connection in use goes back to the pool. Panics in the pool's `BeforeAcquire` or `PrepareConn` hooks are recovered the same way, but pgxpool keeps the connection it was preparing, so each such panic takes one connection out of the pool for good. Don't panic in those hooks. When `Query.Args` panics, pgx never calls the tracer's `TraceQueryEnd` for that query, and the framework cannot do it instead, because the tracer's span lives in the context that `TraceQueryStart` returned to pgx. A span or timer started there is never ended.
 - Bad args (wrong types, unknown fields) end the subscription with `BAD_REQUEST`. An unknown publication name ends it with `NOT_FOUND`.
 
-All observers that need re-running in one tick run inside one `REPEATABLE READ READ ONLY` transaction, so every update a client receives comes from one consistent database snapshot.
+All observers that need re-running in one tick run inside one `REPEATABLE READ READ ONLY` transaction, so every update a client receives comes from one consistent database snapshot. *Planned (M3):* a query slower than a soft deadline will be detached and deliver its result later in its own update. Each update will still come from one snapshot, but two subscriptions on one connection may then sit at different snapshots for a while ([protocol §6.1, §8.4](protocol.md#84-later-slow-observers)).
 
 ### PubOptions
 
@@ -501,7 +501,7 @@ Set `Config.Metrics` to receive health measurements, for example to feed Prometh
 ```go
 type Metric struct {
 	Name  string  // one of the Metric* constants below
-	Pub   string  // the publication, for MetricPubRun; "" otherwise
+	Pub   string  // the publication, for MetricPubRun and MetricStale; "" otherwise
 	Value float64 // seconds for durations, a number otherwise
 }
 ```
@@ -519,6 +519,7 @@ type Metric struct {
 | `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed as a slow consumer: its queue went over 8 MiB, or a write timed out. A write that fails because the peer went away also closes with 4429, but is not counted |
 | `MetricListenReconnect` (`listen_reconnects`) | counter | 1 per failed `LISTEN` attempt: each drop, and each failed reconnect during an outage (retried with backoff up to 10 s) |
 | `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` set, reported once the tick's snapshot commits |
+| `MetricStale` (`stale_seconds`) | duration | per observer result delivered after a change, with `Pub` set: from the tick that drained the first notification the observer's old result did not reflect, until its new result was enqueued to its subscribers (or held for a [coalescing](#slow-clients) connection). A run only to snapshot a new subscription, or a Match candidate the change cannot affect, reports nothing |
 
 Gauges are the current value, so map them to a gauge and set it; a counter is reported as `1` per occurrence; a duration is one observation, for a histogram. A tick happens only when there is work (a change, a request, a timer), so an idle server reports no gauges until something happens.
 

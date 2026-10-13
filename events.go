@@ -206,25 +206,53 @@ func parseEvt(payload string) (*evtNote, bool) {
 	return &n, true
 }
 
-// deliverEvents sends each event to every sub of its observer whose client
-// negotiated the evt cap, except on coalescing connections. It runs after the tick's tx is enqueued and before
-// its fences are released, so an event follows the data committed before it
-// and precedes the res of the call that emitted it.
-func (e *engine) deliverEvents(evts []*evtNote) {
-	for _, n := range evts {
-		obs := e.observers[observerKey(n.Pub, n.Args, n.Scope)]
+// deliverEvents sends each event drained this tick, and each held one, to
+// every sub of its observer whose client negotiated the evt cap, once the
+// observer reflects every change notified before the event. An observer's
+// events go out in order; one still stale holds them. It runs after the
+// tick's tx is enqueued and before its fences are released, so an event
+// follows the data committed before it and precedes the res of the call
+// that emitted it.
+func (e *engine) deliverEvents(evts []heldEvt) {
+	// Held events are older than this drain's, so they go first.
+	for obs := range e.heldEvts {
+		if e.observers[obs.key] != obs {
+			delete(e.heldEvts, obs) // unsubscribed: at-most-once means dropped
+			continue
+		}
+		for len(obs.evts) > 0 && obs.freshPast(obs.evts[0].n) {
+			e.sendEvent(obs, obs.evts[0].note)
+			obs.evts = obs.evts[1:]
+		}
+		if len(obs.evts) == 0 {
+			obs.evts = nil
+			delete(e.heldEvts, obs)
+		}
+	}
+	for _, h := range evts {
+		obs := e.observers[observerKey(h.note.Pub, h.note.Args, h.note.Scope)]
 		if obs == nil || !obs.pub.opts.Events {
 			continue // nobody subscribed: at-most-once means dropped
 		}
-		// Map order: the order across subs means nothing to a client, and
-		// each sub still gets the events in emit order.
-		for sub := range obs.subs {
-			// A coalescing connection (§8.1) gets no events: a held sub is
-			// behind the data the event follows, and queueing them would
-			// grow its memory with the event rate. At-most-once allows it.
-			if sub.c.evt && !e.coalescing[sub.c] {
-				sub.c.sendEvent(&evtMsg{T: "evt", S: sub.s, Topic: n.Topic, Data: n.Data})
-			}
+		if len(obs.evts) == 0 && obs.freshPast(h.n) {
+			e.sendEvent(obs, h.note)
+			continue
+		}
+		obs.evts = append(obs.evts, h)
+		e.heldEvts[obs] = true
+	}
+}
+
+func (e *engine) sendEvent(obs *observer, n *evtNote) {
+	// Map order: the order across subs means nothing to a client, and
+	// each sub still gets the events in emit order.
+	for sub := range obs.subs {
+		// A coalescing connection (§8.1) gets no events: a held sub is
+		// behind the data the event follows, and queueing them would grow
+		// its memory with the event rate. Nor does a sub whose snapshot is
+		// unsent. At-most-once allows both.
+		if sub.c.evt && !e.coalescing[sub.c] && !sub.needInit && !sub.needsReset {
+			sub.c.sendEvent(&evtMsg{T: "evt", S: sub.s, Topic: n.Topic, Data: n.Data})
 		}
 	}
 }
