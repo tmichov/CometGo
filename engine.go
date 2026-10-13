@@ -41,6 +41,8 @@ type engine struct {
 	// After listenIdle without a notification, the listener checks its
 	// connection with a query that must answer within listenProbe.
 	listenIdle, listenProbe time.Duration
+	// Bounds each listener connect when the DSN sets no connect_timeout.
+	listenConnect time.Duration
 
 	// Owned by the run goroutine.
 	observers map[string]*observer
@@ -186,6 +188,9 @@ func newEngine(a *App) *engine {
 		pgTypes:     map[uint32]string{},
 		listenIdle:  30 * time.Second,
 		listenProbe: 5 * time.Second,
+		// Under the OS TCP connect timeout (about 2 min on Linux), so a
+		// path that is still dead is retried soon after it comes back.
+		listenConnect: 10 * time.Second,
 	}
 }
 
@@ -1024,6 +1029,9 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 	// could cancel the probe instead.
 	cfg.BuildContextWatcherHandler = func(c *pgconn.PgConn) ctxwatch.Handler {
 		return &pgconn.DeadlineContextWatcherHandler{Conn: c.Conn()}
+	}
+	if cfg.ConnectTimeout == 0 {
+		cfg.ConnectTimeout = e.listenConnect
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {

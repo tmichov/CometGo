@@ -121,6 +121,7 @@ func setupProxied(t *testing.T, tweak func(*Config)) (*testEnv, *pauseProxy) {
 		}
 	}, func(_ *testEnv, app *App) {
 		app.engine.listenIdle, app.engine.listenProbe = 300*time.Millisecond, 200*time.Millisecond
+		app.engine.listenConnect = 300 * time.Millisecond
 	})
 	// Before the app's own cleanup (LIFO), so a test that fails while paused
 	// does not hang its shutdown.
@@ -188,6 +189,39 @@ func TestListenerProbesOnlyWhenIdle(t *testing.T) {
 	for deadline := time.Now().Add(3 * time.Second); lastQuery() != "SELECT 1"; time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("idle listener never probed")
+		}
+	}
+}
+
+// While the path stays dead, each reconnect attempt gives up after
+// listenConnect instead of waiting for the OS TCP timeout, and the first
+// attempt after the path is back succeeds.
+func TestListenerReconnectAttemptIsBounded(t *testing.T) {
+	log := &metricLog{}
+	e, proxy := setupProxied(t, func(c *Config) { c.Metrics = log.hook })
+	e.waitListening(t)
+	before := e.listened()
+	reconnects := func() int {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		return len(log.seen[MetricListenReconnect])
+	}
+
+	proxy.pause()
+	// The probe drops the old connection, then attempts made while paused
+	// time out: several reconnects, none of which LISTENs.
+	for deadline := time.Now().Add(5 * time.Second); reconnects() < 3; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d listener reconnects while the path was dead, want at least 3", reconnects())
+		}
+	}
+	if e.listened() != before {
+		t.Fatal("listened through a dead path")
+	}
+	proxy.resume()
+	for deadline := time.Now().Add(5 * time.Second); e.listened() == before; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("listener did not reconnect after the path came back")
 		}
 	}
 }
