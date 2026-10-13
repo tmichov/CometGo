@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 )
 
 // The engine owns all observers and subscriptions. Only its run goroutine
@@ -37,6 +38,9 @@ type engine struct {
 	// notification is queued. So a commit, together with its fence's mark,
 	// lands wholly before or wholly after each LISTEN.
 	listenMu sync.RWMutex
+	// After listenIdle without a notification, the listener checks its
+	// connection with a query that must answer within listenProbe.
+	listenIdle, listenProbe time.Duration
 
 	// Owned by the run goroutine.
 	observers map[string]*observer
@@ -180,6 +184,8 @@ func newEngine(a *App) *engine {
 		coalescing:  map[*conn]bool{},
 		snapshotted: map[*conn]int{},
 		pgTypes:     map[uint32]string{},
+		listenIdle:  30 * time.Second,
+		listenProbe: 5 * time.Second,
 	}
 }
 
@@ -1022,7 +1028,14 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 	// code runs here too. A panic in it drops the connection like a network
 	// error, and run reconnects.
 	defer recoverErr(&err)
-	conn, err := pgx.ConnectConfig(ctx, e.a.db.Config().ConnConfig.Copy())
+	cfg := e.a.db.Config().ConnConfig.Copy()
+	// An idle wait that times out must leave the connection usable for the
+	// probe: interrupt it with a read deadline, never a cancel request, which
+	// could cancel the probe instead.
+	cfg.BuildContextWatcherHandler = func(c *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.DeadlineContextWatcherHandler{Conn: c.Conn()}
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1046,7 +1059,23 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 	}
 	listenedAt = time.Now()
 	for {
-		n, err := conn.WaitForNotification(ctx)
+		waitCtx, cancel := context.WithTimeout(ctx, e.listenIdle)
+		n, err := conn.WaitForNotification(waitCtx)
+		idle := waitCtx.Err() != nil && ctx.Err() == nil
+		cancel()
+		if err != nil && idle {
+			// Quiet for listenIdle: check the connection still answers. A path
+			// that died without a TCP reset (failover, black hole) would go
+			// unnoticed for minutes otherwise, with every subscription stale.
+			// Notifications arriving meanwhile are buffered by pgx.
+			probeCtx, cancel := context.WithTimeout(ctx, e.listenProbe)
+			_, err = conn.Exec(probeCtx, "SELECT 1")
+			cancel()
+			if err != nil {
+				return listenedAt, fmt.Errorf("listener probe: %w", err)
+			}
+			continue
+		}
 		if err != nil {
 			return listenedAt, err
 		}
