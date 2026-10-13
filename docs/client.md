@@ -56,7 +56,7 @@ A function token source is called on every (re)connect, so it can return a fresh
 | `call<R>(m, args?, opts?): Promise<R>` | Calls a method. See [Calls](#calls). |
 | `callWithStatus<R>(m, args?, opts?): Promise<{ value: R; lag: boolean }>` | Like `call`, but also reports `lag`. |
 | `setToken(token: TokenSource): Promise<unknown>` | Logs in, refreshes, or logs out. See [Auth](#auth). |
-| `close(): void` | Closes the connection for good and stops reconnecting. It also removes the `online` and `visibilitychange` listeners the client added, so a closed client can be garbage-collected. |
+| `close(): void` | Closes the connection for good and stops reconnecting. It also removes the `online` and `visibilitychange` listeners the client added, so a closed client can be garbage-collected. Calls still waiting are rejected: those already sent with `CONNECTION_LOST` (their outcome is unknown), those never sent with `CANCELED`. A call made after `close()` is rejected at once with `CANCELED`. |
 
 ## Subscriptions
 
