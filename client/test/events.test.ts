@@ -41,7 +41,7 @@ afterEach(() => comet?.close());
 async function connected(): Promise<FakeWS> {
   FakeWS.all = [];
   comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
-  await Promise.resolve(); // #open awaits the token source
+  await new Promise((r) => setImmediate(r)); // #open awaits the token source
   const ws = FakeWS.all[0];
   ws.readyState = 1;
   ws.onopen!();

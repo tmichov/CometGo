@@ -42,7 +42,7 @@ let root: ReturnType<typeof createRoot>;
 
 beforeEach(async () => {
   comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
-  await Promise.resolve(); // #open awaits the token source
+  await new Promise((r) => setImmediate(r)); // #open awaits the token source
   ws = FakeWS.last;
   ws.readyState = 1;
   ws.onopen!();
@@ -218,7 +218,7 @@ test("swapping the provider's client does not show the old client's stopped sub"
   server({ t: "tx", seq: 1, subs: [snapshot(1, [["1", "a"]])] });
   const oldWs = ws;
   const comet2 = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
-  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
   const ws2 = FakeWS.last;
   ws2.readyState = 1;
   ws2.onopen!();

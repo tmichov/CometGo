@@ -48,7 +48,7 @@ async function start(): Promise<FakeWS> {
   mock.timers.enable({ apis: ["setTimeout"] });
   FakeWS.all = [];
   comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
-  await Promise.resolve(); // #open awaits the token source
+  await new Promise((r) => setImmediate(r)); // #open awaits the token source
   const ws = FakeWS.all[0];
   ws.open();
   ws.recv(welcome);
@@ -60,10 +60,10 @@ test("after goaway the client reconnects after retryInMs, not the backoff", asyn
   ws.recv({ t: "goaway", reason: "restart", retryInMs: 1500 });
   ws.closeWith(4503);
   mock.timers.tick(1499);
-  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
   assert.equal(FakeWS.all.length, 1, "reconnected early");
   mock.timers.tick(1);
-  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
   assert.equal(FakeWS.all.length, 2);
 });
 
@@ -84,7 +84,7 @@ test("calls made after goaway wait for the next connection", async () => {
   assert.equal(ws.of("call").length, 0, "sent to a server that is going away");
   ws.closeWith(4503);
   mock.timers.tick(0);
-  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
   const next = FakeWS.all[1];
   next.open();
   next.recv({ ...welcome, session: "s_2" });
@@ -99,7 +99,7 @@ test("the delay applies to one reconnect only", async () => {
   ws.recv({ t: "goaway", reason: "restart", retryInMs: 4000 });
   ws.closeWith(4503);
   mock.timers.tick(4000);
-  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
   const next = FakeWS.all[1];
   next.open();
   next.recv({ ...welcome, session: "s_2" });
@@ -107,6 +107,6 @@ test("the delay applies to one reconnect only", async () => {
   // the first attempt), not the old retryInMs.
   next.closeWith(1006);
   mock.timers.tick(500);
-  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
   assert.equal(FakeWS.all.length, 3);
 });

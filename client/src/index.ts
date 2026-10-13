@@ -324,15 +324,10 @@ export class Comet {
   async #open(): Promise<void> {
     if (this.#closed) return;
     this.#setStatus("connecting");
-    // #credential inlined: one microtask fewer before the socket exists, which
-    // the tests' handshake helpers count on.
-    let cred = { source: this.#opts.token, token: null as string | null };
-    try {
-      cred.token = await resolveToken(cred.source);
-    } catch (e) {
+    const first = await this.#credential();
+    if (!first) {
       // Connecting anonymously would end a resumable session and look like a
       // logout (§7.2), so retry with backoff instead.
-      console.warn("cometgo: token source failed; retrying", e);
       if (this.#closed || this.#ws) return;
       this.#setStatus("disconnected");
       this.#scheduleReconnect();
@@ -342,6 +337,7 @@ export class Comet {
     // have started another #open that already has its socket.
     if (this.#closed || this.#ws) return;
     const WS = this.#opts.WebSocket ?? WebSocket;
+    let cred = first;
     const ws = new WS(this.#opts.url ?? defaultUrl(), [SUBPROTOCOL]);
     this.#ws = ws;
     this.#helloSent = false;
@@ -354,7 +350,10 @@ export class Comet {
       this.#goaway = undefined;
       // A setToken while the socket was opening: hello carries its token.
       while (cred.source !== this.#opts.token) {
-        cred = await this.#credential();
+        const source = this.#opts.token;
+        // shortcut: a throw here still connects anonymously, unlike in #open;
+        // closing this socket so #onDisconnect reconnects would fix it.
+        cred = (await this.#credential()) ?? { source, token: null };
         if (this.#ws !== ws || ws.readyState !== 1) return;
       }
       const { token } = cred;
@@ -383,14 +382,15 @@ export class Comet {
     };
   }
 
-  // The stored token source and its token.
-  async #credential(): Promise<{ source: TokenSource | undefined; token: string | null }> {
+  // The stored token source and its token, or undefined (logged) if the
+  // source threw.
+  async #credential(): Promise<{ source: TokenSource | undefined; token: string | null } | undefined> {
     const source = this.#opts.token;
     try {
       return { source, token: await resolveToken(source) };
     } catch (e) {
       console.warn("cometgo: token source failed", e);
-      return { source, token: null };
+      return undefined;
     }
   }
 
