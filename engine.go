@@ -565,7 +565,13 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	})
 	var toRun []*observer
 	for _, obs := range e.observers {
-		if (obs.dirty || obs.res == nil || obs.awaitsInit() || resetFor[obs]) && !obs.inFlight && !isDeferred(obs) {
+		due := obs.dirty || obs.res == nil || obs.awaitsInit() || resetFor[obs]
+		switch {
+		case !due:
+			// Its awaiting sub left before it ran: it has no place in line
+			// to keep.
+			obs.dueFrom = 0
+		case !obs.inFlight && !isDeferred(obs):
 			if obs.staleFrom == 0 && obs.dueFrom == 0 {
 				obs.dueFrom = cutoff + 1
 			}
