@@ -175,7 +175,10 @@ type conn struct {
 	// a cancel takes effect only before the handler returns.
 	running map[uint64]*runningCall
 
-	authMu   sync.Mutex // serializes identity changes
+	authMu sync.Mutex // serializes identity changes
+	// authTail is closed when the last auth message's handler returns; the
+	// next one waits for it, so auth messages apply in arrival order. c.mu.
+	authTail chan struct{}
 	inflight atomic.Int32
 	// retryIn is the retryInMs of the goaway sent to this session; calls
 	// refused during shutdown carry it as retryAfterMs.
@@ -692,7 +695,21 @@ func (c *conn) dispatch(s *socket, msg *clientMsg) {
 		if !c.firstSeen(*msg.ID) {
 			return
 		}
-		go c.reauth(*msg.ID, msg.Token)
+		// On its own goroutine, since Authenticate may be slow, but after
+		// the previous auth: authMu alone would not keep their order.
+		id, token := *msg.ID, msg.Token
+		done := make(chan struct{})
+		c.mu.Lock()
+		prev := c.authTail
+		c.authTail = done
+		c.mu.Unlock()
+		go func() {
+			defer close(done)
+			if prev != nil {
+				<-prev
+			}
+			c.reauth(id, token)
+		}()
 	case "ack":
 		if msg.Seq != nil {
 			c.mu.Lock()
