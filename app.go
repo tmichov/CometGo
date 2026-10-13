@@ -161,6 +161,10 @@ type Config struct {
 	// idempotency key is kept for retries. Default 24h.
 	IdempotencyTTL time.Duration
 
+	// FnWorkers caps the publication fn calls a tick runs at once, for the
+	// subs, identity changes and Revalidate re-checks it handles. Default 8.
+	FnWorkers int
+
 	MaxSubs     int // default 500
 	MaxInflight int // default 32
 	MaxMsg      int // default 1 MiB
@@ -269,6 +273,7 @@ func New(cfg Config) *App {
 		cfg.MaxDetached = 0
 	}
 	def(&cfg.IdempotencyTTL, 24*time.Hour)
+	defi(&cfg.FnWorkers, 8)
 	defi(&cfg.MaxSubs, 500)
 	defi(&cfg.MaxInflight, 32)
 	defi(&cfg.MaxMsg, 1<<20)
