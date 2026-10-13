@@ -449,9 +449,11 @@ func TestRevalidateDedupesPerTick(t *testing.T) {
 	eng := e.app.engine
 	eng.mu.Lock()
 	for range 50 {
-		eng.reqs = append(eng.reqs, revalidateReq{users: map[string]bool{"alice": true}})
+		eng.nextN++
+		eng.pending = append(eng.pending, notification{n: eng.nextN, reval: "alice"})
 	}
-	eng.reqs = append(eng.reqs, revalidateReq{users: map[string]bool{"bob": true}})
+	eng.nextN++
+	eng.pending = append(eng.pending, notification{n: eng.nextN, reval: "bob"})
 	eng.mu.Unlock()
 	eng.signal()
 	// The call's fence is released by a tick that drained the requests.

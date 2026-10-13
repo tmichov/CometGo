@@ -22,6 +22,7 @@ import (
 // tableChange is what one tick learned about one table: the changed primary
 // keys, or all when a table-dirty marker (or anything unparseable) arrived.
 type tableChange struct {
+	n    uint64 // the first notification for the table in this drain
 	all  bool
 	keys []json.RawMessage // each a JSON array of PK values, wire-encoded
 }
