@@ -3,8 +3,16 @@ package cometgo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"slices"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestParseArrayLiteral(t *testing.T) {
@@ -136,5 +144,92 @@ func TestUserEnumCreatedWhileRunning(t *testing.T) {
 	en := entries(a.next())[0]
 	if cols := fmt.Sprint(en["init"].(map[string]any)["cols"]); cols != "[[id i4] [m enum]]" {
 		t.Fatalf("cols %s", cols)
+	}
+}
+
+// The type lookup takes a second connection while its caller holds one. With
+// the rest of the pool held elsewhere it fails after QueryTimeout instead of
+// waiting forever: Describe returns the error, and a tick retries without
+// ending the sub, which gets its snapshot once a connection frees.
+func TestTypeLookupBoundedWhenPoolExhausted(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	logs := &errLogs{}
+	var pool *pgxpool.Pool
+	var table string
+	e := setupFull(t, func(c *Config) {
+		cfg, err := pgxpool.ParseConfig(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.MaxConns = 2
+		if pool, err = pgxpool.NewWithConfig(context.Background(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		c.DB, c.QueryTimeout, c.Logger = pool, timeout, slog.New(logs)
+	}, func(e *testEnv, app *App) {
+		table = e.table + "_m"
+		mood := "mood_" + e.table[len("items_"):]
+		for _, ddl := range []string{
+			fmt.Sprintf("CREATE TYPE %s AS ENUM ('happy', 'sad')", mood),
+			fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, m %s)", table, mood),
+			fmt.Sprintf("INSERT INTO %s VALUES (1, 'happy')", table),
+		} {
+			if _, err := e.pool.Exec(context.Background(), ddl); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Cleanup(func() {
+			e.pool.Exec(context.Background(), "DROP TABLE "+table)
+			e.pool.Exec(context.Background(), "DROP TYPE "+mood)
+		})
+		if err := InstallTriggers(context.Background(), e.pool, table); err != nil {
+			t.Fatal(err)
+		}
+		Publish(app, "moods", PubOptions{Tables: []string{table}, Scope: ScopeShared},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT id, m FROM " + table + " ORDER BY id"}, nil
+			})
+	})
+	held, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if held != nil {
+			held.Release()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = Describe(ctx, e.app, DescribeOptions{Identity: &Identity{UserID: "u"}})
+	if !errors.Is(err, errTypeLookup) || time.Since(start) > 4*timeout {
+		t.Fatalf("Describe: %v after %v, want a type lookup error after ~%v", err, time.Since(start), timeout)
+	}
+
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "moods"})
+	deadline := time.Now().Add(5 * time.Second)
+	tickFailed := func() bool {
+		logs.mu.Lock()
+		defer logs.mu.Unlock()
+		return slices.ContainsFunc(logs.errs, func(s string) bool { return strings.Contains(s, "look up column types") })
+	}
+	for !tickFailed() {
+		if time.Now().After(deadline) {
+			t.Fatal("tick never failed its type lookup")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	held.Release()
+	held = nil
+	en := entries(a.next())[0]
+	if en["end"] != nil {
+		t.Fatalf("sub ended: %v", en["end"])
+	}
+	if ops, _ := json.Marshal(en["ops"]); string(ops) != `[["i","1",[1,"happy"],0]]` {
+		t.Fatalf("ops %s", ops)
 	}
 }

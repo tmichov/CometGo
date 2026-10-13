@@ -836,6 +836,11 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		if e.a.cfg.Metrics != nil {
 			r.took = time.Since(start)
 		}
+		if errors.Is(qerr, errTypeLookup) {
+			// Not this observer's fault (e.g. the pool is exhausted): retry
+			// the tick rather than end its subs.
+			return qerr
+		}
 		if qerr != nil {
 			if err := sp.Rollback(ctx); err != nil {
 				return err

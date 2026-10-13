@@ -36,7 +36,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 
 | Field | Default | Meaning |
 |---|---|---|
-| `DB *pgxpool.Pool` | required | Pool used for publication queries and method transactions. The `LISTEN` connection is opened separately with the pool's connection config, so it is not one of the pool's connections and does not count against `MaxConns`. Needs `MaxConns` of at least 2 (`pool_max_conns`): a tick holds one connection while it looks up column types on another. |
+| `DB *pgxpool.Pool` | required | Pool used for publication queries and method transactions. The `LISTEN` connection is opened separately with the pool's connection config, so it is not one of the pool's connections and does not count against `MaxConns`. Needs `MaxConns` of at least 2 (`pool_max_conns`): a tick holds one connection while it looks up column types on another. If the pool stays exhausted (for example, handlers hold the other connections), that lookup fails after `QueryTimeout` and the tick retries with backoff, so live updates pause rather than hang. |
 | `Authenticate` | nil | Validates bearer tokens. See [Authentication](#authentication). If nil, every token is rejected with `UNAUTHENTICATED`. |
 | `AuthenticateRequest` | nil | Resolves a cookie-session identity at WebSocket upgrade. See [Authentication](#authentication). |
 | `Build string` | `""` | Identifies the current client build. Sent to clients in `welcome`, where the client exposes it as `comet.serverBuild`. The server does not compare it with anything. |
@@ -45,7 +45,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `MinTickInterval` | 20ms | Minimum time between engine ticks. Bursts of changes inside the interval are coalesced into one re-run. |
 | `FenceTimeout` | 5s | How long a method result waits for its writes to reach the caller's subscriptions. After that the result is sent with `lag: true`. |
 | `IdempotencyTTL` | 24h | How long the result of a call carrying an [idempotency key](#idempotency-keys) is kept. A retry after that runs the method again. Keep it above an hour: the TypeScript client retries a call for up to an hour after first sending it. |
-| `QueryTimeout` | 30s | Hard `statement_timeout` for publication queries. A query that exceeds it ends its subscriptions with `TIMEOUT`. |
+| `QueryTimeout` | 30s | Hard `statement_timeout` for publication queries. A query that exceeds it ends its subscriptions with `TIMEOUT`. Also bounds the column-type lookup for user-defined types, including the wait for its pool connection. |
 | `MaxSubs int` | 500 | Subscriptions per connection. A subscription over the limit is ended with `RATE_LIMITED`. |
 | `MaxInflight int` | 32 | Concurrent method calls per connection. A call over the limit gets `RATE_LIMITED` with `retryAfterMs: 100`. |
 | `MaxMsg int` | 1 MiB | Largest message the server accepts from a client. A larger message closes the connection. |
