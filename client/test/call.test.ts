@@ -264,3 +264,78 @@ test("a failed setToken rejects and keeps the current user; only an expiry clear
   ws.recv({ t: "authRes", seq: 3, ok: false, err: { code: "AUTH_EXPIRED" } });
   assert.equal(comet.user, null);
 });
+
+test("a refused setToken is not sent on the next connection; the previous token is", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const login = comet.setToken("A");
+  await tick();
+  ws.recv({ t: "authRes", seq: 1, id: ws.of("auth")[0].id, ok: true, user: { id: "alice" } });
+  await login;
+
+  const refresh = comet.setToken("B");
+  await tick();
+  ws.recv({ t: "authRes", seq: 2, id: ws.of("auth")[1].id, ok: false, err: { code: "UNAUTHENTICATED" } });
+  await assert.rejects(refresh);
+
+  ws.drop();
+  const ws2 = await nextSocket(ws);
+  ws2.connect();
+  await tick(); // #open awaits the token source before hello
+  assert.equal(ws2.of("hello")[0].auth?.token, "A");
+});
+
+test("a refusal does not undo a newer setToken", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const b = comet.setToken("B");
+  await tick();
+  const c = comet.setToken("C");
+  await tick();
+  ws.recv({ t: "authRes", seq: 1, id: ws.of("auth")[0].id, ok: false, err: { code: "UNAUTHENTICATED" } });
+  await assert.rejects(b);
+  ws.recv({ t: "authRes", seq: 2, id: ws.of("auth")[1].id, ok: true, user: { id: "carol" } });
+  await c;
+
+  ws.drop();
+  const ws2 = await nextSocket(ws);
+  ws2.connect();
+  await tick();
+  assert.equal(ws2.of("hello")[0].auth?.token, "C");
+});
+
+test("two refused setTokens in a row fall back to the last accepted token", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const a = comet.setToken("A");
+  await tick();
+  ws.recv({ t: "authRes", seq: 1, id: ws.of("auth")[0].id, ok: true, user: { id: "alice" } });
+  await a;
+  const b = comet.setToken("B");
+  await tick();
+  const c = comet.setToken("C");
+  await tick();
+  ws.recv({ t: "authRes", seq: 2, id: ws.of("auth")[1].id, ok: false, err: { code: "UNAUTHENTICATED" } });
+  ws.recv({ t: "authRes", seq: 3, id: ws.of("auth")[2].id, ok: false, err: { code: "UNAUTHENTICATED" } });
+  await assert.rejects(b);
+  await assert.rejects(c);
+
+  ws.drop();
+  const ws2 = await nextSocket(ws);
+  ws2.connect();
+  await tick();
+  assert.equal(ws2.of("hello")[0].auth?.token, "A");
+});
+
+test("a setToken lost with the connection stays stored: the server may have accepted it", async () => {
+  const ws = FakeWS.last;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const b = comet.setToken("B");
+  await tick();
+  ws.drop();
+  await lostConnection(b);
+  const ws2 = await nextSocket(ws);
+  ws2.connect();
+  await tick();
+  assert.equal(ws2.of("hello")[0].auth?.token, "B");
+});
