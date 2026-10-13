@@ -33,6 +33,7 @@ interface Entry {
   refs: number;
   stopTimer?: ReturnType<typeof setTimeout>;
   stopped?: boolean; // sub.stop() was called; it will never update again
+  endLogin?: number; // the registry's login count when the server ended the sub
   snap?: SubState<any>;
 }
 
@@ -50,9 +51,29 @@ interface Lease {
 class Registry {
   readonly comet: Comet;
   #entries = new Map<string, Entry>();
+  // Counts changes of comet.user to a different, non-null user. A sub the
+  // server ended (e.g. FORBIDDEN) is asked for again after one; a logout
+  // would only be refused again, and a same-user refresh changes nothing.
+  logins = 0;
+  #user: string;
+  #loginListeners = new Set<() => void>();
 
   constructor(comet: Comet) {
     this.comet = comet;
+    this.#user = JSON.stringify(comet.user);
+    comet.onChange(() => {
+      const u = JSON.stringify(comet.user);
+      if (u === this.#user) return;
+      this.#user = u;
+      if (comet.user === null) return;
+      this.logins++;
+      for (const fn of this.#loginListeners) fn();
+    });
+  }
+
+  onLogin(fn: () => void): () => void {
+    this.#loginListeners.add(fn);
+    return () => this.#loginListeners.delete(fn);
   }
 
   /** The live entry for key, if any, without taking a reference. */
@@ -66,8 +87,13 @@ class Registry {
     // A sub the server ended stays ended for its current holders, but a new
     // acquire (e.g. after login) asks again.
     if (!e || e.sub.status === "ended") {
-      e = { key, sub: this.comet.subscribe(name, args), refs: 0 };
-      this.#entries.set(key, e);
+      const entry: Entry = { key, sub: this.comet.subscribe(name, args), refs: 0 };
+      // The end's tx arrives before the authRes that changes the user (§3.2),
+      // so a login counted after this belongs to the new identity.
+      entry.sub.subscribe(() => {
+        if (entry.sub.status === "ended") entry.endLogin ??= this.logins;
+      });
+      this.#entries.set(key, (e = entry));
     }
     clearTimeout(e.stopTimer);
     e.stopTimer = undefined;
@@ -164,8 +190,21 @@ export function useSubscription<T = Record<string, unknown>>(name: string, args?
   const registry = useRegistry();
   const key = subKey(name, args);
   const [shown, setShown] = useState<Lease | null>(null);
+  // Bumped to acquire again when the shown sub ended before a login.
+  const [retry, setRetry] = useState(0);
   // Every lease this component holds; at rest, exactly the shown one.
   const held = useRef(new Set<Lease>());
+  const shownEntry = showable(shown, registry) ? shown!.entry : undefined;
+
+  useEffect(() => {
+    const e = shownEntry;
+    if (!e) return;
+    const check = () => {
+      if (e.endLogin !== undefined && registry.logins > e.endLogin) setRetry((n) => n + 1);
+    };
+    check(); // a login may have landed before this effect ran
+    return registry.onLogin(check);
+  }, [registry, shownEntry]);
 
   useEffect(() => {
     const lease = registry.acquire(key, name, args);
@@ -203,7 +242,7 @@ export function useSubscription<T = Record<string, unknown>>(name: string, args?
     };
     // `shown` is read only to decide whether to wait; re-running on it
     // would re-acquire.
-  }, [registry, key]);
+  }, [registry, key, retry]);
 
   useEffect(() => {
     const leases = held.current;
@@ -216,7 +255,7 @@ export function useSubscription<T = Record<string, unknown>>(name: string, args?
   // What is on screen: the shown sub while it is still live, else whatever
   // this key already has in the registry (another component's ready sub, or
   // ours during a remount), else loading.
-  const entry = showable(shown, registry) ? shown!.entry : registry.peek(key);
+  const entry = shownEntry ?? registry.peek(key);
   return useSyncExternalStore(
     entry ? entry.sub.subscribe : noopSubscribe,
     entry ? () => snapshot<T>(entry) : loadingSnapshot,
