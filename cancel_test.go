@@ -55,15 +55,16 @@ func TestCancelDuringSleepRollsBack(t *testing.T) {
 
 func TestContextOutlivesAFinishedCall(t *testing.T) {
 	// c.Context is cancelled only by the client's cancel, not when the call ends.
-	e := setup(t)
 	got := make(chan error, 1)
-	Method(e.app, "keepCtx", func(c *Call, _ struct{}) (struct{}, error) {
-		ctx := c.Context
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			got <- ctx.Err()
-		}()
-		return struct{}{}, nil
+	e := setupFull(t, nil, func(_ *testEnv, app *App) {
+		Method(app, "keepCtx", func(c *Call, _ struct{}) (struct{}, error) {
+			ctx := c.Context
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				got <- ctx.Err()
+			}()
+			return struct{}{}, nil
+		})
 	})
 	a, _ := e.dial(t, nil)
 	a.send(map[string]any{"t": "call", "id": 1, "m": "keepCtx"})

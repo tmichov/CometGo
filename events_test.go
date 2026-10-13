@@ -172,7 +172,12 @@ func TestEventsAreNotReplayedAfterReconnect(t *testing.T) {
 }
 
 func TestEmitErrors(t *testing.T) {
-	e := setupEvents(t)
+	e := setupFull(t, nil, func(env *testEnv, app *App) {
+		Publish(app, "items.quiet", PubOptions{Tables: []string{env.table}}, func(c *SubCtx, _ struct{}) (Query, error) {
+			return Query{SQL: "SELECT id FROM " + env.table}, nil
+		})
+	})
+	e.waitListening(t)
 	ctx := context.Background()
 	big := strings.Repeat("x", maxEvtPayload)
 	if err := e.app.Emit(ctx, "items.all", nil, "", "big", big); !errors.Is(err, ErrEventTooLarge) {
@@ -181,9 +186,6 @@ func TestEmitErrors(t *testing.T) {
 	if err := e.app.Emit(ctx, "nope", nil, "", "t", nil); err == nil {
 		t.Fatal("unknown publication accepted")
 	}
-	Publish(e.app, "items.quiet", PubOptions{Tables: []string{e.table}}, func(c *SubCtx, _ struct{}) (Query, error) {
-		return Query{SQL: "SELECT id FROM " + e.table}, nil
-	})
 	if err := e.app.Emit(ctx, "items.quiet", nil, "", "t", nil); err == nil || !strings.Contains(err.Error(), "Events") {
 		t.Fatalf("err %v, want Events not enabled", err)
 	}
