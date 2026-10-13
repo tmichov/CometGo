@@ -4,12 +4,14 @@ import { connect, CometError, type Comet } from "../src/index.ts";
 
 class FakeWS {
   static last: FakeWS;
+  static count = 0;
   readyState = 0;
   sent: any[] = [];
   onopen?: () => void;
   onmessage?: (ev: { data: string }) => void;
   onclose?: (ev: { code: number; reason: string }) => void;
   constructor() {
+    FakeWS.count++;
     FakeWS.last = this;
   }
   send(data: string): void {
@@ -508,4 +510,93 @@ test("close() during a goaway rejects the held-back call with CANCELED", async (
   assert.equal(ws.of("call").length, 0);
   comet.close();
   await assert.rejects(p, (e: unknown) => e instanceof CometError && e.code === "CANCELED");
+});
+
+
+// Runs fn with fake setTimeout, Math.random() = 1 (backoff takes its full
+// delay) and console.warn silenced, after closing the default client.
+async function withFakeTimers(fn: (flush: () => Promise<void>) => Promise<void>): Promise<void> {
+  comet.close();
+  mock.timers.enable({ apis: ["setTimeout"] });
+  mock.method(Math, "random", () => 1);
+  mock.method(console, "warn", () => {});
+  try {
+    await fn(async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+  } finally {
+    mock.timers.reset();
+    mock.restoreAll();
+  }
+}
+
+test("a token function that throws once is retried; the session resumes with the token, no anonymous hello", async () => {
+  await withFakeTimers(async (flush) => {
+    let n = 0;
+    const token = () => {
+      if (++n === 2) throw new Error("auth service down");
+      return "T";
+    };
+    comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any, token });
+    await flush();
+    const ws = FakeWS.last;
+    ws.connect();
+    ws.recv({ t: "welcome", session: "s_1", hb: 25000, user: { id: "a" }, caps: ["resume"] });
+    const p = comet.call("m");
+    const before = FakeWS.count;
+
+    ws.drop();
+    mock.timers.tick(500); // first backoff: the token function throws
+    await flush();
+    assert.equal(n, 2);
+    assert.equal(FakeWS.count, before, "no socket for a failed token");
+    assert.equal(comet.status, "disconnected");
+    mock.timers.tick(1000); // second backoff: it succeeds
+    await flush();
+    assert.equal(FakeWS.count, before + 1);
+
+    const ws2 = FakeWS.last;
+    ws2.connect();
+    const hellos = ws2.of("hello");
+    assert.equal(hellos.length, 1);
+    assert.equal(hellos[0].auth?.token, "T");
+    assert.equal(hellos[0].resume?.session, "s_1");
+    ws2.recv({ t: "welcome", session: "s_1", resumed: true, hb: 25000, user: { id: "a" }, caps: ["resume"] });
+    assert.deepEqual(comet.user, { id: "a" });
+    assert.equal(ws2.of("call").length, 1, "held call re-sent on the resumed session");
+    ws2.recv({ t: "res", seq: 1, id: ws2.of("call")[0].id, ok: true, val: 1 });
+    assert.equal(await p, 1);
+  });
+});
+
+test("a token function that keeps failing is retried with backoff and never connects; close() stops it", async () => {
+  await withFakeTimers(async (flush) => {
+    let calls = 0;
+    const before = FakeWS.count;
+    comet = connect({
+      url: "ws://test/_comet",
+      WebSocket: FakeWS as any,
+      token: () => {
+        calls++;
+        throw new Error("down");
+      },
+    });
+    await flush();
+    assert.equal(calls, 1);
+    mock.timers.tick(499);
+    await flush();
+    assert.equal(calls, 1, "waits for the backoff");
+    mock.timers.tick(1);
+    await flush();
+    assert.equal(calls, 2);
+    mock.timers.tick(1000); // the backoff doubles
+    await flush();
+    assert.equal(calls, 3);
+    assert.equal(FakeWS.count, before, "never opened a socket");
+
+    comet.close();
+    mock.timers.tick(60_000);
+    await flush();
+    assert.equal(calls, 3, "close() stops the retries");
+  });
 });
