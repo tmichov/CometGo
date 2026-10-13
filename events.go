@@ -216,7 +216,9 @@ func (e *engine) deliverEvents(evts []*evtNote) {
 		if obs == nil || !obs.pub.opts.Events {
 			continue // nobody subscribed: at-most-once means dropped
 		}
-		for _, sub := range obs.sortedSubs() {
+		// Map order: the order across subs means nothing to a client, and
+		// each sub still gets the events in emit order.
+		for sub := range obs.subs {
 			// A coalescing connection (§8.1) gets no events: a held sub is
 			// behind the data the event follows, and queueing them would
 			// grow its memory with the event rate. At-most-once allows it.
