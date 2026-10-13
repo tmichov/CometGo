@@ -4,14 +4,16 @@
 
 ## Running it
 
-Start the database, then run both scenarios:
+Start the database, then run every scenario:
 
 ```sh
 make db
 make bench
 ```
 
-`make bench` rewrites [base.md](base.md) and [slow.md](slow.md). Each run takes about 75 seconds. For a single ad hoc run, call the command directly; every load parameter is a flag (`go run ./cmd/cometload -h`):
+`make bench` rewrites [base.md](base.md), [slow.md](slow.md) and [m3-before.md](m3-before.md). Each run takes about 75 seconds.
+
+`m3-before.md` records the `m3` scenario on the engine before M3 (see the [M3 design](../design/m3-slow-work.md)). Once M3 lands, it stays as the record of where M3 started; record the new runs under another `-out`. For a single ad hoc run, call the command directly; every load parameter is a flag (`go run ./cmd/cometload -h`):
 
 ```sh
 go run ./cmd/cometload -clients 2000 -calls 500 -duration 30s
@@ -27,7 +29,8 @@ The driver starts the server under test as a separate process (the same binary, 
 |---|---|---|
 | `shared.group` | publication, `ScopeShared` | Rows of one group of `cometload.shared_items`, with `Match` on the group. |
 | `user.bucket` | publication, `ScopeUser` | One bucket of the caller's rows in `cometload.user_items`, with `Match` on owner and bucket. |
-| `slow.observer` | publication, `ScopeShared` | Group 0 joined with `pg_sleep`, without `Match`, so every shared write re-runs it. Slow scenario only. |
+| `slow.observer` | publication, `ScopeShared` | Group 0 joined with `pg_sleep`, without `Match`, so every shared write re-runs it. Slow and m3 scenarios. |
+| `slow.pubfn` | publication, `ScopeShared` | Its `fn` runs `pg_sleep` on the server's pool before returning its query, on every sub. Each sub passes its own `k`, so each binds its own observer; the query is one shared group, with `Match`. m3 scenario only. |
 | `ping` | method | Writes nothing, so it has no fence. |
 | `shared.bump`, `user.bump` | methods | Increment one shared row, or one of the caller's rows. |
 | `user.add` | method | Inserts a row into one of the caller's buckets and deletes the bucket's oldest, so results keep their size. |
@@ -37,14 +40,16 @@ With the defaults, 1,000 clients are spread round-robin over 500 users. Each cli
 
 - writes 200 rows a second directly to Postgres, outside any call, half shared and half per-user,
 - makes 200 calls a second from random clients: 30% `shared.bump`, 30% `user.bump`, 20% `user.add`, 20% `ping`,
-- in the slow scenario, also opens one client subscribed to `slow.observer` (500 ms) that calls `slow.fn` (2 s) back to back.
+- in the slow scenario, also opens one client subscribed to `slow.observer` (500 ms) that calls `slow.fn` (2 s) back to back,
+- in the m3 scenario, M3's exit-criterion setup: one client subscribed to `slow.observer` at 10 s (`-slow-observer`), and, as the measured window starts, 50 clients (`-slow-pub-subs`) that each subscribe to `slow.pubfn`, whose `fn` takes 100 ms (`-slow-pub-fn`). An explicit `-slow-observer` or `-slow-pub-fn` overrides the scenario's value. The `slow` scenario is unchanged, so its recorded runs stay comparable.
 
 Load runs for a 10 s warmup and then a 60 s measured window. Only calls sent in the window count.
 
 ## Reading a report
 
 - **Calls**: latency from sending `call` to receiving `res`, measured on the client, per method and overall, and the share answered with `lag:true` (§6.2 of the [protocol](../protocol.md)). Every method except `ping` waits for its fence, so its latency includes the tick that delivers its write.
-- **Engine**: from `Config.Metrics`. Tick duration, ticks per second, observer runs per tick, commit-to-fence wait, and the observer and subscription counts.
+- **Engine**: from `Config.Metrics`. Tick duration, ticks per second, observer runs per tick, commit-to-fence wait, and the observer and subscription counts. **Staleness** is `stale_seconds`: per delivered result, the time since the change it reflects was drained. It is reported for every publication except `slow.observer` and `slow.pubfn` together, and, in the slow and m3 scenarios, for each of those two separately.
+- **Slow publication subs** (m3): how long each `slow.pubfn` client took from dialing to its sub being ready.
 - **Resources**: the server process's RSS before any client connects and after every sub has its snapshot; the difference per 1,000 connections; and the Postgres container's CPU time over the measured window, as a percentage of one core (from its cgroup, through `docker exec`).
 
 Driver, server and Postgres share the one machine, so compare numbers only between runs on the same machine. The machine is recorded at the top of each report.

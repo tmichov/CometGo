@@ -499,7 +499,7 @@ Set `Config.Metrics` to receive health measurements, for example to feed Prometh
 ```go
 type Metric struct {
 	Name  string  // one of the Metric* constants below
-	Pub   string  // the publication, for MetricPubRun; "" otherwise
+	Pub   string  // the publication, for MetricPubRun and MetricStale; "" otherwise
 	Value float64 // seconds for durations, a number otherwise
 }
 ```
@@ -517,6 +517,7 @@ type Metric struct {
 | `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed as a slow consumer: its queue went over 8 MiB, or a write timed out. A write that fails because the peer went away also closes with 4429, but is not counted |
 | `MetricListenReconnect` (`listen_reconnects`) | counter | 1 per failed `LISTEN` attempt: each drop, and each failed reconnect during an outage (retried with backoff up to 10 s) |
 | `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` set, reported once the tick's snapshot commits |
+| `MetricStale` (`stale_seconds`) | duration | per observer result delivered after a change, with `Pub` set: from the tick that drained the first notification the observer's old result did not reflect, until its new result was enqueued to its subscribers (or held for a [coalescing](#slow-clients) connection). A run only to snapshot a new subscription, or a Match candidate the change cannot affect, reports nothing |
 
 Gauges are the current value, so map them to a gauge and set it; a counter is reported as `1` per occurrence; a duration is one observation, for a histogram. A tick happens only when there is work (a change, a request, a timer), so an idle server reports no gauges until something happens.
 
