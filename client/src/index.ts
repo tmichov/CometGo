@@ -350,11 +350,16 @@ export class Comet {
       this.#goaway = undefined;
       // A setToken while the socket was opening: hello carries its token.
       while (cred.source !== this.#opts.token) {
-        const source = this.#opts.token;
-        // shortcut: a throw here still connects anonymously, unlike in #open;
-        // closing this socket so #onDisconnect reconnects would fix it.
-        cred = (await this.#credential()) ?? { source, token: null };
+        const next = await this.#credential();
         if (this.#ws !== ws || ws.readyState !== 1) return;
+        if (!next) {
+          // As in #open: no anonymous hello. Drop this socket before hello
+          // (no session is touched) and reconnect with backoff.
+          ws.close(4000);
+          this.#onDisconnect(4000, "token source failed"); // its onclose then sees another #ws
+          return;
+        }
+        cred = next;
       }
       const { token } = cred;
       const resume = this.#resumable() ? { resume: { session: this.#session, seq: this.#seq, subs: [...this.#subs.keys()] } } : {};
