@@ -45,7 +45,7 @@ let comet: Comet;
 
 beforeEach(async () => {
   comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
-  await Promise.resolve(); // #open awaits the token source
+  await new Promise((r) => setImmediate(r)); // #open awaits the token source
   FakeWS.last.open();
 });
 
@@ -197,7 +197,7 @@ test("a retry more than an hour after the first send is rejected", async () => {
 async function resumableStart(): Promise<FakeWS> {
   comet.close();
   comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any });
-  await Promise.resolve();
+  await new Promise((r) => setImmediate(r));
   const ws = FakeWS.last;
   ws.connect();
   ws.recv({ t: "welcome", session: "s_1", hb: 25000, user: null, caps: ["resume", "ik"] });
@@ -461,6 +461,38 @@ test("a function token source is refreshed at about 80% of its lifetime, retried
     mock.timers.tick(1_000_000);
     await flush();
     assert.equal(ws.of("auth").length, 2, "close() cancels the refresh");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("switching to a string token stops a scheduled refresh", async () => {
+  comet.close();
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000_000 });
+  try {
+    const flush = async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    };
+    comet = connect({ url: "ws://test/_comet", WebSocket: FakeWS as any, token: () => "F" });
+    await flush();
+    const ws = FakeWS.last;
+    ws.connect();
+    await flush();
+    ws.recv({ t: "welcome", hb: 25000, user: { id: "a" }, caps: [], authExp: Math.floor(Date.now() / 1000) + 100 });
+
+    mock.timers.tick(79_000);
+    const s = comet.setToken("S");
+    await flush();
+    // The refresh comes due while S's authRes is still outstanding.
+    mock.timers.tick(2_000);
+    await flush();
+    assert.deepEqual(
+      ws.of("auth").map((m) => m.token),
+      ["S"],
+      "the function source's refresh did not fire",
+    );
+    ws.recv({ t: "authRes", seq: 1, id: ws.of("auth")[0].id, ok: true, user: { id: "a" } });
+    await s;
   } finally {
     mock.timers.reset();
   }
