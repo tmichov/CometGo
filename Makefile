@@ -37,3 +37,4 @@ bench:
 bench-feed:
 	go run ./cmd/feedbench -writers 16 -out docs/bench/feedbench.md
 	go run ./cmd/feedbench -writers 64 -out docs/bench/feedbench-64.md
+	go run ./cmd/feedbench -writers 16 -payload 1800 -out docs/bench/feedbench-wide.md

@@ -67,6 +67,7 @@ func main() {
 	warmup := flag.Duration("warmup", 3*time.Second, "writes before measuring, per mode")
 	duration := flag.Duration("duration", 20*time.Second, "measured writes, per mode")
 	only := flag.String("modes", "", "comma-separated modes to run (default all)")
+	payload := flag.Int("payload", 100, "bytes in each row's text column; the logical modes decode whole rows, so wide rows cost them more")
 	out := flag.String("out", "", "also write the Markdown report to this file")
 	flag.Parse()
 
@@ -95,14 +96,14 @@ func main() {
 			log.Printf("skipping %s: wal_level is %s, not logical", m.name, walLevel)
 			continue
 		}
-		r, err := run(ctx, pool, *dsn, m, *writers, *warmup, *duration)
+		r, err := run(ctx, pool, *dsn, m, *writers, *payload, *warmup, *duration)
 		if err != nil {
 			log.Fatalf("%s: %v", m.name, err)
 		}
 		log.Printf("%-15s %8.0f tx/s  p50 %v  p99 %v", m.name, float64(r.commits)/r.took.Seconds(), r.p50, r.p99)
 		results = append(results, r)
 	}
-	report := render(results, *writers, *duration, walLevel, version)
+	report := render(results, *writers, *payload, *duration, walLevel, version)
 	fmt.Print(report)
 	if *out != "" {
 		if err := os.WriteFile(*out, []byte(report), 0o644); err != nil {
@@ -111,8 +112,8 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers int, warmup, duration time.Duration) (result, error) {
-	if err := setup(ctx, pool, m); err != nil {
+func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, payload int, warmup, duration time.Duration) (result, error) {
+	if err := setup(ctx, pool, m, payload); err != nil {
 		return result{}, err
 	}
 	feedCtx, stopFeed := context.WithCancel(ctx)
@@ -203,13 +204,13 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers in
 }
 
 // setup recreates the schema and table, and the feed objects m needs.
-func setup(ctx context.Context, pool *pgxpool.Pool, m mode) error {
+func setup(ctx context.Context, pool *pgxpool.Pool, m mode, payload int) error {
 	stmts := []string{
 		"DROP PUBLICATION IF EXISTS feedbench",
 		"DROP SCHEMA IF EXISTS " + schema + " CASCADE",
 		"CREATE SCHEMA " + schema,
 		"CREATE TABLE " + table + " (id bigint PRIMARY KEY, n int NOT NULL DEFAULT 0, payload text NOT NULL)",
-		fmt.Sprintf("INSERT INTO %s (id, payload) SELECT g, repeat('x', 100) FROM generate_series(1, %d) g", table, rows),
+		fmt.Sprintf("INSERT INTO %s (id, payload) SELECT g, repeat('x', %d) FROM generate_series(1, %d) g", table, payload, rows),
 		"VACUUM ANALYZE " + table,
 	}
 	if m.logical {
@@ -284,13 +285,13 @@ func readSlot(ctx context.Context, dsn string, decoded *atomic.Int64, ready chan
 	}
 }
 
-func render(results []result, writers int, duration time.Duration, walLevel, version string) string {
+func render(results []result, writers, payload int, duration time.Duration, walLevel, version string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# feedbench: change-feed cost on writes\n\n")
 	fmt.Fprintf(&b, "Run %s.\n\n", time.Now().UTC().Format("2006-01-02 15:04 UTC"))
 	fmt.Fprintf(&b, "- Postgres %s, wal_level=%s, on the same machine as the driver\n", version, walLevel)
 	fmt.Fprintf(&b, "- Go %s, %s/%s, %d logical CPUs\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
-	fmt.Fprintf(&b, "- %d writers, %s measured per mode; each transaction updates one random row of %d by primary key\n\n", writers, duration, rows)
+	fmt.Fprintf(&b, "- %d writers, %s measured per mode; each transaction updates one random row of %d (%d-byte text column) by primary key\n\n", writers, duration, rows, payload)
 	fmt.Fprintf(&b, "| Mode | What runs | tx/s | vs plain | p50 | p99 | decoded |\n|---|---|---|---|---|---|---|\n")
 	var plain float64
 	for _, r := range results {

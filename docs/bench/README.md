@@ -78,5 +78,5 @@ The logical modes need `wal_level=logical`, which `make db` sets (an existing co
 make bench-feed
 ```
 
-It writes [feedbench.md](feedbench.md) (16 writers) and [feedbench-64.md](feedbench-64.md) (64 writers). The commit lock that NOTIFY takes shows more with more writers. As with cometload, the numbers are only comparable on one machine with nothing else heavy running.
+It writes [feedbench.md](feedbench.md) (16 writers), [feedbench-64.md](feedbench-64.md) (64 writers) and [feedbench-wide.md](feedbench-wide.md) (16 writers, 1,800-byte rows, just under the TOAST threshold, since the logical feed decodes whole rows). The commit lock that NOTIFY takes shows more with more writers. As with cometload, the numbers are only comparable on one machine with nothing else heavy running.
 
