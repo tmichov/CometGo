@@ -390,7 +390,7 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 - Its result goes out later, in its own `tx`, to the subs that were bound to it before it was detached. Subs that bind while it is in flight wait for its next run, which starts on a snapshot taken after they bound, so a sub's first snapshot is never older than a write the client had already been told about (§6.2).
 - It is not re-run while it is in flight. Notifications that arrive meanwhile keep it dirty, and it runs again once it finishes.
 - Ticks proceed without it. Fences and identity changes on connections not subscribed to it proceed too (§6.2, §3.2).
-- An observer that was detached once starts on the tick only when a detach slot is free, so a known slow query never blocks a tick while the slots are full. A server holds a bounded number of detached queries at once; at the limit, a newly slow query blocks its tick as in v1-core.
+- An observer whose last run was detached and exceeded the soft deadline is *known slow*. It starts only when a detach slot is free, and is detached as soon as it starts, so a known slow query never blocks a tick. A detached run that finishes under the soft deadline clears this. A server holds a bounded number of detached queries at once; at the limit, a newly slow query blocks its tick as in v1-core.
 
 The soft deadline, the detach limit and the tick budget are server settings, not advertised.
 

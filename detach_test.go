@@ -239,6 +239,87 @@ func TestKnownSlowDeferredAtCap(t *testing.T) {
 	}
 }
 
+// A known-slow observer's re-run is detached at once, so it does not hold
+// the tick for SlowObserverAfter before detaching again.
+func TestKnownSlowDetachesAtOnce(t *testing.T) {
+	e := setupFull(t, func(c *Config) { c.SlowObserverAfter = 800 * time.Millisecond }, slowQ)
+	e.waitListening(t)
+	a, _ := e.dial(t, nil)
+	subSlowQ(t, a, 1, 1500, 0) // its first run detaches at the deadline: known slow
+	b, _ := e.dial(t, nil)
+	subscribe(t, b, 1, "items.all")
+
+	insertName(t, e, "w") // re-runs slowq
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	b.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "b", "Name": "n"}})
+	for m := b.next(); m["t"] != "res"; m = b.next() {
+	}
+	if took := time.Since(start); took > 400*time.Millisecond {
+		t.Fatalf("b's call took %s: the known-slow re-run held the tick", took)
+	}
+	var got []string
+	for len(got) < 1 {
+		got = append(got, rowNames(nextWithin(t, a, 10*time.Second), 1)...)
+	}
+	if got[0] != "w" {
+		t.Fatalf("a's detached result %v", got)
+	}
+}
+
+// A known-slow observer whose detached run finishes under the deadline is
+// no longer known slow: with the only slot taken, it runs on the tick
+// instead of waiting for the slot.
+func TestKnownSlowClearedByFastRun(t *testing.T) {
+	e := setupFull(t, func(c *Config) {
+		c.SlowObserverAfter = 300 * time.Millisecond
+		c.MaxDetached = 1
+	}, func(env *testEnv, app *App) {
+		slowQ(env, app)
+		// Slow only while a row named "slow" exists.
+		Publish(app, "toggleq", PubOptions{Tables: []string{env.table}, Scope: ScopeShared},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				return Query{SQL: "SELECT id, owner, name FROM " + env.table +
+					", pg_sleep(CASE WHEN EXISTS (SELECT 1 FROM " + env.table + " WHERE name = 'slow') THEN 1 ELSE 0 END) ORDER BY id"}, nil
+			})
+	})
+	e.waitListening(t)
+	a, _ := e.dial(t, nil)
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "toggleq", "args": map[string]any{}})
+	if m := nextWithin(t, a, 10*time.Second); m["t"] != "tx" || entries(m)[0]["ready"] != true {
+		t.Fatalf("expected toggleq's snapshot, got %v", m)
+	}
+	waitNames := func(want string) {
+		t.Helper()
+		for {
+			if names := rowNames(nextWithin(t, a, 10*time.Second), 1); len(names) > 0 && names[len(names)-1] == want {
+				return
+			}
+		}
+	}
+	insertName(t, e, "slow") // a 1 s run, detached: known slow
+	waitNames("slow")
+	if _, err := e.pool.Exec(context.Background(), "UPDATE "+e.table+" SET name = 'fast' WHERE name = 'slow'"); err != nil {
+		t.Fatal(err)
+	}
+	for { // detached at once, but fast: no longer known slow
+		m := nextWithin(t, a, 10*time.Second)
+		if m["t"] == "tx" && len(entries(m)) > 0 && entries(m)[0]["ops"] != nil {
+			break
+		}
+	}
+
+	b, _ := e.dial(t, nil)
+	b.send(map[string]any{"t": "sub", "s": 1, "name": "slowq", "args": map[string]any{"Ms": 3000}})
+	time.Sleep(500 * time.Millisecond) // its first run has detached and holds the only slot
+	insertName(t, e, "x")
+	start := time.Now()
+	waitNames("x")
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("toggleq's update took %s: it still waited for a detach slot", took)
+	}
+}
+
 // With detaching off, a slow query holds its tick as before, and Start
 // warns about it.
 func TestMaxDetachedOffBlocksTick(t *testing.T) {

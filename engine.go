@@ -153,8 +153,9 @@ type observer struct {
 	// due in; 0 once it runs.
 	dueFrom uint64
 	// inFlight: its query was detached and outlives the tick that started
-	// it. Such an observer is in no tick's run list. knownSlow: it has been
-	// detached before, so it starts only when a detach slot is free.
+	// it. Such an observer is in no tick's run list. knownSlow: its last
+	// run was detached and took at least SlowObserverAfter, so it starts
+	// only when a detach slot is free, and is detached as soon as it does.
 	inFlight, knownSlow bool
 	// evts are events waiting for this observer to reflect their n.
 	evts []heldEvt
@@ -1226,7 +1227,13 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		}()
 		var o queryOut
 		if maxDetached > 0 {
-			timer := time.NewTimer(e.a.cfg.SlowObserverAfter)
+			after := e.a.cfg.SlowObserverAfter
+			if obs.knownSlow {
+				// Detach at once: waiting out the deadline would hold the
+				// tick for every connection on each of its runs.
+				after = 0
+			}
+			timer := time.NewTimer(after)
 			select {
 			case o = <-done:
 				timer.Stop()
@@ -1437,6 +1444,9 @@ func (e *engine) applyDetached(d detachedDone) {
 		obs.dirty = true // not its fault: run it again
 		return
 	}
+	// A run under the deadline would not have been detached: run it on the
+	// tick again, so a query slow once is not kept off ticks for good.
+	obs.knownSlow = d.out.took >= e.a.cfg.SlowObserverAfter
 	if e.a.cfg.Metrics != nil {
 		e.a.metric(MetricPubRun, obs.pub.name, d.out.took.Seconds())
 	}
