@@ -139,15 +139,15 @@ A sparring agent reviewed the design from the code over three rounds, with exper
 
 Filed in Backlog with these dependencies (M4 module):
 
-| # | Task | Depends on |
+| Task | What | Depends on |
 |---|---|---|
-| 1 | Feed interface: the listener behind a feed abstraction (`Config.Feed`), notifications carry an xid. No behaviour change. | |
-| 2 | `InstallPublication`, `UninstallTriggers`, and `checkTables` for logical mode (replica identity, partition root, key-only opt-in check) | |
-| 3 | pgoutput decoder: grouping, coalescing, key encoding with a parity test against the triggers, messages, and the visibility gate with epoch-extended xids | 1 |
-| 4 | Slot lifecycle: persistent slot, creation timeout, resume from the last received commit (verify the skip), zombie and conflict handling, `wal_sender_timeout`, confirming, liveness, missing slot, `SlotName`, health not-ready | 3 |
-| 5 | Fences, events and re-checks as messages in logical mode; the recreated-slot rule by visibility in S and its second pass; the `listened` fence release off in logical mode | 3, 4 |
-| 6 | Orphan slot sweeper and the slot headroom check | 4 |
-| 7 | Migration: `FeedMigrating`, re-checks both ways, LISTEN on logical nodes for re-checks only | 5 |
-| 8 | Streaming large transactions (pgoutput protocol 2) | 3 |
-| 9 | Docs: logical mode in server.md, the managed providers (checked against their current docs), limitations, and §11.1 moved out of [later] | 5, 6 |
-| 10 | Verify the exit criterion: feedbench at 16 and 64 writers and with wide rows, and the full suite with `Config.DB` through PgBouncer in transaction mode | 2, 5, 6, 7, 8 |
+| CMTG-83 | Feed interface: the listener behind a feed abstraction (`Config.Feed`), notifications carry an xid. No behaviour change. | |
+| CMTG-84 | `InstallPublication`, `UninstallTriggers`, and `checkTables` for logical mode (replica identity, partition root, key-only opt-in check) | |
+| CMTG-85 | pgoutput decoder: grouping, coalescing, key encoding with a parity test against the triggers, messages, and the visibility gate with epoch-extended xids | CMTG-83 |
+| CMTG-86 | Slot lifecycle: persistent slot, creation timeout, resume from the last received commit (verify the skip), zombie and conflict handling, `wal_sender_timeout`, confirming, liveness, missing slot, `SlotName`, health not-ready | CMTG-85 |
+| CMTG-87 | Fences, events and re-checks as messages in logical mode; the recreated-slot rule by visibility in S and its second pass; the `listened` fence release off in logical mode | CMTG-85, CMTG-86 |
+| CMTG-88 | Orphan slot sweeper and the slot headroom check | CMTG-86 |
+| CMTG-89 | Migration: `FeedMigrating`, re-checks both ways, LISTEN on logical nodes for re-checks only | CMTG-87 |
+| CMTG-90 | Streaming large transactions (pgoutput protocol 2) | CMTG-85 |
+| CMTG-91 | Docs: logical mode in server.md, the managed providers (checked against their current docs), limitations, and §11.1 moved out of [later] | CMTG-87, CMTG-88 |
+| CMTG-92 | Verify the exit criterion: feedbench at 16 and 64 writers and with wide rows, and the full suite with `Config.DB` through PgBouncer in transaction mode | CMTG-84, CMTG-87, CMTG-88, CMTG-89, CMTG-90 |
