@@ -506,6 +506,7 @@ Every node receives every fence and ignores the tokens it does not own.
 - **Engine:** changed-PK filtering with Go-side equality predicates (§11). Server-internal; no wire change.
 - **Reconnect:** `goaway` graceful shutdown (§7.3). It needs no cap: clients ignore unknown message types.
 - **Backpressure:** coalesce→reset for slow clients (§8.1). It needs no cap: it only sends `reset` entries, which every client handles.
+- **Engine:** slow-work isolation (M3): detached slow observers, a tick budget and a publication `fn` budget (§8.4), per-connection fence release (§6.2), held events (§4.5) and held `authRes` (§3.2). It needs no cap: message shapes are unchanged; only when a connection's `res`, `evt` and `authRes` go out depends on that connection's own subscriptions.
 
 **[later]**, all additive and behind `caps`:
 - **Engine and transport:**
