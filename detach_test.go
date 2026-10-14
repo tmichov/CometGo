@@ -3,10 +3,13 @@ package cometgo
 import (
 	"context"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // logRec records log messages, for tests that check what was logged.
@@ -317,6 +320,55 @@ func TestKnownSlowClearedByFastRun(t *testing.T) {
 	waitNames("x")
 	if took := time.Since(start); took > time.Second {
 		t.Fatalf("toggleq's update took %s: it still waited for a detach slot", took)
+	}
+}
+
+// With the pool exhausted, a known-slow observer waits for a later tick
+// rather than starting a query it could not detach: other subscriptions
+// still update promptly, and it runs once a connection is free.
+func TestKnownSlowWaitsForAConnection(t *testing.T) {
+	e := setupFull(t, fastDetach, slowQ)
+	e.waitListening(t)
+	a, _ := e.dial(t, nil)
+	subSlowQ(t, a, 1, 1500, 0) // its first run detaches: known slow
+	b, _ := e.dial(t, nil)
+	subscribe(t, b, 1, "items.all")
+
+	// Hold every pool connection but one, which the tick's own lane takes.
+	ctx := context.Background()
+	var held []interface{ Release() }
+	for n := e.pool.Stat().MaxConns() - 1; len(held) < int(n); {
+		c, err := e.pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+	}
+	release := func() {
+		for _, c := range held {
+			c.Release()
+		}
+		held = nil
+	}
+	defer release()
+
+	// Written outside the pool, so the write itself does not need a slot.
+	conn, err := pgx.Connect(ctx, os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	start := time.Now()
+	if _, err := conn.Exec(ctx, "INSERT INTO "+e.table+" (owner, name) VALUES ('x', 'w')"); err != nil {
+		t.Fatal(err)
+	}
+	expectOps(t, nextWithin(t, b, 10*time.Second), 1)
+	if took := time.Since(start); took > 700*time.Millisecond {
+		t.Fatalf("b's update took %s: the known-slow query held the tick", took)
+	}
+	release()
+	if names := rowNames(nextWithin(t, a, 10*time.Second), 1); len(names) != 1 || names[0] != "w" {
+		t.Fatal("a's known-slow sub did not run once a connection was free")
 	}
 }
 

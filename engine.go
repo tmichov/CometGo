@@ -1350,7 +1350,7 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 	// cur is the lane: the connection whose transaction holds the tick's
 	// snapshot. A detach hands it to the detached run and moves the tick to
 	// a new lane on the same snapshot.
-	cur, err := e.openLane(ctx, "")
+	cur, err := e.openLane(ctx, "", 0)
 	if err != nil {
 		return err
 	}
@@ -1404,6 +1404,19 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 			obs.dirty = true
 			continue
 		}
+		var next *lane
+		if obs.knownSlow {
+			// Open the lane the tick moves to before starting the query: a
+			// known-slow query that could not be detached would hold the
+			// tick for its whole run. Without a free connection it waits
+			// for a later tick instead, like one without a slot.
+			var lerr error
+			if next, lerr = e.openLane(ctx, cur.snap, knownSlowLaneWait); lerr != nil {
+				obs.dirty = true
+				time.AfterFunc(e.a.cfg.SlowObserverAfter, e.signal)
+				continue
+			}
+		}
 		started = true
 		e.runs.Add(1)
 		// A savepoint per observer keeps one failing query from poisoning
@@ -1430,20 +1443,20 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 			done <- o
 		}()
 		var o queryOut
+		if next != nil {
+			// Known slow: detached at once, on the lane opened for it.
+			e.detachRun(obs, cur, done)
+			cur = next
+			continue
+		}
 		if maxDetached > 0 {
-			after := e.a.cfg.SlowObserverAfter
-			if obs.knownSlow {
-				// Detach at once: waiting out the deadline would hold the
-				// tick for every connection on each of its runs.
-				after = 0
-			}
-			timer := time.NewTimer(after)
+			timer := time.NewTimer(e.a.cfg.SlowObserverAfter)
 			select {
 			case o = <-done:
 				timer.Stop()
 			case <-timer.C:
 				if e.detachedN < maxDetached {
-					next, err := e.openLane(ctx, cur.snap)
+					next, err := e.openLane(ctx, cur.snap, e.a.cfg.SlowObserverAfter)
 					if err == nil {
 						e.detachRun(obs, cur, done)
 						cur = next
@@ -1542,6 +1555,12 @@ type queryOut struct {
 	took   time.Duration
 }
 
+// knownSlowLaneWait bounds how long a tick waits for a pool connection
+// before starting a known-slow query (runObservers): it holds the tick that
+// long when the pool is exhausted, and then the query waits for a later
+// tick.
+const knownSlowLaneWait = 100 * time.Millisecond
+
 // lane is a REPEATABLE READ READ ONLY transaction holding a tick's
 // snapshot. snap is its exported snapshot id, when detaching is enabled.
 type lane struct {
@@ -1557,14 +1576,14 @@ func (l *lane) close() {
 
 // openLane begins a lane. With snap, it imports that snapshot and exports
 // it again, so the new id outlives the exporting transaction: in that
-// order, before its SET LOCAL.
-func (e *engine) openLane(ctx context.Context, snap string) (l *lane, err error) {
+// order, before its SET LOCAL. wait, if not 0, bounds waiting for a pool
+// connection: a detach waits for this, so it must not hang the tick on an
+// exhausted pool.
+func (e *engine) openLane(ctx context.Context, snap string, wait time.Duration) (l *lane, err error) {
 	actx := ctx
-	if snap != "" {
-		// A detach waits for this: don't hang the tick on an exhausted
-		// pool, block on the slow query instead.
+	if wait > 0 {
 		var cancel context.CancelFunc
-		actx, cancel = context.WithTimeout(ctx, e.a.cfg.SlowObserverAfter)
+		actx, cancel = context.WithTimeout(ctx, wait)
 		defer cancel()
 	}
 	// Acquired explicitly so a panic during BEGIN releases the connection
