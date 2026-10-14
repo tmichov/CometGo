@@ -440,6 +440,8 @@ func TestRevalidateDedupesPerTick(t *testing.T) {
 				return Query{SQL: "SELECT id FROM " + env.table + " ORDER BY id"}, nil
 			})
 	})
+	// The first LISTEN re-checks every sub; it must not land after the reset.
+	e.waitListening(t)
 	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
 	subscribe(t, a, 1, "counted")
 	subscribe(t, a, 2, "counted")
