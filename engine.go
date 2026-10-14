@@ -524,7 +524,24 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	clear(e.blocked)
 	clear(e.rebinding)
 	for _, q := range queue {
-		if c := reqConn(q.r); c != nil && (e.blocked[c] || !e.fnsReady(ctx, q)) {
+		c := reqConn(q.r)
+		if _, ok := q.r.(closeReq); ok && e.blocked[c] {
+			// The session is gone, so its carried requests no longer
+			// matter: close undoes whatever they would have done. A carried
+			// rebind still waits for its fn calls on a closed connection,
+			// so without this an fn that never returns would keep the
+			// session's subs, and their observers, alive for good.
+			e.carry = slices.DeleteFunc(e.carry, func(o queuedReq) bool {
+				if reqConn(o.r) != c {
+					return false
+				}
+				delete(e.fns, o.seq)
+				return true
+			})
+			delete(e.blocked, c)
+			delete(e.rebinding, c)
+		}
+		if c != nil && (e.blocked[c] || !e.fnsReady(ctx, q)) {
 			e.blocked[c] = true
 			if _, ok := q.r.(rebindReq); ok {
 				e.rebinding[c] = true

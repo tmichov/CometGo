@@ -124,3 +124,36 @@ func TestCarriedRebindSendsNoOldData(t *testing.T) {
 		t.Fatalf("expected authRes, got %v", m)
 	}
 }
+
+// A session that ends while its identity change waits for an fn that never
+// returns is still closed: its bound subs stop running. (A carried sub needs
+// no fn once its connection is closed; a rebind still does.)
+func TestCloseDropsCarriedRequests(t *testing.T) {
+	release := make(chan struct{})
+	e := setupFull(t, nil, func(env *testEnv, app *App) {
+		// Stuck for bob only, so alice's sub binds and bob's rebind hangs.
+		Publish(app, "stuck", PubOptions{Tables: []string{env.table}, Scope: ScopeShared},
+			func(c *SubCtx, _ struct{}) (Query, error) {
+				if c.Identity != nil && c.Identity.UserID == "bob" {
+					<-release
+				}
+				return Query{SQL: "SELECT id FROM " + env.table + " ORDER BY id"}, nil
+			})
+	})
+	t.Cleanup(func() { close(release) })
+	e.waitListening(t)
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice"}})
+	subscribe(t, a, 1, "items.all")
+	subscribe(t, a, 2, "stuck")
+	a.send(map[string]any{"t": "auth", "id": 3, "token": "bob"})
+	time.Sleep(100 * time.Millisecond) // the rebind is carried
+	a.ws.CloseNow()
+	time.Sleep(200 * time.Millisecond) // the session's close is handled
+
+	runs := e.app.engine.runs.Load()
+	insertName(t, e, "after")
+	time.Sleep(300 * time.Millisecond)
+	if n := e.app.engine.runs.Load() - runs; n != 0 {
+		t.Fatalf("%d observer runs after the session ended: its subs are still bound", n)
+	}
+}
