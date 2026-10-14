@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:17-alpine
+    # Logical decoding, for the M4 change feed and cmd/feedbench.
+    command: ["postgres", "-c", "wal_level=logical"]
     environment:
       POSTGRES_USER: comet
       POSTGRES_PASSWORD: comet
