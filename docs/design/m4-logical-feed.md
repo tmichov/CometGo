@@ -13,7 +13,20 @@ Status: draft, under review (CMTG-31). The wire-visible parts will go in the [pr
 
 Every statement on a tracked table runs a statement trigger that counts the transition table, aggregates the changed keys into JSON and calls `pg_notify` (triggers.go). Every fenced call adds a `pg_notify` (conn.go). At commit, a transaction that queued a notification takes a database-wide lock (`NotifyQueueLock`) to append to the queue, so such commits serialize. And `LISTEN` needs a session that stays on one backend, which a transaction-mode pooler does not give, so today the listener silently uses the pool's DSN.
 
-Numbers: see [feedbench.md](../bench/feedbench.md). (A first 4-writer run on a busy machine: triggers 46% of plain, triggers plus fence 47%, logical feed 95%, logical plus message fence 97%.)
+Measured with [feedbench](../bench/README.md#change-feed-cost-feedbench) on the baseline machine, idle (2026-10-14; one random-row UPDATE per transaction, 20 s per mode, all modes with `wal_level=logical`):
+
+| Mode | 16 writers | 64 writers | 16 writers, 1,800-byte rows |
+|---|---|---|---|
+| plain (no feed) | 5,031 tx/s | 6,594 tx/s | 1,872 tx/s |
+| triggers | 624 (12%) | 599 (9%) | 261 (14%) |
+| triggers + NOTIFY fence | 654 (13%) | 375 (6%) | 255 (14%) |
+| logical | 3,600 (72%) | 5,904 (90%) | 1,792 (96%) |
+| logical + message fence | 3,728 (74%) | 4,569 (69%) | 1,588 (85%) |
+
+Reports: [feedbench.md](../bench/feedbench.md), [feedbench-64.md](../bench/feedbench-64.md), [feedbench-wide.md](../bench/feedbench-wide.md).
+
+- **The NOTIFY feed is the ceiling.** With the triggers, throughput stays near 600 tx/s whatever the number of writers, and p50 latency goes from 3 ms to 25 ms (16 writers) and from 9 ms to 105 ms (64 writers): commits that queued a notification serialize.
+- **The logical feed costs 4–31%,** a 6–15× gain over the triggers, but not yet the 90% the exit criterion asks for in every mode. feedbench reads its slot through the SQL interface every 50 ms, a stand-in for the streaming consumer; CMTG-92 measures the real one, and the criterion is revisited there if the streaming feed still falls short. The extra cost of a message fence at 64 writers (69% against 90% without) is the first thing to look at.
 
 ## What the spike showed
 
