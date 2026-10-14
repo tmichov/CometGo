@@ -275,7 +275,7 @@ A request of C that waits for a slow publication `fn` (a sub, an identity change
 | Method wrote only to unwatched tables | The fence still forces a (cheap) tick. Under §8.4 it still waits for any of the connection's observers that are dirty from an earlier notification. |
 | Listener down when the method commits (server just started, or reconnecting) | The fence notification is lost (§11). The all-dirty tick that follows the next successful LISTEN re-runs every observer on a snapshot taken after the commit. That tick releases every fence whose transaction committed before that LISTEN, and sends the `res` after the tick's `tx`. The call resolves without `lag` once the listener is back. Fenced commits wait while LISTEN itself runs, so each commit falls clearly before or after it. A fence committed after the LISTEN is left to its own notification, so its events still precede its `res`. |
 | Writes outside `ctx.Tx` (another connection or pool) | No fence guarantee. This is documented. |
-| **[later]** logical replication | The fence becomes "the replication stream has processed past the commit LSN". The wire protocol is unchanged. |
+| **[later]** logical replication feed (§11.1) | The fence is a transactional logical message instead of a NOTIFY, released once the decoded stream has delivered it and its transaction is visible. The wire protocol is unchanged. |
 
 ## 7. Reconnect
 
@@ -481,6 +481,16 @@ Change and fence notifications use channel `comet`. Events (§4.5) use `comet_ev
 **Listener connection loss.** Notifications sent while the LISTEN connection is down are lost. On reconnect, the server marks **all** observers dirty, and that tick also releases the fences of methods that committed while it was down (§6.2). Events (§4.5) sent while it is down are dropped. `comet_reval` re-checks are lost too, so the same tick re-runs the publication fn of every subscription, before it releases fences.
 
 Every node receives every fence and ignores the tokens it does not own.
+
+### 11.1 [later] Logical replication feed
+
+An alternative feed, selected per node (`Config.Feed`), that replaces NOTIFY with logical decoding. Server-internal: the wire protocol and the guarantees above are unchanged. Design and rationale: [M4 design](design/m4-logical-feed.md).
+
+- **Source.** pgoutput from a slot per node, on a direct replication connection (`ReplicationDSN`), over publication `cometgo` (tables added by `InstallPublication`, whole rows by default, `publish_via_partition_root`). Replica identity `DEFAULT` or `FULL` is required. No triggers and no NOTIFY: the app's pool may go through a transaction-mode pooler.
+- **Row changes.** Per transaction, keys are grouped per (op, table), encoded as above, and flushed before each transactional message and at commit. An UPDATE reports the old and new keys. More than 1,000 keys for one (op, table) in a transaction, or a TRUNCATE, becomes a table-dirty notification. There is no payload size limit.
+- **Messages.** Fences, events and re-checks are transactional logical messages with prefix `comet` and content `f|<token>`, `e|<event JSON>` and `v|<userID>`. `Emit` and `Revalidate` send theirs in their own autocommit statement. The fence statement also returns the transaction's xid.
+- **Visibility.** A transaction is handed to the engine only once it is visible in a fresh snapshot, and every later one waits behind it, in commit order. Decoding happens at the flush of the commit record, before the transaction is visible to other sessions.
+- **Feed loss.** A dropped connection resumes the slot after the last fully received commit, so nothing is lost or repeated. A slot that has to be recreated is handled as a lost LISTEN: every observer is dirty and every subscription re-checked, on a snapshot S taken after the new slot exists. A fence whose transaction is visible in S is released by that tick, and decoded messages from transactions visible in S are dropped; a transaction not visible in S is decoded later, in order. A second all-dirty pass runs once the transactions in progress in S have ended.
 
 ## 12. Scope
 

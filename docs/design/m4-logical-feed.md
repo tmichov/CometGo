@@ -64,7 +64,7 @@ No NOTIFY is sent: commits do not serialize on the notify queue lock, and every 
 
 The walsender decodes a transaction once its commit record is flushed, but other sessions see it only after `ProcArrayEndTransaction`, which runs after any synchronous-replication wait. With synchronous standbys the gap is a network round trip, and unbounded while a standby is down. NOTIFY never had this gap: listeners skip entries from transactions still in progress.
 
-So **the decoder holds each committed transaction until it is visible**, before handing its notifications to `engine.notify`, and every later transaction behind it, in commit order. It polls `pg_current_snapshot()` on a pool connection every few milliseconds, one query per batch, with no backoff. Visibility is monotonic, so every tick snapshot taken after the hand-off sees the transaction: the tick's own, its detached lanes and the Match candidate filter. `tick()`, fences, held events and carried requests need no change. A transaction stuck in a synchronous-replication wait holds this node's feed behind it, as it holds every reader that waits for it; it does not stall the engine, whose ticks, calls without writes and other work go on.
+So **the decoder holds each committed transaction until it is visible**, before handing its notifications to `engine.notify`, and every later transaction behind it, in commit order. It polls `pg_current_snapshot()` every few milliseconds on a **dedicated connection** (a pool saturated by method calls must not stall the feed), one query per batch, with no backoff. While it holds, the replication connection keeps being read, buffered and answered (status updates and probes included): with the short `wal_sender_timeout` of §5, a stalled reader would have its walsender ended and resume into the same held transaction, over and over. Visibility is monotonic, so every tick snapshot taken after the hand-off sees the transaction: the tick's own, its detached lanes and the Match candidate filter. `tick()`, fences, held events and carried requests need no change. A transaction stuck in a synchronous-replication wait holds this node's feed behind it, as it holds every reader that waits for it; it does not stall the engine, whose ticks, calls without writes and other work go on.
 
 **Xids.** pgoutput's BEGIN carries a 32-bit xid; it is extended with the epoch of the snapshot's `xmax` before comparing with the 64-bit `xid8` values of `pg_current_snapshot()`, never compared raw. Subtransactions need nothing: BEGIN carries the top-level xid, `txid_current()` returns it, and a snapshot's `xip` holds top-level xids only.
 
@@ -73,7 +73,8 @@ So **the decoder holds each committed transaction until it is visible**, before 
 - `Config.ReplicationDSN`: a direct connection (`replication=database`); poolers do not carry the replication protocol. Required in logical mode. `Config.DB` may then go through a pooler. The feed sets a short `wal_sender_timeout` on it (a user-settable option), so a dead connection's walsender ends quickly.
 - **A persistent slot per process**, named `cometgo_<SlotName>` where `Config.SlotName` defaults to the random node ID and can be set to a stable name (a pod or host name), so a process restarted under the same name resumes its slot instead of leaving one behind. Creating a slot waits for every transaction that holds an xid (2.14 s with one 2 s transaction in the spike, unbounded in general), so it happens at start, with a timeout and backoff. Until it succeeds the node's feed is down: it logs that, and its health check reports not ready rather than serving stale subscriptions.
 - **Resume without duplicates.** After a dropped connection, the node restarts replication from the **end LSN of the last commit it received in full**, not from the confirmed LSN, which trails what the engine has drained. Postgres skips commits below a requested start that is above `confirmed_flush`, so nothing is delivered twice and nothing is lost. A transaction whose BEGIN arrived without its COMMIT counts as not received. (To be verified in the slot task: the skip comes from reading `CreateDecodingContext`.)
-- **A zombie walsender** from the dead connection keeps the slot active until it notices. If the slot is active for another PID, the node terminates that walsender (`pg_terminate_backend`, allowed for the same role) and retries, instead of waiting out `wal_sender_timeout` while every fence passes `FenceTimeout`.
+- **A zombie walsender** from the dead connection keeps the slot active until it notices. The node records its walsender's `pg_backend_pid()` when it connects; if the slot is then active for **that** PID, it terminates it (`pg_terminate_backend`, allowed for the same role) and retries, instead of waiting out `wal_sender_timeout` while every fence passes `FenceTimeout`. A slot active for any other PID is a conflict, not a zombie: another live process uses the same `SlotName` (a rolling deploy that starts the new pod first, or a misconfiguration). The node reports "slot in use" and retries with backoff; it never terminates another process's walsender, which would let two nodes kill each other's feed in turn.
+- **A new process on a stable name** resumes the slot from its confirmed LSN. Its engine starts empty, so its first tick is the usual full all-dirty pass.
 - **A missing slot** (dropped by a sweep while partitioned, or its WAL removed by `max_slot_wal_keep_size`) takes the start path: a new slot, then the all-dirty pass of §6.
 - **Orphans.** The slot is dropped on clean shutdown. A crashed process leaves it behind, so a periodic sweeper on every node drops `cometgo_*` slots **of its own database** (slots are cluster-wide, and another app or environment may share the cluster) that are inactive, and have been for `OrphanSlotAfter` (10 min): `inactive_since` on PG 17; before that, seen inactive with an unchanged `confirmed_flush_lsn` across sweeps that far apart. At start, a node also checks there is room for its slot in `max_replication_slots` and says which `cometgo_*` slots hold it. The docs require `max_slot_wal_keep_size` to bound what an orphan holds meanwhile.
 - **Confirming.** The node confirms the commit LSN of each transaction once the engine has drained it, and, when idle and outside a transaction, the WAL end from the server's keepalive, so writes to untracked tables do not pile up behind the slot.
@@ -123,6 +124,30 @@ Per node, at restart.
 
 Proposal, for the owner to decide: both feeds are in the open-source server. Logical decoding is what makes CometGo correct at scale and behind poolers, so leaving it out of OSS would ship a ceiling. The hosted offering's value is operating it: the database settings above, slot and lag monitoring, and a fan-out decoder for many nodes (M5).
 
+## Review
+
+A sparring agent reviewed the design from the code over three rounds, with experiments on Postgres 17, and ended at AGREE WITH CHANGES; the changes are applied above. What it forced:
+
+- the visibility gate (§4): decoded is not visible yet; the gate lives in the decoder, holding commits in order, not in the tick,
+- the reconnect rule by xid visibility instead of LSN (§6), after an experiment decoded a transaction that wrote before the consistent point and committed after it,
+- a persistent slot resumed from the last fully received commit instead of a temporary slot per connection (§5), with zombie handling that never terminates another process's walsender, and a sweep limited to the app's own database,
+- whole rows by default and the replica-identity hazard stated (§2), after an experiment showed a key-only column list, or a dropped primary key, breaks the app's own UPDATEs,
+- transactional messages for Emit and Revalidate (§3), after an experiment showed a non-transactional message waits for the WAL writer,
+- re-checks sent both ways during a migration, events not (§10).
+
 ## Tasks
 
-To be filed after review, with dependencies and acceptance criteria.
+Filed in Backlog with these dependencies (M4 module):
+
+| # | Task | Depends on |
+|---|---|---|
+| 1 | Feed interface: the listener behind a feed abstraction (`Config.Feed`), notifications carry an xid. No behaviour change. | |
+| 2 | `InstallPublication`, `UninstallTriggers`, and `checkTables` for logical mode (replica identity, partition root, key-only opt-in check) | |
+| 3 | pgoutput decoder: grouping, coalescing, key encoding with a parity test against the triggers, messages, and the visibility gate with epoch-extended xids | 1 |
+| 4 | Slot lifecycle: persistent slot, creation timeout, resume from the last received commit (verify the skip), zombie and conflict handling, `wal_sender_timeout`, confirming, liveness, missing slot, `SlotName`, health not-ready | 3 |
+| 5 | Fences, events and re-checks as messages in logical mode; the recreated-slot rule by visibility in S and its second pass; the `listened` fence release off in logical mode | 3, 4 |
+| 6 | Orphan slot sweeper and the slot headroom check | 4 |
+| 7 | Migration: `FeedMigrating`, re-checks both ways, LISTEN on logical nodes for re-checks only | 5 |
+| 8 | Streaming large transactions (pgoutput protocol 2) | 3 |
+| 9 | Docs: logical mode in server.md, the managed providers (checked against their current docs), limitations, and §11.1 moved out of [later] | 5, 6 |
+| 10 | Verify the exit criterion: feedbench at 16 and 64 writers and with wide rows, and the full suite with `Config.DB` through PgBouncer in transaction mode | 2, 5, 6, 7, 8 |
