@@ -1,4 +1,4 @@
-.PHONY: db todo test chaos build gen gen-check bench
+.PHONY: db todo test chaos build gen gen-check bench bench-feed
 
 db:
 	docker compose up -d
@@ -33,3 +33,7 @@ bench:
 	go run ./cmd/cometload -out docs/bench/base.md
 	go run ./cmd/cometload -scenario slow -out docs/bench/slow.md
 	go run ./cmd/cometload -scenario m3 -out docs/bench/m3-after.md
+
+bench-feed:
+	go run ./cmd/feedbench -writers 16 -out docs/bench/feedbench.md
+	go run ./cmd/feedbench -writers 64 -out docs/bench/feedbench-64.md
