@@ -1,6 +1,6 @@
 # M4 design: the logical-replication change feed
 
-Status: draft, under review (CMTG-31). The wire-visible parts will go in the [protocol](../protocol.md) §11, marked **[later]**. This page holds the engine design and the rules each implementation task must keep.
+Status: agreed design, not implemented (CMTG-31). The wire-visible parts will go in the [protocol](../protocol.md) §11, marked **[later]**. This page holds the engine design and the rules each implementation task must keep.
 
 **Goal.** Remove the NOTIFY ceiling on writes, and work when the app's pool goes through a transaction-mode pooler (PgBouncer, Supavisor, Neon's pooler).
 
