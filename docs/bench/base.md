@@ -1,6 +1,6 @@
 # cometload: base scenario
 
-Run 2026-10-13 10:59 UTC at commit c206ce3.
+Run 2026-10-14 12:09 UTC at commit 438f2cb-dirty.
 
 ## Machine
 
@@ -21,17 +21,17 @@ Driver, server and Postgres share the machine.
 | Shared groups / rows per result | 50 / 20 |
 | Direct writes | 200/s target, 201/s done |
 | Calls | 200/s target, 201/s sent |
-| Warmup / measured | 10s / 1m0s |
+| Warmup / measured | 10s / 1m0.001s |
 
 ## Calls
 
 | Method | Calls | p50 | p99 | max | lag:true |
 |---|---|---|---|---|---|
-| ping | 2448 | 0.6 ms | 5.7 ms | 8.1 ms | 0.00% |
-| shared.bump | 3672 | 36.0 ms | 81.9 ms | 129.8 ms | 0.00% |
-| user.add | 2421 | 36.9 ms | 88.3 ms | 140.4 ms | 0.00% |
-| user.bump | 3508 | 37.0 ms | 81.5 ms | 136.3 ms | 0.00% |
-| **all** | 12049 | **31.7 ms** | **82.1 ms** | 140.4 ms | **0.00%** |
+| ping | 2405 | 1.0 ms | 7.2 ms | 11.8 ms | 0.00% |
+| shared.bump | 3628 | 55.2 ms | 126.0 ms | 160.6 ms | 0.00% |
+| user.add | 2424 | 59.0 ms | 131.5 ms | 155.7 ms | 0.00% |
+| user.bump | 3616 | 55.5 ms | 126.0 ms | 164.3 ms | 0.00% |
+| **all** | 12073 | **50.0 ms** | **123.2 ms** | 164.3 ms | **0.00%** |
 
 Latency is send to `res` on the client, for calls answered ok.
 
@@ -39,12 +39,13 @@ Latency is send to `res` on the client, for calls answered ok.
 
 | Metric | Value |
 |---|---|
-| Ticks | 1727 (28.8/s) |
-| Tick duration p50 / p99 / max | 10.5 ms / 33.0 ms / 42.2 ms |
-| Runs per tick mean / p99 / max | 12.8 / 21 / 33 |
-| Fence wait p50 / p99 | 31.7 ms / 75.1 ms |
+| Ticks | 1283 (21.4/s) |
+| Tick duration p50 / p99 / max | 25.2 ms / 57.4 ms / 66.2 ms |
+| Runs per tick mean / p99 / max | 17.3 / 29 / 36 |
+| Fence wait p50 / p99 | 49.7 ms / 110.2 ms |
+| Staleness p50 / p99, other publications | 25.7 ms / 59.2 ms |
 | Observers / subscriptions | 1550 / 5000 |
-| Max queued bytes / coalescing conns | 16750 / 0 |
+| Max queued bytes / coalescing conns | 26237 / 0 |
 | Slow-consumer closes / listener reconnects / dropped clients | 0 / 0 / 0 |
 | Subs ended by the server at connect | 0 |
 
@@ -52,9 +53,9 @@ Latency is send to `res` on the client, for calls answered ok.
 
 | Metric | Value |
 |---|---|
-| Server RSS idle / loaded | 14.3 MiB / 94.0 MiB |
-| Server RSS per 1k connections | 79.7 MiB |
-| Connect + initial snapshots | 668ms |
-| Postgres CPU | 43% of one core |
+| Server RSS idle / loaded | 13.9 MiB / 86.6 MiB |
+| Server RSS per 1k connections | 72.7 MiB |
+| Connect + initial snapshots | 816ms |
+| Postgres CPU | 64% of one core |
 
 RSS per 1k connections is (loaded − idle) / clients × 1000, measured with every sub's snapshot sent. Postgres CPU is the container's cgroup CPU time over the measured window.

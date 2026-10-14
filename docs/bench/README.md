@@ -11,9 +11,9 @@ make db
 make bench
 ```
 
-`make bench` rewrites [base.md](base.md), [slow.md](slow.md) and [m3-before.md](m3-before.md). Each run takes about 75 seconds.
+`make bench` rewrites [base.md](base.md), [slow.md](slow.md) and [m3-after.md](m3-after.md). Each run takes about 75 seconds.
 
-`m3-before.md` records the `m3` scenario on the engine before M3 (see the [M3 design](../design/m3-slow-work.md)). Once M3 lands, it stays as the record of where M3 started; record the new runs under another `-out`. For a single ad hoc run, call the command directly; every load parameter is a flag (`go run ./cmd/cometload -h`):
+[m3-before.md](m3-before.md) records the `m3` scenario on the engine before M3 (see the [M3 design](../design/m3-slow-work.md)) and is no longer rewritten. [m3-after.md](m3-after.md) records it on the engine with M3, with the exit criterion's three-run medians at the end. For a single ad hoc run, call the command directly; every load parameter is a flag (`go run ./cmd/cometload -h`):
 
 ```sh
 go run ./cmd/cometload -clients 2000 -calls 500 -duration 30s

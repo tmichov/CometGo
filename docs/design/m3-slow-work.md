@@ -1,6 +1,6 @@
 # M3 design: slow-work isolation
 
-Status: agreed design, not implemented. The wire-visible parts are in the [protocol](../protocol.md) (§3.2, §4.5, §6.1, §6.2, §8.4, marked **[later]**). This page holds the engine design and the rules each implementation task must keep.
+Status: implemented. The exit criterion below is met: see [m3-after.md](../bench/m3-after.md), against [m3-before.md](../bench/m3-before.md) and [base.md](../bench/base.md). The wire-visible parts are in the [protocol](../protocol.md) (§3.2, §4.5, §6.1, §6.2, §8.4). This page holds the engine design and the rules the implementation keeps.
 
 **Goal.** A slow observer query or a slow publication `fn` cannot stall the other subscriptions or calls on the node.
 

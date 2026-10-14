@@ -31,6 +31,6 @@ promise resolves ◄────────── res ──────  (sent
 - [Typed clients](codegen.md): generate TypeScript types for methods and publications from the Go server.
 - [Wire protocol](protocol.md): the full protocol specification, including planned features.
 - [Load benchmarks](bench/README.md): the load harness and the recorded baseline numbers.
-- [M3 design: slow-work isolation](design/m3-slow-work.md): the agreed, not yet implemented, engine design for detaching slow queries and per-connection fences.
+- [M3 design: slow-work isolation](design/m3-slow-work.md): the engine design for detaching slow queries and slow publication `fn` calls, and per-connection fences, with how it was verified.
 - [Known limitations](limitations.md): what the current engine does not do well, and when that matters.
 - [Stability policy](stability.md): versioning, and what may change before 1.0.
