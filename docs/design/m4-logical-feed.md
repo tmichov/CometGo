@@ -122,7 +122,7 @@ Per node, at restart.
 
 ### 11. Open source and hosted
 
-Proposal, for the owner to decide: both feeds are in the open-source server. Logical decoding is what makes CometGo correct at scale and behind poolers, so leaving it out of OSS would ship a ceiling. The hosted offering's value is operating it: the database settings above, slot and lag monitoring, and a fan-out decoder for many nodes (M5).
+Decided (the owner, 2026-10-14): both feeds are in the open-source server. Logical decoding is what makes CometGo correct at scale and behind poolers, so leaving it out of OSS would ship a ceiling. The hosted offering's value is operating it: the database settings above, slot and lag monitoring, and a fan-out decoder for many nodes (M5).
 
 ## Review
 
