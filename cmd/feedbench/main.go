@@ -48,7 +48,7 @@ var modes = []mode{
 	{name: "triggers", desc: "InstallTriggers, one listener", triggers: true},
 	{name: "triggers+fence", desc: "InstallTriggers and a NOTIFY fence per transaction", triggers: true,
 		fence: "SELECT pg_notify('comet', '1|f|bench:' || $1::text)"},
-	{name: "logical", desc: "publication (key columns) and a slot read every 50 ms", logical: true},
+	{name: "logical", desc: "publication (whole rows) and a slot read every 50 ms", logical: true},
 	{name: "logical+fence", desc: "logical, and a transactional logical message per transaction", logical: true,
 		fence: "SELECT pg_logical_emit_message(true, 'comet', 'f|bench:' || $1::text)"},
 }
@@ -213,8 +213,8 @@ func setup(ctx context.Context, pool *pgxpool.Pool, m mode) error {
 		"VACUUM ANALYZE " + table,
 	}
 	if m.logical {
-		// Key columns only, as the feed needs no more (column lists: PG 15+).
-		stmts = append(stmts, "CREATE PUBLICATION feedbench FOR TABLE "+table+" (id)")
+		// Whole rows, the feed's default (a key-only column list is opt-in).
+		stmts = append(stmts, "CREATE PUBLICATION feedbench FOR TABLE "+table)
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {

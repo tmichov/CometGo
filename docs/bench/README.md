@@ -69,7 +69,7 @@ A single run is noisy on a laptop. Four back-to-back base runs on the baseline m
 | `plain` | No feed: the baseline. |
 | `triggers` | `InstallTriggers` on the table, with one connection listening on `comet`. |
 | `triggers+fence` | The same, and a `pg_notify` fence in every transaction, as a fenced call sends. |
-| `logical` | A publication with the table's key column, and a temporary pgoutput slot read every 50 ms. |
+| `logical` | A publication with the table (whole rows, the feed's default), and a temporary pgoutput slot read every 50 ms. |
 | `logical+fence` | The same, and a transactional `pg_logical_emit_message` in every transaction. |
 
 The logical modes need `wal_level=logical`, which `make db` sets (an existing container picks it up on `docker compose up -d`). Run them all with:
