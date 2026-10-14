@@ -67,12 +67,17 @@ In the request phase of a tick, `bind` and `recheck` no longer call `fn` inline.
 
 1. collects the `fn` calls its drained requests need (sub, rebind, revalidate),
 2. runs them concurrently, bounded by `Config.FnWorkers` (default 8), each with the tick's context,
-3. waits for all of them,
-4. applies the results on the engine goroutine, in request order, exactly as today.
+3. waits for them up to `Config.FnBudget` (default 50 ms),
+4. applies the results on the engine goroutine, in request order.
 
-The identity is still read at handle time, and nothing outlives the tick, so sub/unsub/rebind/revalidate ordering, `MaxSubs`, `MaxObservers` and duplicate handling do not change. A tick then waits for its slowest `fn` rather than for every `fn` in turn.
+A request whose calls are not done by then is **carried** to the next tick, with every later request of its connection, so each connection's requests still apply in order; other connections' requests apply now. The calls keep running on the shared workers (at most `FnWorkers` across ticks) and wake the engine when they finish. The identity is still read at handle time, and a call made for another identity than the one in force when its request applies is made again.
 
-A single very slow `fn` still holds its tick. That is accepted for M3 and documented. Moving `fn` state across ticks (pending subs, identity generations) was considered and rejected: it adds races with rebind, revalidate and resume that the exit criterion does not need.
+The first version waited for every call, so one slow `fn` held its tick. The exit run showed that a burst of 50 subs at 100 ms each held a tick for about 850 ms (CMTG-79), so the state moved across ticks after all. It is kept per request, which keeps the races small:
+
+- **Fences and `authRes`.** A connection with a carried request is not settled (§6.2): its fences and after messages wait until the request applies.
+- **Rebind.** While an identity change is carried, the connection gets no data or events for its subs: they are still bound under the identity it left. Ends still go out. The rebind then resets every sub.
+- **Revalidate** becomes one re-check request per connection, carried like any other. It re-checks the subs bound before the drain that brought it. A call still pending when such a drain names its user is marked stale and made again, since it may have read access data from before the change, and its sub is not bound yet for a re-check to reach.
+- **Resume, unsub and close** are ordinary requests of their connection, so they apply after its carried subs.
 
 **Tests:**
 

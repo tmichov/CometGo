@@ -250,8 +250,9 @@ func (e *engine) sendEvent(obs *observer, n *evtNote) {
 		// A coalescing connection (§8.1) gets no events: a held sub is
 		// behind the data the event follows, and queueing them would grow
 		// its memory with the event rate. Nor does a sub whose snapshot is
-		// unsent. At-most-once allows both.
-		if sub.c.evt && !e.coalescing[sub.c] && !sub.needInit && !sub.needsReset {
+		// unsent, or one of a connection whose identity change is carried
+		// (tick). At-most-once allows all three.
+		if sub.c.evt && !e.coalescing[sub.c] && !e.rebinding[sub.c] && !sub.needInit && !sub.needsReset {
 			sub.c.sendEvent(&evtMsg{T: "evt", S: sub.s, Topic: n.Topic, Data: n.Data})
 		}
 	}

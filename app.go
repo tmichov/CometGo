@@ -161,9 +161,17 @@ type Config struct {
 	// idempotency key is kept for retries. Default 24h.
 	IdempotencyTTL time.Duration
 
-	// FnWorkers caps the publication fn calls a tick runs at once, for the
-	// subs, identity changes and Revalidate re-checks it handles. Default 8.
+	// FnWorkers caps the publication fn calls that run at once, for the
+	// subs, identity changes and Revalidate re-checks the engine handles.
+	// Default 8.
 	FnWorkers int
+
+	// FnBudget is how long a tick waits for the publication fn calls it
+	// starts. A request whose calls are still running then waits for a
+	// later tick, with every later request of its connection, and that
+	// connection's method results and identity changes wait with it. Other
+	// connections go on. Default 50ms.
+	FnBudget time.Duration
 
 	MaxSubs     int // default 500
 	MaxInflight int // default 32
@@ -274,6 +282,7 @@ func New(cfg Config) *App {
 	}
 	def(&cfg.IdempotencyTTL, 24*time.Hour)
 	defi(&cfg.FnWorkers, 8)
+	def(&cfg.FnBudget, 50*time.Millisecond)
 	defi(&cfg.MaxSubs, 500)
 	defi(&cfg.MaxInflight, 32)
 	defi(&cfg.MaxMsg, 1<<20)
