@@ -97,6 +97,8 @@ The handshake is **pipelined**: the client may send `sub`/`call` immediately aft
   `authRes` is sent **after** that `tx`. The UI moves from user A's world to user B's world in one render. **[later]**: minimal diff rebind instead of resets.
 
   With slow-observer detachment and the tick budget (§8.4), a re-bound sub whose observer is in flight, or deferred by the tick budget, cannot get its reset in that `tx`. `authRes` is then held under the same per-connection condition as a fence (§6.2): it is sent once every sub of the connection reflects the new identity. Several identity changes on one connection send their `authRes` messages in order.
+
+  An identity change whose publication `fn` calls are still running when the tick's `fn` budget runs out (§8.4) is applied in a later tick. Until then the connection receives no data for its subs, so nothing reaches it under the identity it left; ends still go out.
 - **Failed auth** (the token is rejected with `UNAUTHENTICATED`, is not a string, or `Authenticate` fails, e.g. with `INTERNAL`) changes nothing: the server answers `{"t":"authRes","seq":…,"id":3,"ok":false,"err":{…}}` and keeps the current identity, its subscriptions and its expiry. A rejected new token says nothing about the old one, so a definitive `UNAUTHENTICATED` is treated the same as a transient error. The session is downgraded only when the old identity expires (`AUTH_EXPIRED`, below) or the client logs out with `token:null`. The client keeps its current user.
 - **In-flight calls** keep running under the identity they were received with.
 - **Expiry without refresh** is treated like logout. The server pushes an `authRes` with no `id`: `{"t":"authRes","seq":…,"ok":false,"err":{"code":"AUTH_EXPIRED"}}`. The client library refreshes proactively at about 80% of the token lifetime, when it can get a new token (a token function).
@@ -261,6 +263,8 @@ In v1-core, ticks are sequential and every dirty observer runs in each tick, so 
 
 With slow-observer detachment and the tick budget (§8.4), a tick no longer runs every dirty observer, so the server applies the condition above per connection. A fence whose connection still has an observer dirty from `n ≤ p` is carried to later ticks; fences of other connections are released as before. In addition, a sub whose initial or reset snapshot has not been sent holds the fence. A call on a connection subscribed to a slow publication therefore waits for that publication's next result, and gets `lag:true` if the result takes longer than the fence timeout. Calls on connections not subscribed to it are unaffected.
 
+A request of C that waits for a slow publication `fn` (a sub, an identity change, a re-check, and every later request of C; §8.4) holds C's fences too, until it is applied.
+
 **Edge cases:**
 
 | Situation | Behaviour |
@@ -392,7 +396,9 @@ Browsers cannot observe WebSocket control frames, so liveness is checked on both
 - Ticks proceed without it. Fences and identity changes on connections not subscribed to it proceed too (§6.2, §3.2).
 - An observer whose last run was detached and exceeded the soft deadline is *known slow*. It starts only when a detach slot is free, and is detached as soon as it starts, so a known slow query never blocks a tick. A detached run that finishes under the soft deadline clears this. A server holds a bounded number of detached queries at once; at the limit, a newly slow query blocks its tick as in v1-core.
 
-The soft deadline, the detach limit and the tick budget are server settings, not advertised.
+**Slow `fn`.** Publication `fn` calls (for a sub, an identity change, or a re-check) run on a bounded set of workers, and a tick waits for the ones it starts only until an `fn` budget (default 50 ms) has passed. A request whose calls are still running is carried to a later tick, together with every later request of the same connection, so a connection's requests still apply in the order it sent them. That connection's fences and `authRes` wait for them (§6.2, §3.2); other connections proceed. A carried call is made again if a re-check of its user (`comet_reval`) is drained before it is applied, since it may have checked access before the change.
+
+The soft deadline, the detach limit, the tick budget and the `fn` budget are server settings, not advertised.
 
 Cancel-and-retry is rejected because a query that always exceeds the deadline would never finish.
 
