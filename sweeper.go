@@ -37,23 +37,27 @@ func (f *logicalFeed) sweepLoop(ctx context.Context) {
 			return
 		case <-time.After(sweepEvery(after)):
 		}
-		if err := f.sweep(ctx, time.Now()); err != nil && ctx.Err() == nil {
+		if err := f.sweep(ctx, 0); err != nil && ctx.Err() == nil {
 			f.e.a.log.Warn("logical feed: orphan slot sweep failed", "err", err)
 		}
 	}
 }
 
 // sweep drops this database's cometgo_* slots, other than ours, that have
-// been inactive for OrphanSlotAfter as of now. PG 17 records inactive_since;
-// before, a slot counts from the first sweep that saw it inactive with its
-// current confirmed_flush_lsn, and starts again whenever it is seen active
-// or with another LSN. Dropping a slot that became active in between fails,
-// and is left alone.
-func (f *logicalFeed) sweep(ctx context.Context, now time.Time) error {
+// been inactive for OrphanSlotAfter. PG 17 records inactive_since, and its
+// age is taken on the database's clock, so a node whose clock is off by
+// more than OrphanSlotAfter cannot drop a live node's slot mid-reconnect.
+// Before 17, a slot counts from the first sweep that saw it inactive with
+// its current confirmed_flush_lsn, on this node's clock (it never compares
+// with another clock), and starts again whenever it is seen active or with
+// another LSN. Dropping a slot that became active in between fails, and is
+// left alone. elapsed is added to both ages, so tests need not wait.
+func (f *logicalFeed) sweep(ctx context.Context, elapsed time.Duration) error {
 	after := f.e.a.cfg.OrphanSlotAfter
+	now := f.clock().Add(elapsed)
 	rows, err := f.e.a.db.Query(ctx, `
 		SELECT slot_name, active, coalesce(confirmed_flush_lsn, '0/0'),
-			(to_jsonb(s)->>'inactive_since')::timestamptz
+			extract(epoch FROM now() - (to_jsonb(s)->>'inactive_since')::timestamptz)
 		FROM pg_replication_slots s
 		WHERE database = current_database() AND slot_type = 'logical'
 			AND slot_name LIKE 'cometgo\_%' AND slot_name <> $1`, f.slot)
@@ -61,34 +65,34 @@ func (f *logicalFeed) sweep(ctx context.Context, now time.Time) error {
 		return err
 	}
 	type slotRow struct {
-		name          string
-		active        bool
-		lsn           pglogrepl.LSN
-		inactiveSince *time.Time
+		name     string
+		active   bool
+		lsn      pglogrepl.LSN
+		inactive *float64 // seconds since inactive_since, on the database's clock (PG 17)
 	}
 	slots, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (s slotRow, err error) {
-		return s, r.Scan(&s.name, &s.active, &s.lsn, &s.inactiveSince)
+		return s, r.Scan(&s.name, &s.active, &s.lsn, &s.inactive)
 	})
 	if err != nil {
 		return err
 	}
 	seen := map[string]seenSlot{}
 	for _, s := range slots {
-		var since time.Time
+		var age time.Duration
 		switch {
 		case s.active:
 			continue
-		case s.inactiveSince != nil && !f.noInactiveSince:
-			since = *s.inactiveSince
+		case s.inactive != nil && !f.noInactiveSince:
+			age = time.Duration(*s.inactive*float64(time.Second)) + elapsed
 		default:
 			prev, ok := f.swept[s.name]
 			if !ok || prev.lsn != s.lsn {
 				prev = seenSlot{lsn: s.lsn, since: now}
 			}
 			seen[s.name] = prev
-			since = prev.since
+			age = now.Sub(prev.since)
 		}
-		if now.Sub(since) < after {
+		if age < after {
 			continue
 		}
 		if _, err := f.e.a.db.Exec(ctx, "SELECT pg_drop_replication_slot($1)", s.name); err != nil {
@@ -96,7 +100,7 @@ func (f *logicalFeed) sweep(ctx context.Context, now time.Time) error {
 			continue
 		}
 		delete(seen, s.name)
-		f.e.a.log.Info("logical feed: dropped orphan slot", "slot", s.name, "inactive_since", since)
+		f.e.a.log.Info("logical feed: dropped orphan slot", "slot", s.name, "inactive_for", age.Round(time.Second))
 	}
 	f.swept = seen
 	return nil

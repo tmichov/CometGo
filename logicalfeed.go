@@ -46,6 +46,7 @@ type logicalFeed struct {
 	// (tests). Owned by the sweeper.
 	swept           map[string]seenSlot
 	noInactiveSince bool
+	clock           func() time.Time // this node's clock, for swept (tests skew it)
 
 	// Timings, settable by tests.
 	senderTimeout time.Duration // wal_sender_timeout on the connection
@@ -65,6 +66,7 @@ func newLogicalFeed(e *engine) *logicalFeed {
 		senderTimeout: 10 * time.Second,
 		statusEvery:   time.Second,
 		createTimeout: 30 * time.Second,
+		clock:         time.Now,
 	}
 	f.gate = newGate(f.snapshot, f.deliver)
 	return f

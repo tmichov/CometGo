@@ -39,13 +39,13 @@ func TestSweeperDropsOrphan(t *testing.T) {
 	other := "cometgo_act_" + fe.table
 	fe.f.slot = other // the sweeping node's own slot is another one
 
-	if err := fe.f.sweep(ctx, time.Now()); err != nil {
+	if err := fe.f.sweep(ctx, 0); err != nil {
 		t.Fatal(err)
 	}
 	if !slotExists(t, fe, orphan) {
 		t.Fatal("slot dropped before OrphanSlotAfter")
 	}
-	if err := fe.f.sweep(ctx, time.Now().Add(fe.app.cfg.OrphanSlotAfter+time.Minute)); err != nil {
+	if err := fe.f.sweep(ctx, fe.app.cfg.OrphanSlotAfter+time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if slotExists(t, fe, orphan) {
@@ -64,19 +64,19 @@ func TestSweeperKeepsSlotWhoseLSNMoved(t *testing.T) {
 	ctx := context.Background()
 	slot := "cometgo_moved_" + fe.table
 	createSlot(t, fe, slot)
-	t0, after := time.Now(), fe.app.cfg.OrphanSlotAfter
-	if err := fe.f.sweep(ctx, t0); err != nil {
+	after := fe.app.cfg.OrphanSlotAfter
+	if err := fe.f.sweep(ctx, 0); err != nil {
 		t.Fatal(err)
 	}
 	fe.insert(t, 1) // WAL to advance over
 	execAll(t, fe.testEnv, "SELECT pg_replication_slot_advance('"+slot+"', pg_current_wal_lsn())")
-	if err := fe.f.sweep(ctx, t0.Add(after+time.Minute)); err != nil {
+	if err := fe.f.sweep(ctx, after+time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if !slotExists(t, fe, slot) {
 		t.Fatal("slot whose LSN moved was dropped")
 	}
-	if err := fe.f.sweep(ctx, t0.Add(2*after+2*time.Minute)); err != nil {
+	if err := fe.f.sweep(ctx, 2*after+2*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if slotExists(t, fe, slot) {
@@ -111,7 +111,7 @@ func TestSweeperKeepsOtherDatabase(t *testing.T) {
 	for _, fallback := range []bool{false, true} {
 		fe.f.noInactiveSince = fallback
 		for _, at := range []time.Duration{0, fe.app.cfg.OrphanSlotAfter + time.Minute} {
-			if err := fe.f.sweep(ctx, time.Now().Add(at)); err != nil {
+			if err := fe.f.sweep(ctx, at); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -148,5 +148,24 @@ func TestSlotHeadroomCheck(t *testing.T) {
 		if !strings.Contains(err.Error(), n+" (comet, inactive)") {
 			t.Errorf("error does not name %s: %v", n, err)
 		}
+	}
+}
+
+// On PG 17 a slot's age is taken on the database's clock: a node whose own
+// clock runs far ahead keeps a slot that has been inactive for seconds.
+func TestSweeperUsesDatabaseClock(t *testing.T) {
+	fe := newFeedEnv(t)
+	slot := "cometgo_fresh_" + fe.table
+	createSlot(t, fe, slot)
+	fe.f.clock = func() time.Time { return time.Now().Add(time.Hour) }
+	if err := fe.f.sweep(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	if err := fe.pool.QueryRow(context.Background(), "SELECT current_setting('server_version_num')::int").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v >= 170000 && !slotExists(t, fe, slot) {
+		t.Error("a slot inactive for seconds was dropped by a node whose clock runs an hour ahead")
 	}
 }
