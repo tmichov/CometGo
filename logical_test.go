@@ -3,6 +3,7 @@ package cometgo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -418,5 +419,32 @@ func TestDecoderTriggerParity(t *testing.T) {
 		if !slices.Equal(logical[i], trig[i]) {
 			t.Errorf("%s\n  triggers %q\n  decoder  %q", stmts[i], trig[i], logical[i])
 		}
+	}
+}
+
+// A snapshot error after part of the queue went out keeps only the rest:
+// nothing is delivered twice.
+func TestGateErrorDeliversOnce(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	g := newGate(func(context.Context) (pgSnapshot, error) {
+		if fail.Load() {
+			return pgSnapshot{}, errors.New("connection lost")
+		}
+		return pgSnapshot{xmin: 100, xmax: 100}, nil
+	}, nil)
+	var got []string
+	g.deliver = func(tx decodedTx) { got = append(got, noteStrings(tx.notes)...) }
+	g.push(decodedTx{notes: []notification{{reval: "msg"}}})
+	g.push(decodedTx{xid: 11, notes: []notification{{table: "t"}}})
+	if err := g.run(context.Background()); err == nil {
+		t.Fatal("run returned no error")
+	}
+	fail.Store(false)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	g.run(ctx)
+	if want := []string{"reval msg", "t dirty"}; !slices.Equal(got, want) {
+		t.Errorf("delivered %q, want %q", got, want)
 	}
 }

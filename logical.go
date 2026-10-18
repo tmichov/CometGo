@@ -351,14 +351,15 @@ func (g *gate) run(ctx context.Context) error {
 			}
 		}
 		var snap *pgSnapshot
+		var err error
 		n := 0
 		for _, tx := range queue {
 			var full uint64
 			if tx.xid != 0 {
 				if snap == nil {
-					s, err := g.snapshot(ctx)
-					if err != nil {
-						return err
+					var s pgSnapshot
+					if s, err = g.snapshot(ctx); err != nil {
+						break
 					}
 					snap = &s
 				}
@@ -373,9 +374,14 @@ func (g *gate) run(ctx context.Context) error {
 			g.deliver(tx)
 			n++
 		}
+		// Trimmed before an error returns too: what went out must not go
+		// out again on the next run.
 		g.mu.Lock()
 		g.queue = g.queue[n:]
 		g.mu.Unlock()
+		if err != nil {
+			return err
+		}
 		if n < len(queue) {
 			// Held: poll again soon, without backoff; visibility follows the
 			// commit by a standby round trip at most, in the normal case.
