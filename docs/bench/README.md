@@ -59,3 +59,24 @@ Driver, server and Postgres share the one machine, so compare numbers only betwe
 M3's exit criterion is overall call p99 within the baseline + 20%. To check a change, run `make bench` on the same machine that recorded the baseline, with nothing else heavy running, and compare the **all** row of the Calls table. Commit the new reports with the change only when they become the new baseline.
 
 A single run is noisy on a laptop. Four back-to-back base runs on the baseline machine gave an overall p99 of 82.1, 157.6, 72.8 and 77.9 ms (p50 31.7 to 39.7 ms). One run in four was an outlier at about twice the others. So run the base scenario at least three times on each side of a change and compare the median p99, not one run against [base.md](base.md).
+
+## Change-feed cost (feedbench)
+
+`cmd/feedbench` measures what the change feed costs writes, for M4 (see the [M4 design](../design/m4-logical-feed.md)). It runs the same transaction, one `UPDATE` of a random row by primary key, from many connections for 20 s per mode, and reports committed transactions per second:
+
+| Mode | What runs |
+|---|---|
+| `plain` | No feed: the baseline. |
+| `triggers` | `InstallTriggers` on the table, with one connection listening on `comet`. |
+| `triggers+fence` | The same, and a `pg_notify` fence in every transaction, as a fenced call sends. |
+| `logical` | A publication with the table (whole rows, the feed's default), and a temporary pgoutput slot read every 50 ms. |
+| `logical+fence` | The same, and a transactional `pg_logical_emit_message` in every transaction. |
+
+The logical modes need `wal_level=logical`, which `make db` sets (an existing container picks it up on `docker compose up -d`). Run them all with:
+
+```sh
+make bench-feed
+```
+
+It writes [feedbench.md](feedbench.md) (16 writers), [feedbench-64.md](feedbench-64.md) (64 writers) and [feedbench-wide.md](feedbench-wide.md) (16 writers, 1,800-byte rows, just under the TOAST threshold, since the logical feed decodes whole rows). The commit lock that NOTIFY takes shows more with more writers. As with cometload, the numbers are only comparable on one machine with nothing else heavy running. Like cometload, it drops and recreates its schema (`feedbench`) and publication on every run, so point it only at a database you can write to freely.
+
