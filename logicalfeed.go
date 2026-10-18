@@ -310,14 +310,16 @@ func (f *logicalFeed) restart(ctx context.Context) error {
 	f.dropIn.Store(&s)
 	f.e.notifyAll([]notification{{all: true, restart: &s}})
 	if len(s.xip) > 0 {
-		go f.secondPass(ctx, s)
+		go f.secondPass(ctx, s, f.snapshot)
 	}
 	return nil
 }
 
-func (f *logicalFeed) secondPass(ctx context.Context, s pgSnapshot) {
+// secondPass waits, polling snapshot, until every transaction in progress
+// in s has ended, then queues the second all-dirty pass.
+func (f *logicalFeed) secondPass(ctx context.Context, s pgSnapshot, snapshot func(context.Context) (pgSnapshot, error)) {
 	for ctx.Err() == nil {
-		cur, err := f.snapshot(ctx)
+		cur, err := snapshot(ctx)
 		if err == nil && !slices.ContainsFunc(s.xip, func(x uint64) bool { return !cur.visible(x) }) {
 			// An empty snapshot releases no fence.
 			f.e.notifyAll([]notification{{all: true, restart: &pgSnapshot{}}})
