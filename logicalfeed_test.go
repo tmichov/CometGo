@@ -366,3 +366,23 @@ func TestRecreatedSlotSpanningCall(t *testing.T) {
 		}
 	}
 }
+
+// On a logical node while FeedMigrating, a reconnect of its comet_reval
+// LISTEN re-checks every sub but neither marks observers dirty nor
+// releases a fence by listener generation: a message fence is released
+// only by its own message or by a restart's visibility.
+func TestRevalOnlyListenReleasesNoFence(t *testing.T) {
+	e := fenceEngine()
+	e.feed, e.revalOnly = newLogicalFeed(e), true
+	token, f := e.registerFence(nil)
+	e.markCommitted(token)
+	e.listening()
+	if n := e.pending[len(e.pending)-1]; n.all || n.listen == 0 {
+		t.Fatalf("revalOnly LISTEN queued %+v, want a re-check-only notification", n)
+	}
+	e.tick(context.Background())
+	if released(f) {
+		t.Fatal("fence released by a re-check LISTEN")
+	}
+	e.dropFence(token)
+}

@@ -119,6 +119,14 @@ type Config struct {
 	// FeedLogical, which needs ReplicationDSN.
 	Feed Feed
 
+	// FeedMigrating is set on every node while a running app moves between
+	// feeds (some nodes on FeedNotify, some on FeedLogical): re-checks
+	// (Revalidate, RevalidateAfterCommit) are then sent both ways, and
+	// logical nodes also listen for the notify nodes'. Events are not: an
+	// event reaches only subscribers on nodes of its sender's feed. Needs
+	// wal_level = logical. See docs/server.md, "Moving to the logical feed".
+	FeedMigrating bool
+
 	// ReplicationDSN is a direct connection to the database of DB for the
 	// logical feed's replication protocol (FeedLogical): poolers do not
 	// carry it. Required with FeedLogical.
@@ -376,6 +384,10 @@ func (a *App) Start(ctx context.Context) error {
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, a.cfg.QueryTimeout)
 	defer cancel()
+	if err := a.checkWalLevel(checkCtx); err != nil {
+		a.log.Error("start failed", "err", err)
+		return err
+	}
 	if err := a.checkTables(checkCtx); err != nil {
 		// Logged too: a caller that ignores the error would otherwise serve
 		// an app with no engine, and no clue why.
@@ -394,6 +406,24 @@ func (a *App) Start(ctx context.Context) error {
 			defer a.running.Done()
 			run(ctx)
 		}()
+	}
+	return nil
+}
+
+// checkWalLevel fails when a node would send logical messages (the logical
+// feed, or re-checks while FeedMigrating) that Postgres refuses without
+// wal_level = logical: every Revalidate would fail, and every method
+// calling RevalidateAfterCommit would roll back.
+func (a *App) checkWalLevel(ctx context.Context) error {
+	if a.cfg.Feed != FeedLogical && !a.cfg.FeedMigrating {
+		return nil
+	}
+	var level string
+	if err := a.db.QueryRow(ctx, "SHOW wal_level").Scan(&level); err != nil {
+		return err
+	}
+	if level != "logical" {
+		return fmt.Errorf("cometgo: Config.Feed = FeedLogical and Config.FeedMigrating need wal_level = logical on the server, which has %q", level)
 	}
 	return nil
 }

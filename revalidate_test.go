@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"os"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -501,4 +502,116 @@ func TestRevalidateUserIDTooLong(t *testing.T) {
 	if n := e.countRows(t, "SELECT count(*) FROM "+e.table+" WHERE name = 'after-long'"); n != 1 {
 		t.Fatalf("method's write: %d rows", n)
 	}
+}
+
+// While FeedMigrating, a notify node and a logical node share re-checks: a
+// revoke sent on either one ends the revoked sub on the other, by
+// Revalidate and by RevalidateAfterCommit.
+func TestRevalidateAcrossFeedsWhileMigrating(t *testing.T) {
+	var members string
+	team := dbTeam(t, &members)
+	e := setupFull(t, func(c *Config) {
+		c.Feed, c.ReplicationDSN, c.FeedMigrating = FeedNotify, "", true
+	}, func(env *testEnv, app *App) {
+		team(env, app)
+		// Both feeds' setup: the notify node needs the triggers (setupFull
+		// installed them on env.table), the logical node the publication.
+		if err := InstallTriggers(context.Background(), env.pool, members); err != nil {
+			t.Fatal(err)
+		}
+		if err := InstallPublication(context.Background(), env.pool, env.table, members); err != nil {
+			t.Fatal(err)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	logical := New(Config{
+		DB:              e.pool,
+		Feed:            FeedLogical,
+		ReplicationDSN:  os.Getenv("COMETGO_TEST_DATABASE_URL"),
+		FeedMigrating:   true,
+		MinTickInterval: 5 * time.Millisecond,
+		Authenticate: func(ctx context.Context, token string) (*Identity, error) {
+			return &Identity{UserID: token}, nil
+		},
+	})
+	publishDBTeam(logical, e, members)
+	dropSlotAfter(t, logical, e.pool, cancel)
+	if err := logical.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(logical)
+	t.Cleanup(srv.Close)
+	l := &testEnv{app: logical, srv: srv, pool: e.pool, table: e.table}
+	e.waitListening(t)
+	l.waitListening(t)
+	// The logical node's LISTEN for re-checks is up too.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		logical.engine.mu.Lock()
+		gen := logical.engine.listenGen
+		logical.engine.mu.Unlock()
+		if gen > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("logical node did not LISTEN on comet_reval")
+		}
+	}
+
+	sub := func(env *testEnv, user string) *client {
+		c, _ := env.dial(t, map[string]any{"auth": map[string]any{"token": user}})
+		c.send(map[string]any{"t": "sub", "s": 1, "name": "dbteam"})
+		if en := entries(c.next()); en[0]["ready"] != true {
+			t.Fatalf("%s: snapshot %v", user, en)
+		}
+		return c
+	}
+	revoke := func(user string) {
+		if _, err := e.pool.Exec(ctx, "DELETE FROM "+members+" WHERE user_id = $1", user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ended := func(c *client, who string) {
+		t.Helper()
+		if en := entries(c.next()); len(en) != 1 || !isForbiddenEnd(en[0]) {
+			t.Fatalf("%s: %v", who, en)
+		}
+	}
+
+	// Notify node sends, logical node ends.
+	aliceOnLogical := sub(l, "alice")
+	revoke("alice")
+	e.revalidate(t, "alice")
+	ended(aliceOnLogical, "alice on the logical node, revoked on the notify node")
+
+	// Logical node sends, notify node ends.
+	bobOnNotify := sub(e, "bob")
+	revoke("bob")
+	l.revalidate(t, "bob")
+	ended(bobOnNotify, "bob on the notify node, revoked on the logical node")
+
+	// RevalidateAfterCommit in a method on the notify node reaches the
+	// logical node.
+	if _, err := e.pool.Exec(ctx, "INSERT INTO "+members+" VALUES ('carol')"); err != nil {
+		t.Fatal(err)
+	}
+	carolOnLogical := sub(l, "carol")
+	caller, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "bob"}}) // any token the notify node accepts
+	caller.send(map[string]any{"t": "call", "id": 1, "m": "leave", "args": map[string]any{"User": "carol"}})
+	if r := caller.next(); r["t"] != "res" || r["ok"] != true {
+		t.Fatalf("leave: %v", r)
+	}
+	ended(carolOnLogical, "carol on the logical node, after leave on the notify node")
+
+	// A notify node not yet restarted with FeedMigrating sends a NOTIFY
+	// only: the logical node gets it through its LISTEN on comet_reval.
+	if _, err := e.pool.Exec(ctx, "INSERT INTO "+members+" VALUES ('dave')"); err != nil {
+		t.Fatal(err)
+	}
+	daveOnLogical := sub(l, "dave")
+	revoke("dave")
+	if _, err := e.pool.Exec(ctx, "SELECT pg_notify('"+revalChannel+"', 'dave')"); err != nil {
+		t.Fatal(err)
+	}
+	ended(daveOnLogical, "dave on the logical node, revoked by a NOTIFY alone")
 }

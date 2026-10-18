@@ -44,6 +44,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `Heartbeat` | 25s | The server pings every interval and closes the connection with 4408 if a ping gets no pong within twice the interval. Also sent to the client, which uses it for its own liveness check. |
 | `MinTickInterval` | 20ms | Minimum time between engine ticks. Bursts of changes inside the interval are coalesced into one re-run. |
 | `Feed` | `FeedNotify` | Change feed. `FeedNotify` listens for the triggers' notifications (see `InstallTriggers`). `FeedLogical` decodes the write-ahead log through a replication slot per node, from the tables `InstallPublication` publishes; it needs `ReplicationDSN`, PostgreSQL 14 or later and `wal_level = logical` ([protocol §11.1](protocol.md#111-later-logical-replication-feed)). Fences, events and re-checks then travel as logical messages, and no `NOTIFY` is sent. |
+| `FeedMigrating` | false | Set on every node while a running app moves between feeds ([Moving to the logical feed](#moving-to-the-logical-feed)): re-checks from `Revalidate` and `RevalidateAfterCommit` are sent both as a `NOTIFY` and as a logical message, and logical nodes also listen for the notify nodes'. Needs `wal_level = logical`. |
 | `OrphanSlotAfter` | 10 min | Logical feed only: every node drops the `cometgo_*` replication slots of its own database that have been inactive this long, as left behind by a crashed process (a clean `Shutdown` drops its own). Slots of other databases on the cluster, and active slots, are never touched. PostgreSQL 17 dates inactivity itself (`inactive_since`); before 17, a slot counts as inactive from the first sweep that saw it inactive with its current position. Negative disables the sweep. Until an orphan goes it holds WAL, so set `max_slot_wal_keep_size` on the server to bound that. Creating a slot with `max_replication_slots` full fails with an error naming the `cometgo_*` slots that hold places. |
 | `ReplicationDSN` | none | Required with `FeedLogical`: a direct connection to the same database for the replication protocol. Poolers do not carry it. |
 | `SlotName` | the random node ID | Logical feed only: names this node's replication slot `cometgo_<SlotName>`. Lowercase letters, digits and underscores, at most 55; `Start` rejects anything else. Set a stable name (a pod or host name) so a restarted process resumes its slot instead of leaving an orphan. `Shutdown` drops the slot; a crashed process leaves it behind. |
@@ -584,3 +585,31 @@ The counterpart of `InstallTriggers` for the logical feed (`FeedLogical`). It ad
 `InstallPublication` publishes whole rows. `InstallPublicationKeysOnly` limits each table's column list to its primary key, which keeps the change stream small for wide tables. It needs PostgreSQL 15 or newer and `REPLICA IDENTITY DEFAULT`. Each function switches a table that is already in the publication to its own form.
 
 **Replica identity.** Postgres refuses `UPDATE` and `DELETE` on a published table that has no usable replica identity. So both functions refuse a table, or a partition, that has neither `REPLICA IDENTITY DEFAULT` with a primary key nor `FULL`. A migration that runs later and drops the primary key, sets `REPLICA IDENTITY NOTHING`, or (under a key-only list) changes the key, makes the app's own writes to that table fail until it is fixed. The check at `Start` catches this only when it already happened before the restart. After changing a key under a key-only list, run `InstallPublicationKeysOnly` again.
+
+## Moving to the logical feed
+
+A running app moves from `FeedNotify` to `FeedLogical` one node at a time, without downtime. During the move some nodes run each feed, and both kinds of nodes serve the same subscriptions correctly. Only events are affected (below).
+
+1. **Prepare the server.**
+   - Set `wal_level = logical`. This needs a Postgres restart.
+   - Make room in `max_replication_slots` and `max_wal_senders`: one slot and one sender per node, plus whatever standbys and other replication tools use.
+   - Set `max_slot_wal_keep_size`.
+   - Give the app's role `REPLICATION`, or your provider's equivalent.
+2. **Publish the tables.** Run `InstallPublication` for every table in a publication's `Tables`, next to `InstallTriggers`, which stays.
+3. **Restart every node with `FeedMigrating: true`**, still on `FeedNotify`. From now on, every re-check is sent both ways.
+4. **Roll the nodes to the logical feed** one at a time:
+   - set `Feed: FeedLogical` and `ReplicationDSN`;
+   - set a stable `SlotName`, so a restarted node resumes its slot;
+   - keep `FeedMigrating: true`.
+
+   A logical node keeps a `LISTEN` on re-checks for as long as `FeedMigrating` is set, so it also gets re-checks from notify nodes that have not reached step 3.
+5. **Once every node runs the logical feed,** restart them with `FeedMigrating` off.
+6. **Run `UninstallTriggers`** for the tables. Writes stop paying for the triggers only from here.
+
+**During the move:**
+
+- **Re-checks** reach every node, whatever its feed: a lost one would leave a permission granted.
+- **Events** are not sent both ways. An event emitted on a node of one feed reaches only subscribers on nodes of the same feed. Events are at-most-once, and nothing could de-duplicate a second copy.
+- **Fences and method results** are unaffected: each node waits for its own calls on its own feed.
+
+**Rolling back** is the same steps in reverse, as long as the triggers are still installed. After `UninstallTriggers`, a notify-mode node refuses to start, because `Start` checks the triggers. Run `InstallTriggers` first.
