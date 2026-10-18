@@ -448,3 +448,63 @@ func TestGateErrorDeliversOnce(t *testing.T) {
 		t.Errorf("delivered %q, want %q", got, want)
 	}
 }
+
+// A streamed transaction is folded into its tables, dirty, then its comet
+// messages, at its Stream Commit; a rolled-back savepoint's messages go,
+// an aborted transaction leaves nothing, and a transaction committed
+// between chunks goes out on its own, in commit order.
+func TestDecoderStreamed(t *testing.T) {
+	d := testDecoder(t)
+	ctx := context.Background()
+	feed := func(msgs ...pglogrepl.Message) []*decodedTx {
+		t.Helper()
+		var out []*decodedTx
+		for _, m := range msgs {
+			tx, err := d.handle(ctx, m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tx != nil {
+				out = append(out, tx)
+			}
+		}
+		return out
+	}
+	ins := func(xid, rel uint32, vals ...string) pglogrepl.Message {
+		m := &pglogrepl.InsertMessageV2{}
+		m.Xid, m.RelationID, m.Tuple = xid, rel, textTuple(vals...)
+		return m
+	}
+	msg := func(xid uint32, content string) pglogrepl.Message {
+		m := &pglogrepl.LogicalDecodingMessageV2{}
+		m.Xid, m.Transactional, m.Prefix, m.Content = xid, true, "comet", []byte(content)
+		return m
+	}
+	start := func(xid uint32) pglogrepl.Message { return &pglogrepl.StreamStartMessageV2{Xid: xid} }
+	stop := &pglogrepl.StreamStopMessageV2{}
+
+	out := feed(
+		start(100), ins(100, 1, "1", "0"), ins(100, 2, "a", "1", "0"), msg(100, "e|"+`{"p":"items","t":"x"}`), stop,
+		// A small transaction commits between chunks.
+		&pglogrepl.BeginMessage{Xid: 7}, &pglogrepl.InsertMessage{RelationID: 1, Tuple: textTuple("5", "0")}, &pglogrepl.CommitMessage{TransactionEndLSN: 50},
+		start(100), ins(101, 1, "2", "0"), msg(101, "v|gone"), ins(100, 9, "1"), stop,
+		&pglogrepl.StreamAbortMessageV2{Xid: 100, SubXid: 101}, // savepoint 101 rolled back
+		start(100), msg(100, "f|tok"), stop,
+		&pglogrepl.StreamCommitMessageV2{Xid: 100, TransactionEndLSN: 90},
+		start(200), ins(200, 1, "3", "0"), stop,
+		&pglogrepl.StreamAbortMessageV2{Xid: 200, SubXid: 200},
+	)
+	if len(out) != 2 {
+		t.Fatalf("got %d transactions, want 2", len(out))
+	}
+	if got := noteStrings(out[0].notes); out[0].xid != 7 || !slices.Equal(got, []string{`public.items [["5"]]`}) {
+		t.Errorf("between chunks: xid %d %q", out[0].xid, got)
+	}
+	want := []string{"all", "public.items dirty", "s.comp dirty", "evt items", "fence tok"}
+	if got := noteStrings(out[1].notes); out[1].xid != 100 || out[1].end != 90 || !slices.Equal(got, want) {
+		t.Errorf("streamed: xid %d end %d\n  got  %q\n  want %q", out[1].xid, out[1].end, got, want)
+	}
+	if len(d.streams) != 0 || d.inStream {
+		t.Errorf("stream state left: %v %v", d.streams, d.inStream)
+	}
+}
