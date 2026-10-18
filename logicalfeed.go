@@ -166,6 +166,7 @@ func (f *logicalFeed) run(ctx context.Context) {
 	backoff := minBackoff
 	for ctx.Err() == nil {
 		startedAt, err := f.runOnce(ctx)
+		f.e.feedIsDown(err)
 		if ctx.Err() != nil {
 			break
 		}
@@ -286,6 +287,7 @@ func (f *logicalFeed) runOnce(ctx context.Context) (startedAt time.Time, err err
 	}
 	startedAt = time.Now()
 	f.e.starts.Add(1)
+	f.e.feedIsUp()
 	return startedAt, f.stream(ctx, conn)
 }
 
