@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -465,5 +466,70 @@ func TestLargeTransactionStreamed(t *testing.T) {
 	// ahead of the call's; streamed, most of it was decoded while it ran.
 	if with > without/2 {
 		t.Errorf("small call took %v streamed, %v without streaming: not held for less than half the decode", with, without)
+	}
+}
+
+// The second pass waits while any transaction in progress in S is still
+// running, then queues exactly one all-dirty restart that releases no
+// fence; it gives up when ctx ends.
+func TestSecondPassWaitsForSInProgress(t *testing.T) {
+	e := fenceEngine()
+	f := newLogicalFeed(e)
+	token, fc := e.registerFence(nil)
+	e.setFenceXid(token, 20)
+	s := pgSnapshot{xmin: 10, xmax: 40, xip: []uint64{20, 30}}
+	var running atomic.Value // the xids still in progress, []uint64
+	running.Store([]uint64{20, 30})
+	snap := func(context.Context) (pgSnapshot, error) {
+		return pgSnapshot{xmin: 10, xmax: 50, xip: running.Load().([]uint64)}, nil
+	}
+	queued := func() int {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return len(e.pending)
+	}
+	done := make(chan struct{})
+	go func() {
+		f.secondPass(context.Background(), s, snap)
+		close(done)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	running.Store([]uint64{30}) // 20 has ended, 30 has not
+	time.Sleep(100 * time.Millisecond)
+	if n := queued(); n != 0 {
+		t.Fatalf("queued %d notifications while 30 was still running", n)
+	}
+	running.Store([]uint64{})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second pass never ran")
+	}
+	if n := queued(); n != 1 {
+		t.Fatalf("queued %d notifications, want one", n)
+	}
+	if n := e.pending[0]; !n.all || n.restart == nil || n.restart.visible(20) {
+		t.Fatalf("queued %+v, want an all-dirty restart on an empty snapshot", n)
+	}
+	e.tick(context.Background())
+	if released(fc) {
+		t.Error("the second pass released a fence")
+	}
+	e.dropFence(token)
+
+	// A ctx that ends while it waits stops it.
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		f.secondPass(ctx, pgSnapshot{xmax: 40, xip: []uint64{30}}, func(context.Context) (pgSnapshot, error) {
+			return pgSnapshot{xmax: 50, xip: []uint64{30}}, nil
+		})
+		close(stopped)
+	}()
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second pass kept waiting after ctx ended")
 	}
 }
