@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,7 +33,7 @@ func newFeedEnv(t *testing.T) *feedEnv {
 	if err := InstallPublication(context.Background(), e.pool, e.table); err != nil {
 		t.Fatal(err)
 	}
-	app := New(Config{DB: e.pool, ReplicationDSN: os.Getenv("COMETGO_TEST_DATABASE_URL"), SlotName: "t" + e.table})
+	app := New(Config{DB: e.pool, ReplicationDSN: testDirectDSN(), SlotName: "t" + e.table})
 	fe := &feedEnv{testEnv: e, app: app, f: newLogicalFeed(app.engine)}
 	t.Cleanup(func() {
 		fe.halt()
@@ -216,7 +215,12 @@ func TestLogicalFeedRecreatesDroppedSlot(t *testing.T) {
 	fe.start()
 	waitFor(t, "the slot", func() bool { return len(fe.notes()) > 0 })
 	fe.halt()
-	execAll(t, fe.testEnv, "SELECT pg_drop_replication_slot('"+fe.f.slot+"')")
+	// The walsender may still hold the slot for a moment after the feed's
+	// connection closed.
+	waitFor(t, "the slot dropped", func() bool {
+		_, err := fe.pool.Exec(context.Background(), "SELECT pg_drop_replication_slot($1)", fe.f.slot)
+		return err == nil
+	})
 	before := len(fe.notes())
 	fe.start()
 	// Changes before the new slot's consistent point are never decoded;
@@ -307,7 +311,7 @@ func TestDeliverDropsTransactionsVisibleInS(t *testing.T) {
 func TestRecreatedSlotSpanningCall(t *testing.T) {
 	release := make(chan struct{})
 	e := setupFull(t, func(c *Config) {
-		c.Feed, c.ReplicationDSN = FeedLogical, os.Getenv("COMETGO_TEST_DATABASE_URL")
+		c.Feed, c.ReplicationDSN = FeedLogical, testDirectDSN()
 	}, func(env *testEnv, app *App) {
 		if err := InstallPublication(context.Background(), env.pool, env.table); err != nil {
 			t.Fatal(err)
@@ -397,7 +401,7 @@ func TestRevalOnlyListenReleasesNoFence(t *testing.T) {
 // transaction is streamed (or, without streaming, spilled to disk).
 func largeTxThenCall(t *testing.T, streaming bool) (time.Duration, slotStats) {
 	t.Helper()
-	dsn := os.Getenv("COMETGO_TEST_DATABASE_URL")
+	dsn := testDirectDSN()
 	sep := "?"
 	if strings.Contains(dsn, "?") {
 		sep = "&"
@@ -542,13 +546,13 @@ func TestSecondPassWaitsForSInProgress(t *testing.T) {
 func proxiedFeed(t *testing.T) (*feedEnv, *pauseProxy) {
 	t.Helper()
 	fe := newFeedEnv(t)
-	cc, err := pgconn.ParseConfig(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	cc, err := pgconn.ParseConfig(testDirectDSN())
 	if err != nil {
 		t.Fatal(err)
 	}
 	proxy := newPauseProxy(t, net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port))))
 	t.Cleanup(proxy.resume) // before the feed's cleanup, so it can stop
-	u, err := url.Parse(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	u, err := url.Parse(testDirectDSN())
 	if err != nil {
 		t.Fatal(err)
 	}

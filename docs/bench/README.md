@@ -69,14 +69,16 @@ A single run is noisy on a laptop. Four back-to-back base runs on the baseline m
 | `plain` | No feed: the baseline. |
 | `triggers` | `InstallTriggers` on the table, with one connection listening on `comet`. |
 | `triggers+fence` | The same, and a `pg_notify` fence in every transaction, as a fenced call sends. |
-| `logical` | A publication with the table (whole rows, the feed's default), and a temporary pgoutput slot read every 50 ms. |
-| `logical+fence` | The same, and a transactional `pg_logical_emit_message` in every transaction. |
+| `logical` | `InstallPublication` on the table (whole rows, the feed's default), and a CometGo `App` on `FeedLogical` streaming its slot: the real consumer, with its replication connection, visibility gate and engine. |
+| `logical+fence` | The same, and a transactional `pg_logical_emit_message` in every transaction, as a fenced call sends. |
 
 The logical modes need `wal_level=logical`, which `make db` sets (an existing container picks it up on `docker compose up -d`). Run them all with:
 
 ```sh
 make bench-feed
 ```
+
+`make bench-feed` runs 5 rounds per configuration, the modes alternating within each round, and reports each mode's median and range. Every transaction waits on a WAL flush, and on a laptop disk the flush time varies so much that one run of `plain` can come out at half the speed of the next.
 
 It writes [feedbench.md](feedbench.md) (16 writers), [feedbench-64.md](feedbench-64.md) (64 writers) and [feedbench-wide.md](feedbench-wide.md) (16 writers, 1,800-byte rows, just under the TOAST threshold, since the logical feed decodes whole rows). The commit lock that NOTIFY takes shows more with more writers. As with cometload, the numbers are only comparable on one machine with nothing else heavy running. Like cometload, it drops and recreates its schema (`feedbench`) and publication on every run, so point it only at a database you can write to freely.
 

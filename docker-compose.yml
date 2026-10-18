@@ -12,5 +12,15 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  # Transaction-mode pooler for make test-pgbouncer: Config.DB through it,
+  # the logical feed's replication connection direct.
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    depends_on: [postgres]
+    ports:
+      - "54330:5432"
+    volumes:
+      - ./docker/pgbouncer:/etc/pgbouncer:ro
+
 volumes:
   pgdata:

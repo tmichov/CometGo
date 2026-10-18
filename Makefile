@@ -1,4 +1,4 @@
-.PHONY: db todo test test-logical chaos build gen gen-check bench bench-feed
+.PHONY: db todo test test-logical test-pgbouncer chaos build gen gen-check bench bench-feed
 
 db:
 	docker compose up -d
@@ -27,6 +27,14 @@ test:
 test-logical:
 	COMETGO_TEST_FEED=logical go test -count=1 .
 
+# The Go suite on the logical feed with Config.DB through PgBouncer in
+# transaction mode (port 54330) and the replication connection direct.
+test-pgbouncer:
+	COMETGO_TEST_FEED=logical \
+	COMETGO_TEST_DATABASE_URL=postgres://comet:comet@localhost:54330/comet \
+	COMETGO_TEST_DIRECT_URL=postgres://comet:comet@localhost:54329/comet \
+	go test -count=1 .
+
 # Fault-injection tests, as CI runs them (needs the db and COMETGO_TEST_DATABASE_URL).
 chaos:
 	COMETGO_TEST_PG_RESTART="docker compose restart postgres" go test -race -count=3 -run TestChaos .
@@ -39,6 +47,6 @@ bench:
 	go run ./cmd/cometload -scenario m3 -out docs/bench/m3-after.md
 
 bench-feed:
-	go run ./cmd/feedbench -writers 16 -out docs/bench/feedbench.md
-	go run ./cmd/feedbench -writers 64 -out docs/bench/feedbench-64.md
-	go run ./cmd/feedbench -writers 16 -payload 1800 -out docs/bench/feedbench-wide.md
+	go run ./cmd/feedbench -rounds 5 -writers 16 -out docs/bench/feedbench.md
+	go run ./cmd/feedbench -rounds 5 -writers 64 -out docs/bench/feedbench-64.md
+	go run ./cmd/feedbench -rounds 5 -writers 16 -payload 1800 -out docs/bench/feedbench-wide.md

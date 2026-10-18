@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
-	"os"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -508,6 +507,7 @@ func TestRevalidateUserIDTooLong(t *testing.T) {
 // revoke sent on either one ends the revoked sub on the other, by
 // Revalidate and by RevalidateAfterCommit.
 func TestRevalidateAcrossFeedsWhileMigrating(t *testing.T) {
+	skipPooled(t, "its notify-mode node LISTENs, which a transaction pooler cannot carry")
 	var members string
 	team := dbTeam(t, &members)
 	e := setupFull(t, func(c *Config) {
@@ -528,7 +528,7 @@ func TestRevalidateAcrossFeedsWhileMigrating(t *testing.T) {
 	logical := New(Config{
 		DB:              e.pool,
 		Feed:            FeedLogical,
-		ReplicationDSN:  os.Getenv("COMETGO_TEST_DATABASE_URL"),
+		ReplicationDSN:  testDirectDSN(),
 		FeedMigrating:   true,
 		MinTickInterval: 5 * time.Millisecond,
 		Authenticate: func(ctx context.Context, token string) (*Identity, error) {

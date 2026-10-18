@@ -37,3 +37,26 @@ jobs:
           COMETGO_TEST_DATABASE_URL: postgres://comet:comet@localhost:54329/comet
           COMETGO_TEST_FEED: logical
         run: go test -count=1 .
+
+  # The suite on the logical feed with Config.DB through PgBouncer in
+  # transaction mode and the replication connection direct (M4 exit
+  # criterion), as make test-pgbouncer runs it.
+  pgbouncer:
+    runs-on: ubuntu-latest
+    name: logical feed through PgBouncer
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Start Postgres and PgBouncer
+        run: |
+          docker compose up -d postgres pgbouncer
+          for i in $(seq 60); do
+            docker compose exec -T postgres pg_isready -U comet -d comet -h 127.0.0.1 && exit 0
+            sleep 1
+          done
+          docker compose logs
+          exit 1
+      - name: Tests through PgBouncer
+        run: make test-pgbouncer

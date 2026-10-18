@@ -1,6 +1,6 @@
 # M4 design: the logical-replication change feed
 
-Status: agreed design, not implemented (CMTG-31). The wire-visible parts will go in the [protocol](../protocol.md) §11, marked **[later]**. This page holds the engine design and the rules each implementation task must keep.
+Status: implemented (CMTG-83 to CMTG-90); exit criterion partly met (CMTG-92, below). The wire-visible parts will go in the [protocol](../protocol.md) §11, marked **[later]**. This page holds the engine design and the rules each implementation task must keep.
 
 **Goal.** Remove the NOTIFY ceiling on writes, and work when the app's pool goes through a transaction-mode pooler (PgBouncer, Supavisor, Neon's pooler).
 
@@ -23,10 +23,27 @@ Measured with [feedbench](../bench/README.md#change-feed-cost-feedbench) on the 
 | logical | 3,600 (72%) | 5,904 (90%) | 1,792 (96%) |
 | logical + message fence | 3,728 (74%) | 4,569 (69%) | 1,588 (85%) |
 
-Reports: [feedbench.md](../bench/feedbench.md), [feedbench-64.md](../bench/feedbench-64.md), [feedbench-wide.md](../bench/feedbench-wide.md).
+Reports: commit 1638072 (`docs/bench/feedbench*.md`); the files there now hold the CMTG-92 runs below.
 
 - **The NOTIFY feed is the ceiling.** With the triggers, throughput stays near 600 tx/s whatever the number of writers, and p50 latency goes from 3 ms to 25 ms (16 writers) and from 9 ms to 105 ms (64 writers): commits that queued a notification serialize.
 - **The logical feed costs 4–31%,** a 6–15× gain over the triggers, but not yet the 90% the exit criterion asks for in every mode. feedbench reads its slot through the SQL interface every 50 ms, a stand-in for the streaming consumer; CMTG-92 measures the real one, and the criterion is revisited there if the streaming feed still falls short. The extra cost of a message fence at 64 writers (69% against 90% without) is the first thing to look at.
+
+### Exit criterion check (CMTG-92, 2026-10-18)
+
+The logical modes now run the real consumer: a CometGo `App` on `FeedLogical`, streaming its slot through the visibility gate. Every transaction waits on a WAL flush, and on the baseline machine's disk one run of `plain` can come out at half the speed of the next, so each configuration ran 5 rounds with the modes alternating. The figures are medians, with "vs plain" comparing medians. Reports: [feedbench.md](../bench/feedbench.md), [feedbench-64.md](../bench/feedbench-64.md), [feedbench-wide.md](../bench/feedbench-wide.md).
+
+| Mode | 16 writers | 64 writers | 16 writers, 1,800-byte rows |
+|---|---|---|---|
+| plain (no feed) | 1,991 tx/s (1,817–4,883) | 6,935 (5,970–9,444) | 1,955 (1,509–2,399) |
+| logical | 95% | **87%** | **84%** |
+| logical + message fence | 102% | **78%** | **87%** |
+
+- **Result.** Met at 16 writers. Not met at 64 writers or with 1,800-byte rows, so M4 is not done.
+- **Clearest gap.** The fenced mode at 64 writers: its range (5,227–6,220) sits below most of `plain`'s.
+- **What the writers wait on.** Sampling `pg_stat_activity` during fenced runs shows them waiting on `LWLock:WALWrite`, i.e. flushes not grouped.
+- **What the feed adds.** The feed's gate took about 1,000–1,500 `pg_current_snapshot()` per second while keeping up. Each one takes `ProcArrayLock`, which every commit takes too.
+- **Not the message itself.** With nothing reading the slot, the same fenced workload ran at 87% of `plain`.
+- **The PgBouncer half of the criterion is met.** The suite passes with `Config.DB` through PgBouncer 1.24 in transaction mode and `ReplicationDSN` direct (`make test-pgbouncer`, in CI).
 
 ## What the spike showed
 
