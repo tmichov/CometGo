@@ -36,6 +36,13 @@ type logicalFeed struct {
 	catalog *pgx.Conn
 
 	gate *gate
+
+	// The feed is up for App.Ready while it streams and its gate can take
+	// snapshots: a gate stuck on its catalog connection delivers nothing.
+	healthMu  sync.Mutex
+	streaming bool
+	streamErr error
+	gateErr   error
 	// dropIn is the snapshot S of the last restart: decoded transactions
 	// visible in it are dropped.
 	dropIn    atomic.Pointer[pgSnapshot]
@@ -118,7 +125,26 @@ func (f *logicalFeed) pkColumns(ctx context.Context, relID uint32) (cols []strin
 }
 
 // deliver hands a visible transaction to the engine.
+// health updates the feed's state with fn, under healthMu, and reports
+// it to the engine.
+func (f *logicalFeed) health(fn func()) {
+	f.healthMu.Lock()
+	defer f.healthMu.Unlock()
+	fn()
+	switch {
+	case !f.streaming:
+		f.e.feedIsDown(f.streamErr)
+	case f.gateErr != nil:
+		f.e.feedIsDown(fmt.Errorf("visibility gate: %w", f.gateErr))
+	default:
+		f.e.feedIsUp()
+	}
+}
+
 func (f *logicalFeed) deliver(tx decodedTx) {
+	if tx.xid != 0 && f.gateBlocked() {
+		f.health(func() { f.gateErr = nil }) // its snapshot just worked
+	}
 	if s := f.dropIn.Load(); s != nil && tx.full != 0 && s.visible(tx.full) {
 		return // covered by the restart on S
 	}
@@ -142,6 +168,12 @@ func (f *logicalFeed) confirmable(midTx bool, walEnd pglogrepl.LSN) pglogrepl.LS
 	return f.confirmed
 }
 
+func (f *logicalFeed) gateBlocked() bool {
+	f.healthMu.Lock()
+	defer f.healthMu.Unlock()
+	return f.gateErr != nil
+}
+
 func (f *logicalFeed) run(ctx context.Context) {
 	go f.sweepLoop(ctx)
 	if f.e.revalOnly {
@@ -150,6 +182,7 @@ func (f *logicalFeed) run(ctx context.Context) {
 	go func() {
 		for ctx.Err() == nil {
 			if err := f.gate.run(ctx); err != nil && ctx.Err() == nil {
+				f.health(func() { f.gateErr = err })
 				f.e.a.log.Warn("logical feed: snapshot failed", "err", err)
 				select {
 				case <-ctx.Done():
@@ -168,7 +201,7 @@ func (f *logicalFeed) run(ctx context.Context) {
 	backoff := minBackoff
 	for ctx.Err() == nil {
 		startedAt, err := f.runOnce(ctx)
-		f.e.feedIsDown(err)
+		f.health(func() { f.streaming, f.streamErr = false, err })
 		if ctx.Err() != nil {
 			break
 		}
@@ -289,7 +322,7 @@ func (f *logicalFeed) runOnce(ctx context.Context) (startedAt time.Time, err err
 	}
 	startedAt = time.Now()
 	f.e.starts.Add(1)
-	f.e.feedIsUp()
+	f.health(func() { f.streaming = true })
 	return startedAt, f.stream(ctx, conn)
 }
 

@@ -2,7 +2,9 @@ package cometgo
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,4 +95,38 @@ func TestReadyWaitsForLogicalSlot(t *testing.T) {
 	}
 	close(release)
 	waitReady(t, e.app, true, "")
+}
+
+// A logical feed that streams but whose visibility gate cannot take
+// snapshots (only its catalog connection is failing) delivers nothing: it
+// is reported down after the grace, and up again once snapshots work.
+func TestReadyReportsStuckGate(t *testing.T) {
+	fe := newFeedEnv(t)
+	var failing atomic.Bool
+	real := fe.f.gate.snapshot
+	fe.f.gate.snapshot = func(ctx context.Context) (pgSnapshot, error) {
+		if failing.Load() {
+			return pgSnapshot{}, errors.New("catalog connection refused")
+		}
+		return real(ctx)
+	}
+	setReadyGrace(fe.app, 300*time.Millisecond)
+	ready := func() error { return fe.app.engine.feedReady(time.Now()) }
+	fe.start()
+	waitFor(t, "the feed up", func() bool { return ready() == nil })
+
+	failing.Store(true)
+	fe.insert(t, 1) // a transaction for the gate to hold
+	waitFor(t, "the stuck gate reported", func() bool {
+		err := ready()
+		return err != nil && strings.Contains(err.Error(), "visibility gate: catalog connection refused")
+	})
+	if fe.ids(t)["1"] != 0 {
+		t.Fatal("delivered while the gate had no snapshot")
+	}
+	failing.Store(false)
+	waitFor(t, "id 1", func() bool { return fe.ids(t)["1"] == 1 })
+	if err := ready(); err != nil {
+		t.Errorf("after the gate recovered: %v", err)
+	}
 }
