@@ -33,9 +33,8 @@ type engine struct {
 	fenceN  uint64
 	wake    chan struct{}
 	feed    feed
-	// drained is the number of the last notification a tick has drained
-	// (the logical feed confirms its slot up to it).
-	drained atomic.Uint64
+	// starts counts the feed's (re)starts: LISTENs, or replication starts.
+	starts atomic.Uint64
 	// listenGen counts successful LISTENs (listening).
 	listenGen uint64
 	// listenMu orders fenced commits against LISTEN: commitFenced holds it
@@ -121,6 +120,10 @@ type notification struct {
 	token  string // fence
 	evt    *evtNote
 	reval  string // comet_reval: the user ID to re-check
+	// restart, from the logical feed after it created its slot, makes the
+	// tick re-check every sub and release every fence whose xid is visible
+	// in it: the snapshot S of design §6.
+	restart *pgSnapshot
 	// xid is the transaction the notification came from, 0 when unknown
 	// (the notify feed never knows it).
 	xid uint64
@@ -137,6 +140,10 @@ type fence struct {
 	// is listenGen at that moment (notifyFeed.commitFenced).
 	committed bool
 	gen       uint64
+	// xid is the transaction of the fence's method, from its fence
+	// statement in logical mode (0 until then, and in notify mode).
+	// Engine mutex.
+	xid uint64
 }
 
 type observer struct {
@@ -289,7 +296,11 @@ func newEngine(a *App) *engine {
 		// path that is still dead is retried soon after it comes back.
 		listenConnect: 10 * time.Second,
 	}
-	e.feed = notifyFeed{e} // Start rejects every other Config.Feed
+	if a.cfg.Feed == FeedLogical {
+		e.feed = newLogicalFeed(e)
+	} else {
+		e.feed = notifyFeed{e} // Start rejects an unknown Config.Feed
+	}
 	return e
 }
 
@@ -316,21 +327,18 @@ func (e *engine) notify(n notification) {
 	e.signal()
 }
 
-// notifyAll queues notes in order, numbered consecutively, and returns the
-// number of the last one: with none, the last number given out.
-func (e *engine) notifyAll(notes []notification) uint64 {
+// notifyAll queues notes in order, numbered consecutively.
+func (e *engine) notifyAll(notes []notification) {
 	e.mu.Lock()
 	for _, n := range notes {
 		e.nextN++
 		n.n = e.nextN
 		e.pending = append(e.pending, n)
 	}
-	last := e.nextN
 	e.mu.Unlock()
 	if len(notes) > 0 {
 		e.signal()
 	}
-	return last
 }
 
 // registerFence must be called before the method's transaction commits, so
@@ -357,12 +365,21 @@ func (e *engine) markCommitted(token string) {
 // and marks everything dirty: notifications sent while nobody listened are
 // lost.
 func (e *engine) listening() {
+	e.starts.Add(1)
 	e.mu.Lock()
 	e.listenGen++
 	e.nextN++
 	e.pending = append(e.pending, notification{n: e.nextN, all: true, listen: e.listenGen})
 	e.mu.Unlock()
 	e.signal()
+}
+
+func (e *engine) setFenceXid(token string, xid uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if f := e.fences[token]; f != nil {
+		f.xid = xid
+	}
 }
 
 func (e *engine) dropFence(token string) {
@@ -429,11 +446,11 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	notes, reqs := e.pending, e.reqs
 	e.pending, e.reqs = nil, nil
 	cutoff := e.nextN
-	e.drained.Store(cutoff)
 	evts := e.carryEvts
 	e.carryEvts = nil
 	reval := revalidateReq{users: map[string]bool{}}
 	var listened, listenN, allN uint64
+	var restarted bool
 	for _, n := range notes {
 		if n.evt != nil {
 			evts = append(evts, heldEvt{n: n.n, note: n.evt})
@@ -451,6 +468,17 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		}
 		if n.listen > listened {
 			listened, listenN = n.listen, n.n
+		}
+		if n.restart != nil {
+			restarted = true
+			// Visible in S: committed before it, so the all-dirty tick on a
+			// later snapshot reflects the fence's writes. Its own messages,
+			// if decoded at all, are dropped (logicalFeed.deliver).
+			for _, f := range e.fences {
+				if f.xid != 0 && f.p == 0 && n.restart.visible(f.xid) {
+					f.p = n.n
+				}
+			}
 		}
 	}
 	if listened > 0 {
@@ -503,7 +531,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	// is bound to its connection's current identity, and before fences are
 	// released, so an end still precedes the res of the method that caused
 	// it.
-	reval.all = listened > 0
+	reval.all = listened > 0 || restarted
 	queue := e.carry
 	e.carry = nil
 	for _, r := range reqs {

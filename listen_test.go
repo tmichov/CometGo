@@ -132,6 +132,7 @@ func setupProxied(t *testing.T, tweak func(*Config)) (*testEnv, *pauseProxy) {
 // A listener whose network path goes silent, with no TCP reset, notices
 // within listenIdle + listenProbe and reconnects once the path is back.
 func TestListenerDetectsSilentlyDeadConnection(t *testing.T) {
+	skipLogical(t, "the LISTEN connection's probe")
 	log := &metricLog{}
 	e, proxy := setupProxied(t, func(c *Config) { c.Metrics = log.hook })
 	a, _ := e.dial(t, nil)
@@ -160,6 +161,7 @@ func TestListenerDetectsSilentlyDeadConnection(t *testing.T) {
 
 // While notifications keep arriving, the listener sends no probe.
 func TestListenerProbesOnlyWhenIdle(t *testing.T) {
+	skipLogical(t, "the LISTEN connection's probe")
 	appName := "cometgo_probe_" + newID(4)
 	e, _ := setupProxied(t, withAppName(t, appName))
 	e.waitListening(t)
@@ -197,6 +199,7 @@ func TestListenerProbesOnlyWhenIdle(t *testing.T) {
 // listenConnect instead of waiting for the OS TCP timeout, and the first
 // attempt after the path is back succeeds.
 func TestListenerReconnectAttemptIsBounded(t *testing.T) {
+	skipLogical(t, "the LISTEN connection's connect timeout")
 	log := &metricLog{}
 	e, proxy := setupProxied(t, func(c *Config) { c.Metrics = log.hook })
 	e.waitListening(t)

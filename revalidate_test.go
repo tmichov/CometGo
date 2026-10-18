@@ -230,13 +230,16 @@ func TestRevalidateReachesOtherNode(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	other := New(Config{
+	cfg := Config{
 		DB:              e.pool,
 		MinTickInterval: 5 * time.Millisecond,
 		Authenticate: func(ctx context.Context, token string) (*Identity, error) {
 			return &Identity{UserID: token}, nil
 		},
-	})
+	}
+	cfg.Feed, cfg.ReplicationDSN = e.app.cfg.Feed, e.app.cfg.ReplicationDSN // both nodes on one feed
+	other := New(cfg)
+	dropSlotAfter(t, other, e.pool, cancel)
 	publishDBTeam(other, e, members)
 	other.Start(ctx)
 	srv := httptest.NewServer(other)
@@ -273,6 +276,7 @@ func TestRevalidateReachesOtherNode(t *testing.T) {
 // commits while the listener is down, is caught up by the reconnect tick:
 // the revoked sub still ends, ahead of the method's res.
 func TestRevalidateAfterCommitLostWhileListenerDown(t *testing.T) {
+	skipLogical(t, "it kills the LISTEN backend")
 	var members string
 	appName := "cometgo_test_" + newID(4)
 	e := setupFull(t, namedPool(t, appName), dbTeam(t, &members))
@@ -362,6 +366,7 @@ func (e *testEnv) killListener(t *testing.T, appName string) {
 // the membership row empties the user's result, also when it commits while
 // the listener is down, once the listener is back.
 func TestJoinTableRevocation(t *testing.T) {
+	skipLogical(t, "it kills the LISTEN backend")
 	var members string
 	appName := "cometgo_test_" + newID(4)
 	e := setupFull(t, namedPool(t, appName), func(env *testEnv, app *App) {
@@ -371,7 +376,7 @@ func TestJoinTableRevocation(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { env.pool.Exec(context.Background(), "DROP TABLE "+members) })
-		if err := InstallTriggers(ctx, env.pool, members); err != nil {
+		if err := installFeed(ctx, env.pool, members); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "joined", PubOptions{Tables: []string{env.table, members}}, func(c *SubCtx, _ struct{}) (Query, error) {

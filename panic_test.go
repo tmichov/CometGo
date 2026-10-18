@@ -333,6 +333,7 @@ func TestPoolTracerPanicFailsOnlyThatCall(t *testing.T) {
 // connection like a network error: the listener reconnects and live
 // updates flow.
 func TestPoolTracerPanicOnListenReconnects(t *testing.T) {
+	skipLogical(t, "a panic on the LISTEN connection")
 	logs := &errLogs{}
 	tr := &panicTracer{prefix: "LISTEN "}
 	tr.armed.Store(true) // the first LISTEN, at Start

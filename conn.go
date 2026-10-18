@@ -913,15 +913,11 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	// A replay is always fenced: the original may still be running.
 	var f *fence
 	token, f = c.a.engine.registerFence(c)
-	fenceSQL := "SELECT pg_notify('comet', $1) WHERE txid_current_if_assigned() IS NOT NULL"
-	if stored != nil {
-		fenceSQL = "SELECT pg_notify('comet', $1)"
-	}
-	tag, err := tx.Exec(ctx, fenceSQL, "1|f|"+token)
+	sent, err := c.a.engine.feed.fence(ctx, tx, token, stored != nil)
 	if err != nil {
 		return nil, false, err
 	}
-	if tag.RowsAffected() == 0 {
+	if !sent {
 		c.a.engine.dropFence(token)
 		return val, false, tx.Commit(ctx)
 	}

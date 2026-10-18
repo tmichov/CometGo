@@ -115,8 +115,8 @@ type Config struct {
 	// DB is the Postgres pool used for publications, methods and LISTEN.
 	DB *pgxpool.Pool
 
-	// Feed selects the change feed. Default FeedNotify; FeedLogical is not
-	// implemented yet, and Start rejects it.
+	// Feed selects the change feed: FeedNotify (the default) or
+	// FeedLogical, which needs ReplicationDSN.
 	Feed Feed
 
 	// ReplicationDSN is a direct connection to the database of DB for the
@@ -349,7 +349,9 @@ func (a *App) Start(ctx context.Context) error {
 	switch a.cfg.Feed {
 	case FeedNotify:
 	case FeedLogical:
-		feedErr = errors.New("cometgo: Config.Feed: FeedLogical is not implemented yet")
+		if a.cfg.ReplicationDSN == "" {
+			feedErr = errors.New("cometgo: Config.Feed: FeedLogical needs Config.ReplicationDSN")
+		}
 	default:
 		feedErr = fmt.Errorf("cometgo: Config.Feed: unknown feed %d", a.cfg.Feed)
 	}

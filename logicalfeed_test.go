@@ -113,9 +113,8 @@ func (fe *feedEnv) slotPID(t *testing.T) (pid *int32) {
 }
 
 // A killed connection resumes after the last commit received in full:
-// nothing is lost, and the commits received before the kill, which the
-// slot has not confirmed (the engine never drained them), are not sent
-// again. Once the engine drains, the slot is confirmed.
+// nothing is lost, and nothing received before the kill is sent again.
+// The slot is confirmed up to what was received.
 func TestLogicalFeedResume(t *testing.T) {
 	fe := newFeedEnv(t)
 	fe.start()
@@ -142,19 +141,17 @@ func TestLogicalFeedResume(t *testing.T) {
 	if got["10"] != 6 {
 		t.Errorf("id 10 notified %d times, want 6", got["10"])
 	}
+	// Confirmed up to what was received, with no drain needed: a fast
+	// shutdown of Postgres waits for it.
 	var written pglogrepl.LSN
 	if err := fe.pool.QueryRow(context.Background(), "SELECT pg_current_wal_lsn()").Scan(&written); err != nil {
 		t.Fatal(err)
 	}
-	confirmed := func() (c pglogrepl.LSN) {
+	waitFor(t, "the slot confirmed", func() bool {
+		var c pglogrepl.LSN
 		fe.pool.QueryRow(context.Background(), "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = $1", fe.f.slot).Scan(&c)
-		return c
-	}
-	if c := confirmed(); c >= written {
-		t.Fatalf("slot confirmed %s before the engine drained (written %s): the resume skip was not exercised", c, written)
-	}
-	fe.app.engine.drained.Store(fe.app.engine.notifyAll(nil))
-	waitFor(t, "the slot confirmed", func() bool { return confirmed() >= written })
+		return c >= written
+	})
 }
 
 // holdSlot streams the slot on a connection of its own, as a walsender the
@@ -245,5 +242,127 @@ func TestLogicalFeedDropsSlotOnShutdown(t *testing.T) {
 	fe.halt()
 	if exists() {
 		t.Error("slot still there after Shutdown")
+	}
+}
+
+// A restart on snapshot S releases the fences whose xid is visible in S,
+// and re-checks every sub; a fence not visible in S waits for its own
+// message. The second pass's empty snapshot releases nothing.
+func TestRestartReleasesFencesVisibleInS(t *testing.T) {
+	e := fenceEngine()
+	visTok, vis := e.registerFence(nil)
+	e.setFenceXid(visTok, 5)
+	lateTok, late := e.registerFence(nil)
+	e.setFenceXid(lateTok, 50)
+	unsetTok, unset := e.registerFence(nil) // fence statement not run yet
+	s := pgSnapshot{xmin: 10, xmax: 40, xip: []uint64{20}}
+	e.notifyAll([]notification{{all: true, restart: &pgSnapshot{}}})
+	e.tick(context.Background())
+	if released(vis) || released(late) || released(unset) {
+		t.Fatal("the empty second-pass snapshot released a fence")
+	}
+	e.notifyAll([]notification{{all: true, restart: &s}})
+	e.tick(context.Background())
+	if !released(vis) {
+		t.Error("fence visible in S not released")
+	}
+	if released(late) || released(unset) {
+		t.Fatal("fence not visible in S released")
+	}
+	e.notify(notification{token: lateTok})
+	e.tick(context.Background())
+	if !released(late) {
+		t.Error("late fence not released by its own message")
+	}
+	e.dropFence(unsetTok)
+}
+
+// Decoded transactions visible in the restart's S are dropped, since S
+// covers them; later ones are delivered.
+func TestDeliverDropsTransactionsVisibleInS(t *testing.T) {
+	e := fenceEngine()
+	f := newLogicalFeed(e)
+	f.dropIn.Store(&pgSnapshot{xmin: 10, xmax: 40, xip: []uint64{20}})
+	f.deliver(decodedTx{full: 5, end: 1, notes: []notification{{token: "old"}}})
+	f.deliver(decodedTx{full: 20, end: 2, notes: []notification{{token: "in-xip"}}})
+	f.deliver(decodedTx{full: 45, end: 3, notes: []notification{{token: "new"}}})
+	var got []string
+	for _, n := range e.pending {
+		got = append(got, n.token)
+	}
+	if want := []string{"in-xip", "new"}; !slices.Equal(got, want) {
+		t.Errorf("delivered %q, want %q", got, want)
+	}
+}
+
+// A call whose transaction wrote before a recreated slot's consistent point
+// and committed after it: slot creation waits for it, so it commits during
+// the creation. Its res comes once, without lag, after its row and event
+// (if the event comes at all: it is dropped when S covers its transaction),
+// and the subscriber sees the row.
+func TestRecreatedSlotSpanningCall(t *testing.T) {
+	release := make(chan struct{})
+	e := setupFull(t, func(c *Config) {
+		c.Feed, c.ReplicationDSN = FeedLogical, os.Getenv("COMETGO_TEST_DATABASE_URL")
+	}, func(env *testEnv, app *App) {
+		if err := InstallPublication(context.Background(), env.pool, env.table); err != nil {
+			t.Fatal(err)
+		}
+		Method(app, "holdAdd", func(c *Call, _ struct{}) (string, error) {
+			var id string
+			if err := c.Tx.QueryRow(c.Context, "INSERT INTO "+env.table+" (owner, name) VALUES ('h', 'held') RETURNING id::text").Scan(&id); err != nil {
+				return "", err
+			}
+			if err := c.EmitAfterCommit("items.all", nil, "", "held", id); err != nil {
+				return "", err
+			}
+			<-release
+			return id, nil
+		})
+	})
+	e.waitListening(t)
+	slot := e.app.engine.feed.(*logicalFeed).slot
+	a, _ := e.dial(t, evtCaps)
+	subscribe(t, a, 1, "items.all")
+	a.send(map[string]any{"t": "call", "id": 1, "m": "holdAdd", "args": map[string]any{}})
+	waitFor(t, "the call's insert", func() bool {
+		var n int
+		e.pool.QueryRow(context.Background(), "SELECT count(*) FROM pg_locks WHERE locktype = 'transactionid' AND mode = 'ExclusiveLock' AND pid <> pg_backend_pid()").Scan(&n)
+		return n > 0
+	})
+
+	// Drop the slot under the feed: terminate its walsender until the drop
+	// gets in before the reconnect.
+	before := e.listened()
+	waitFor(t, "the slot dropped", func() bool {
+		e.pool.Exec(context.Background(), "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL", slot)
+		_, err := e.pool.Exec(context.Background(), "SELECT pg_drop_replication_slot($1)", slot)
+		return err == nil
+	})
+	time.Sleep(300 * time.Millisecond) // the feed is now creating the slot, waiting for the call
+	close(release)
+	waitFor(t, "the feed restarted", func() bool { return e.listened() > before })
+
+	var sawRow, sawEvt bool
+	for {
+		m := a.next()
+		switch m["t"] {
+		case "tx":
+			sawRow = sawRow || strings.Contains(fmt.Sprint(m), "held")
+		case "evt":
+			if sawEvt {
+				t.Fatal("event delivered twice")
+			}
+			sawEvt = true
+		case "res":
+			if m["ok"] != true || m["lag"] == true {
+				t.Fatalf("res %v, want ok without lag", m)
+			}
+			if !sawRow {
+				t.Fatal("res before the row reached the subscriber")
+			}
+			t.Logf("event delivered: %v", sawEvt)
+			return
+		}
 	}
 }

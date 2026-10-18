@@ -266,7 +266,7 @@ func TestDescribe(t *testing.T) {
 			}
 		}
 		t.Cleanup(func() { e.pool.Exec(context.Background(), "DROP TABLE "+e.table+"_d") })
-		if err := InstallTriggers(ctx, e.pool, e.table+"_d"); err != nil {
+		if err := installFeed(ctx, e.pool, e.table+"_d"); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "d.one", PubOptions{Tables: []string{e.table + "_d"}},

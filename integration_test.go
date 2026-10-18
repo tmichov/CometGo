@@ -92,7 +92,7 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { pool.Exec(context.Background(), "DROP TABLE "+table) })
-	if err := InstallTriggers(ctx, pool, table); err != nil {
+	if err := installFeed(ctx, pool, table); err != nil {
 		t.Fatal(err)
 	}
 	if err := InstallIdempotency(ctx, pool); err != nil {
@@ -116,10 +116,14 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 			return nil, NewError(CodeUnauthenticated, "bad token")
 		},
 	}
+	if testLogical {
+		cfg.Feed, cfg.ReplicationDSN = FeedLogical, dsn
+	}
 	if tweak != nil {
 		tweak(&cfg)
 	}
 	app := New(cfg)
+	dropSlotAfter(t, app, pool, cancel)
 	Publish(app, "items.all", PubOptions{Tables: []string{table}, Scope: ScopeShared, Events: true},
 		func(c *SubCtx, _ struct{}) (Query, error) {
 			return Query{SQL: "SELECT id, owner, name, n FROM " + table + " ORDER BY id"}, nil
@@ -208,11 +212,61 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 	return env
 }
 
-// listened reports how many LISTENs have succeeded.
+// listened reports how many times the feed has started: LISTENs, or
+// replication starts with COMETGO_TEST_FEED=logical.
 func (e *testEnv) listened() uint64 {
-	e.app.engine.mu.Lock()
-	defer e.app.engine.mu.Unlock()
-	return e.app.engine.listenGen
+	return e.app.engine.starts.Load()
+}
+
+// testLogical runs the suite on the logical feed (COMETGO_TEST_FEED=logical):
+// apps use FeedLogical, and installFeed publishes their tables too.
+var testLogical = os.Getenv("COMETGO_TEST_FEED") == "logical"
+
+// installFeed installs what the feed under test needs on tables.
+func installFeed(ctx context.Context, pool *pgxpool.Pool, tables ...string) error {
+	if err := InstallTriggers(ctx, pool, tables...); err != nil {
+		return err
+	}
+	if testLogical {
+		return InstallPublication(ctx, pool, tables...)
+	}
+	return nil
+}
+
+// dropSlotAfter drops a logical app's slot when the test ends: a stop that
+// is not a Shutdown keeps it. cancel stops the app first (cleanups run in
+// reverse order, so the pool is still open).
+func dropSlotAfter(t testing.TB, app *App, pool *pgxpool.Pool, cancel context.CancelFunc) {
+	lf, ok := app.engine.feed.(*logicalFeed)
+	if !ok {
+		return
+	}
+	t.Cleanup(func() {
+		cancel()
+		app.running.Wait()
+		ctx := context.Background()
+		for range 100 {
+			var exists bool
+			pool.QueryRow(ctx, "SELECT EXISTS (SELECT FROM pg_replication_slots WHERE slot_name = $1)", lf.slot).Scan(&exists)
+			if !exists {
+				return
+			}
+			pool.Exec(ctx, "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL", lf.slot)
+			if _, err := pool.Exec(ctx, "SELECT pg_drop_replication_slot($1)", lf.slot); err == nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Errorf("slot %s not dropped", lf.slot)
+	})
+}
+
+// skipLogical skips a test of the notify feed's own mechanics.
+func skipLogical(t testing.TB, why string) {
+	t.Helper()
+	if testLogical {
+		t.Skip("notify feed only: " + why)
+	}
 }
 
 // waitListening waits for the first LISTEN. Calls do not need it; tests

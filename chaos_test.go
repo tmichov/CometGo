@@ -21,7 +21,10 @@ import (
 
 // chaosCallBudget is how long one call may take under a fault: well under
 // the 5s FenceTimeout, so a call released by FenceTimeout fails the test.
-const chaosCallBudget = 3 * time.Second
+// The logical feed gets a second more: a call spanning a Postgres restart
+// waits for the feed's reconnect backoff, as with LISTEN, and then for the
+// slot to resume, which decodes from its restart_lsn up to where it left.
+var chaosCallBudget = map[bool]time.Duration{false: 3 * time.Second, true: 4 * time.Second}[testLogical]
 
 // readMsg reads the next non-pong message. It reports errors instead of
 // failing the test, for use off the test goroutine.
@@ -275,6 +278,7 @@ func (e *testEnv) waitDB(t *testing.T) {
 // The listener's connection is killed mid-traffic, several times in a
 // row. Every call still answers well within FenceTimeout, without lag.
 func TestChaosListenerKilled(t *testing.T) {
+	skipLogical(t, "it kills the LISTEN backend")
 	appName := "cometgo_chaos_" + newID(4)
 	e := setupWith(t, withAppName(t, appName))
 	ws := e.watch(t, 3)

@@ -159,6 +159,7 @@ func withAppName(t testing.TB, name string) func(*Config) {
 // reconnect's full re-run, with its tx ahead of its res, not after
 // FenceTimeout.
 func TestCallDuringListenerReconnectHasNoLag(t *testing.T) {
+	skipLogical(t, "it kills the LISTEN backend")
 	appName := "cometgo_test_" + newID(4)
 	e := setupWith(t, withAppName(t, appName))
 	a, _ := e.dial(t, nil)

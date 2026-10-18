@@ -88,7 +88,7 @@ func (a *App) Revalidate(ctx context.Context, userID string) error {
 	if len(userID) > maxNotifyPayload {
 		return ErrUserIDTooLong
 	}
-	_, err := a.db.Exec(ctx, "SELECT pg_notify($1, $2)", revalChannel, userID)
+	_, err := a.db.Exec(ctx, a.engine.feed.msgSQL('v'), userID)
 	return err
 }
 
@@ -109,7 +109,7 @@ func (c *Call) RevalidateAfterCommit(userID string) error {
 	// txid_current gives the transaction an ID even if the method writes
 	// nothing else, so a server that skips the fence for ID-less calls
 	// still sends the end before the res. pg_notify alone assigns none.
-	_, err := c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2), txid_current()", revalChannel, userID)
+	_, err := c.Tx.Exec(c.Context, c.app.engine.feed.msgSQL('v')+", txid_current()", userID)
 	return err
 }
 
@@ -131,7 +131,7 @@ func (a *App) Emit(ctx context.Context, pubName string, args any, scope, topic s
 	if err != nil {
 		return err
 	}
-	_, err = a.db.Exec(ctx, "SELECT pg_notify($1, $2)", evtChannel, payload)
+	_, err = a.db.Exec(ctx, a.engine.feed.msgSQL('e'), payload)
 	return err
 }
 
@@ -151,7 +151,7 @@ func (c *Call) EmitAfterCommit(pubName string, args any, scope, topic string, da
 	// txid_current assigns the transaction an ID, which keeps the call's
 	// fence (a call with no ID skips it): the evt must precede the res.
 	// pg_notify alone assigns none before commit.
-	_, err = c.Tx.Exec(c.Context, "SELECT pg_notify($1, $2), txid_current()", evtChannel, payload)
+	_, err = c.Tx.Exec(c.Context, c.app.engine.feed.msgSQL('e')+", txid_current()", payload)
 	return err
 }
 

@@ -20,7 +20,7 @@ func sleepyTable(t *testing.T, table *string) func(*testEnv, *App) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { env.pool.Exec(context.Background(), "DROP TABLE "+*table) })
-		if err := InstallTriggers(ctx, env.pool, *table); err != nil {
+		if err := installFeed(ctx, env.pool, *table); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "sleepy", PubOptions{Tables: []string{*table}, Scope: ScopeShared},

@@ -229,6 +229,7 @@ func TestSubAwaitingInitHoldsFence(t *testing.T) {
 // the reconnect's all-dirty number, so it waits for its connection's
 // observers to re-run, deferred ones included.
 func TestReconnectFenceWaitsForDeferredObserver(t *testing.T) {
+	skipLogical(t, "listener generations release the fence")
 	e, d := setupDeferred(t, nil, nil)
 	a, _ := e.dial(t, nil)
 	subscribe(t, a, 1, "items.all")
@@ -326,7 +327,7 @@ func TestForcedCoalescingKeepsDeferredSubHeld(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { env.pool.Exec(context.Background(), "DROP TABLE "+other) })
-		if err := InstallTriggers(ctx, env.pool, other); err != nil {
+		if err := installFeed(ctx, env.pool, other); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "other.all", PubOptions{Tables: []string{other}, Scope: ScopeShared},

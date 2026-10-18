@@ -42,6 +42,7 @@ func (l *metricLog) wait(t *testing.T, name string, match func(Metric) bool) Met
 }
 
 func TestMetricsReportEachSignal(t *testing.T) {
+	skipLogical(t, "it kills the LISTEN backend")
 	log := &metricLog{}
 	appName := "cometgo_test_" + newID(4)
 	e := setupWith(t, func(c *Config) {

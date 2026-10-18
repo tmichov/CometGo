@@ -1,4 +1,4 @@
-.PHONY: db todo test chaos build gen gen-check bench bench-feed
+.PHONY: db todo test test-logical chaos build gen gen-check bench bench-feed
 
 db:
 	docker compose up -d
@@ -22,6 +22,10 @@ test:
 	go test ./...
 	npm run typecheck
 	npm test
+
+# The Go suite on the logical feed (needs the db and COMETGO_TEST_DATABASE_URL).
+test-logical:
+	COMETGO_TEST_FEED=logical go test -count=1 .
 
 # Fault-injection tests, as CI runs them (needs the db and COMETGO_TEST_DATABASE_URL).
 chaos:
