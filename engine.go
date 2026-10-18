@@ -35,6 +35,10 @@ type engine struct {
 	feed    feed
 	// starts counts the feed's (re)starts: LISTENs, or replication starts.
 	starts atomic.Uint64
+	// revalOnly, on a logical node while Config.FeedMigrating, makes the
+	// listener LISTEN on comet_reval only, for re-checks sent by nodes still
+	// on the notify feed (engine.listen).
+	revalOnly bool
 	// listenGen counts successful LISTENs (listening).
 	listenGen uint64
 	// listenMu orders fenced commits against LISTEN: commitFenced holds it
@@ -298,6 +302,7 @@ func newEngine(a *App) *engine {
 	}
 	if a.cfg.Feed == FeedLogical {
 		e.feed = newLogicalFeed(e)
+		e.revalOnly = a.cfg.FeedMigrating
 	} else {
 		e.feed = notifyFeed{e} // Start rejects an unknown Config.Feed
 	}
@@ -365,6 +370,18 @@ func (e *engine) markCommitted(token string) {
 // and marks everything dirty: notifications sent while nobody listened are
 // lost.
 func (e *engine) listening() {
+	if e.revalOnly {
+		// Only re-checks were lost: re-check every sub (reval.all), without
+		// re-running observers; the logical feed's restarted ignores the
+		// generation, so no fence is released by it.
+		e.mu.Lock()
+		e.listenGen++
+		e.nextN++
+		e.pending = append(e.pending, notification{n: e.nextN, listen: e.listenGen})
+		e.mu.Unlock()
+		e.signal()
+		return
+	}
 	e.starts.Add(1)
 	e.mu.Lock()
 	e.listenGen++
@@ -1926,7 +1943,11 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 	err = func() error {
 		e.listenMu.Lock()
 		defer e.listenMu.Unlock()
-		for _, ch := range []string{"comet", evtChannel, revalChannel} {
+		chans := []string{"comet", evtChannel, revalChannel}
+		if e.revalOnly {
+			chans = []string{revalChannel}
+		}
+		for _, ch := range chans {
 			if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 				return err
 			}

@@ -88,7 +88,7 @@ func (a *App) Revalidate(ctx context.Context, userID string) error {
 	if len(userID) > maxNotifyPayload {
 		return ErrUserIDTooLong
 	}
-	_, err := a.db.Exec(ctx, a.engine.feed.msgSQL('v'), userID)
+	_, err := a.db.Exec(ctx, a.revalSQL(), userID)
 	return err
 }
 
@@ -109,8 +109,19 @@ func (c *Call) RevalidateAfterCommit(userID string) error {
 	// txid_current gives the transaction an ID even if the method writes
 	// nothing else, so a server that skips the fence for ID-less calls
 	// still sends the end before the res. pg_notify alone assigns none.
-	_, err := c.Tx.Exec(c.Context, c.app.engine.feed.msgSQL('v')+", txid_current()", userID)
+	_, err := c.Tx.Exec(c.Context, c.app.revalSQL()+", txid_current()", userID)
 	return err
+}
+
+// revalSQL sends a re-check with user ID $1. While Config.FeedMigrating it
+// goes both ways, as a NOTIFY and as a logical message, so nodes of either
+// feed get it: a lost re-check leaves a permission granted, and one
+// received twice only re-runs fn.
+func (a *App) revalSQL() string {
+	if a.cfg.FeedMigrating {
+		return "SELECT pg_notify('" + revalChannel + "', $1), pg_logical_emit_message(true, 'comet', 'v|' || $1)"
+	}
+	return a.engine.feed.msgSQL('v')
 }
 
 // Emit sends an ephemeral event to every subscription of the publication

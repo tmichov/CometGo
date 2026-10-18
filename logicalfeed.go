@@ -141,6 +141,9 @@ func (f *logicalFeed) confirmable(midTx bool, walEnd pglogrepl.LSN) pglogrepl.LS
 
 func (f *logicalFeed) run(ctx context.Context) {
 	go f.sweepLoop(ctx)
+	if f.e.revalOnly {
+		go f.e.listen(ctx) // re-checks from notify-mode nodes (FeedMigrating)
+	}
 	go func() {
 		for ctx.Err() == nil {
 			if err := f.gate.run(ctx); err != nil && ctx.Err() == nil {
