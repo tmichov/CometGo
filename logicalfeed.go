@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -18,8 +20,8 @@ import (
 
 // logicalFeed reads the node's replication slot (PROTOCOL.md §11.1,
 // docs/design/m4-logical-feed.md §5): decoder parses it, gate hands
-// visible transactions to the engine, and the slot is confirmed as the
-// engine drains them.
+// visible transactions to the engine, and the slot is confirmed up to what
+// was received.
 type logicalFeed struct {
 	e    *engine
 	slot string // cometgo_<Config.SlotName>
@@ -34,22 +36,15 @@ type logicalFeed struct {
 	catalog *pgx.Conn
 
 	gate *gate
-	// pend holds, in order, each delivered transaction's end LSN with the
-	// number of its last notification; confirmed is the end of the last
-	// one the engine has drained. Guarded by pendMu.
-	pendMu    sync.Mutex
-	pend      []pendingConfirm
-	confirmed pglogrepl.LSN
+	// dropIn is the snapshot S of the last restart: decoded transactions
+	// visible in it are dropped.
+	dropIn    atomic.Pointer[pgSnapshot]
+	confirmed pglogrepl.LSN // owned by stream
 
 	// Timings, settable by tests.
 	senderTimeout time.Duration // wal_sender_timeout on the connection
 	statusEvery   time.Duration
 	createTimeout time.Duration
-}
-
-type pendingConfirm struct {
-	n   uint64
-	end pglogrepl.LSN
 }
 
 func newLogicalFeed(e *engine) *logicalFeed {
@@ -71,26 +66,30 @@ func newLogicalFeed(e *engine) *logicalFeed {
 // withCatalog runs fn on the catalog connection, connecting it first if
 // needed, and drops the connection when fn fails, so the next call
 // reconnects.
-func (f *logicalFeed) withCatalog(ctx context.Context, fn func(*pgx.Conn) error) error {
+func (f *logicalFeed) withCatalog(ctx context.Context, fn func(*pgx.Conn) error) (err error) {
 	f.catMu.Lock()
 	defer f.catMu.Unlock()
+	defer func() {
+		if err != nil && f.catalog != nil {
+			f.catalog.Close(context.Background())
+			f.catalog = nil
+		}
+	}()
+	// The connection copies the pool's ConnConfig, tracer included, so user
+	// code runs here too: a panic in it fails this call like a network
+	// error, instead of ending the process from the gate's goroutine.
+	defer recoverErr(&err)
 	if f.catalog == nil {
 		cfg := f.e.a.db.Config().ConnConfig.Copy()
 		if cfg.ConnectTimeout == 0 {
 			cfg.ConnectTimeout = f.e.listenConnect
 		}
-		c, err := pgx.ConnectConfig(ctx, cfg)
-		if err != nil {
+		if f.catalog, err = pgx.ConnectConfig(ctx, cfg); err != nil {
+			f.catalog = nil
 			return err
 		}
-		f.catalog = c
 	}
-	if err := fn(f.catalog); err != nil {
-		f.catalog.Close(context.Background())
-		f.catalog = nil
-		return err
-	}
-	return nil
+	return fn(f.catalog)
 }
 
 func (f *logicalFeed) snapshot(ctx context.Context) (s pgSnapshot, err error) {
@@ -109,37 +108,27 @@ func (f *logicalFeed) pkColumns(ctx context.Context, relID uint32) (cols []strin
 	return cols, err
 }
 
-// deliver hands a visible transaction to the engine and records its end
-// LSN, to be confirmed once the engine has drained its notifications.
+// deliver hands a visible transaction to the engine.
 func (f *logicalFeed) deliver(tx decodedTx) {
-	last := f.e.notifyAll(tx.notes)
-	if tx.end == 0 {
-		return // a non-transactional message: nothing to confirm
+	if s := f.dropIn.Load(); s != nil && tx.full != 0 && s.visible(tx.full) {
+		return // covered by the restart on S
 	}
-	f.pendMu.Lock()
-	f.pend = append(f.pend, pendingConfirm{last, tx.end})
-	f.pendMu.Unlock()
+	f.e.notifyAll(tx.notes)
 }
 
-// confirmable returns the LSN the slot may be confirmed up to: the end of
-// the last delivered transaction the engine has drained. With nothing in
-// flight (no transaction half received, none held or undrained), it is
-// idle, and walEnd, the server's position from its last keepalive, is
-// confirmed too: every transaction before it was sent before the
-// keepalive, so writes to untracked tables do not pile up behind the slot.
+// confirmable returns the LSN the slot is confirmed up to: the end of the
+// last commit received in full and, outside a transaction, walEnd, the
+// server's position from its last keepalive (every transaction before it
+// was sent before the keepalive), so writes to untracked tables do not pile
+// up behind the slot. Received is enough: a reconnect resumes from it with
+// the gate's queue kept, and the engine's state dies with the process. And
+// it must be: a walsender ends at a fast shutdown only once its client has
+// confirmed everything sent, so confirming only what the engine drained
+// held Postgres' shutdown until it was killed.
 func (f *logicalFeed) confirmable(midTx bool, walEnd pglogrepl.LSN) pglogrepl.LSN {
-	drained := f.e.drained.Load()
-	f.pendMu.Lock()
-	defer f.pendMu.Unlock()
-	for len(f.pend) > 0 && f.pend[0].n <= drained {
-		f.confirmed = f.pend[0].end
-		f.pend = f.pend[1:]
-	}
-	f.gate.mu.Lock()
-	held := len(f.gate.queue)
-	f.gate.mu.Unlock()
-	if !midTx && held == 0 && len(f.pend) == 0 && walEnd > f.confirmed {
-		f.confirmed = walEnd
+	f.confirmed = max(f.confirmed, f.received)
+	if !midTx {
+		f.confirmed = max(f.confirmed, walEnd)
 	}
 	return f.confirmed
 }
@@ -250,7 +239,9 @@ func (f *logicalFeed) runOnce(ctx context.Context) (startedAt time.Time, err err
 		}
 		f.e.a.log.Info("logical feed: slot created", "slot", f.slot, "consistent_point", res.ConsistentPoint)
 		f.received = start
-		f.e.notifyAll([]notification{{all: true}})
+		if err := f.restart(ctx); err != nil {
+			return time.Time{}, err
+		}
 	case rows[0].Rows[0][0] != nil:
 		active, _ := strconv.Atoi(string(rows[0].Rows[0][0]))
 		if active != prevPID || prevPID == 0 {
@@ -275,7 +266,83 @@ func (f *logicalFeed) runOnce(ctx context.Context) (startedAt time.Time, err err
 		return time.Time{}, err
 	}
 	startedAt = time.Now()
+	f.e.starts.Add(1)
 	return startedAt, f.stream(ctx, conn)
+}
+
+// restart covers what a new slot cannot replay (design §6): changes
+// committed before its consistent point are never decoded. On a snapshot S
+// taken after the slot exists, the engine marks everything dirty,
+// re-checks every sub and releases the fences visible in S; decoded
+// messages of transactions visible in S are dropped (deliver), since S
+// covers their writes and their events could otherwise follow their res.
+// A transaction not visible in S commits after it, so after the consistent
+// point, and is decoded whole. One that was in a synchronous-standby wait
+// at S may have committed below the consistent point: once every
+// transaction in progress in S has ended, a second pass marks everything
+// dirty and re-checks every sub again. Its fence, if any, lags.
+func (f *logicalFeed) restart(ctx context.Context) error {
+	s, err := f.snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	f.dropIn.Store(&s)
+	f.e.notifyAll([]notification{{all: true, restart: &s}})
+	if len(s.xip) > 0 {
+		go f.secondPass(ctx, s)
+	}
+	return nil
+}
+
+func (f *logicalFeed) secondPass(ctx context.Context, s pgSnapshot) {
+	for ctx.Err() == nil {
+		cur, err := f.snapshot(ctx)
+		if err == nil && !slices.ContainsFunc(s.xip, func(x uint64) bool { return !cur.visible(x) }) {
+			// An empty snapshot releases no fence.
+			f.e.notifyAll([]notification{{all: true, restart: &pgSnapshot{}}})
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (f *logicalFeed) fence(ctx context.Context, tx pgx.Tx, token string, always bool) (bool, error) {
+	sql := "SELECT pg_logical_emit_message(true, 'comet', $1)::text, txid_current()"
+	if !always {
+		// The WHERE runs first: the message would assign the ID itself.
+		sql += " WHERE txid_current_if_assigned() IS NOT NULL"
+	}
+	var lsn string
+	var xid uint64
+	err := tx.QueryRow(ctx, sql, "f|"+token).Scan(&lsn, &xid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	f.e.setFenceXid(token, xid)
+	return true, nil
+}
+
+// commitFenced needs no ordering against restarts: a fence is released by
+// its decoded message, or by a restart in which its xid is visible.
+func (f *logicalFeed) commitFenced(ctx context.Context, tx pgx.Tx, _ string) error {
+	return tx.Commit(ctx)
+}
+
+// The listener-generation release is the notify feed's; the logical feed
+// releases by visibility (restart).
+func (*logicalFeed) restarted(uint64, uint64) {}
+
+// msgSQL sends the message transactional, also in its own autocommit
+// statement (Emit, Revalidate): a commit flushes the WAL at once, where a
+// non-transactional message waits for the WAL writer.
+func (*logicalFeed) msgSQL(kind byte) string {
+	return "SELECT pg_logical_emit_message(true, 'comet', '" + string(kind) + "|' || $1)"
 }
 
 // stream reads replication messages until the connection fails.

@@ -172,7 +172,7 @@ func TestStartChecksFeed(t *testing.T) {
 		feed Feed
 		want string
 	}{
-		{FeedLogical, "not implemented yet"},
+		{FeedLogical, "needs Config.ReplicationDSN"},
 		{Feed(7), "unknown feed 7"},
 	} {
 		app := New(Config{DB: e.pool, Feed: c.feed})

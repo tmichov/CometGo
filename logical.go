@@ -26,6 +26,7 @@ const maxTxKeys = 1000
 // non-transactional message, which needs no visibility wait.
 type decodedTx struct {
 	xid   uint32
+	full  uint64        // xid, epoch-extended by the gate; 0 for a message
 	end   pglogrepl.LSN // the transaction's end LSN; 0 for a message
 	notes []notification
 }
@@ -368,6 +369,7 @@ func (g *gate) run(ctx context.Context) error {
 					break
 				}
 			}
+			tx.full = full
 			for i := range tx.notes {
 				tx.notes[i].xid = full
 			}

@@ -133,7 +133,7 @@ func setupFilter(t testing.TB, tweak func(*Config)) *testEnv {
 			}
 		}
 		t.Cleanup(func() { e.pool.Exec(context.Background(), "DROP TABLE "+comp+", "+uu) })
-		if err := InstallTriggers(ctx, e.pool, comp, uu); err != nil {
+		if err := installFeed(ctx, e.pool, comp, uu); err != nil {
 			t.Fatal(err)
 		}
 		pair := func(name, table string, key []string, sql string, match func(json.RawMessage) (map[string]any, []any)) {
@@ -415,7 +415,7 @@ func TestChangedKeyFilterFallsBackWhenItCannotCompare(t *testing.T) {
 			}
 		}
 		t.Cleanup(func() { e.pool.Exec(context.Background(), "DROP TABLE "+padded+", "+comp) })
-		if err := InstallTriggers(context.Background(), e.pool, padded, comp); err != nil {
+		if err := installFeed(context.Background(), e.pool, padded, comp); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "padded", PubOptions{Tables: []string{padded}, Scope: ScopeShared},

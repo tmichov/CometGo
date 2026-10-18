@@ -59,7 +59,7 @@ func TestUserEnumTypeCode(t *testing.T) {
 			e.pool.Exec(context.Background(), "DROP DOMAIN "+mood+"_d")
 			e.pool.Exec(context.Background(), "DROP TYPE "+mood)
 		})
-		if err := InstallTriggers(context.Background(), e.pool, table); err != nil {
+		if err := installFeed(context.Background(), e.pool, table); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "moods", PubOptions{Tables: []string{table}, Scope: ScopeShared},
@@ -122,7 +122,7 @@ func TestUserEnumCreatedWhileRunning(t *testing.T) {
 		if _, err := e.pool.Exec(context.Background(), fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, m text)", table)); err != nil {
 			t.Fatal(err)
 		}
-		if err := InstallTriggers(context.Background(), e.pool, table); err != nil {
+		if err := installFeed(context.Background(), e.pool, table); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "late", PubOptions{Tables: []string{table}, Scope: ScopeShared},
@@ -183,7 +183,7 @@ func TestTypeLookupBoundedWhenPoolExhausted(t *testing.T) {
 			e.pool.Exec(context.Background(), "DROP TABLE "+table)
 			e.pool.Exec(context.Background(), "DROP TYPE "+mood)
 		})
-		if err := InstallTriggers(context.Background(), e.pool, table); err != nil {
+		if err := installFeed(context.Background(), e.pool, table); err != nil {
 			t.Fatal(err)
 		}
 		Publish(app, "moods", PubOptions{Tables: []string{table}, Scope: ScopeShared},
