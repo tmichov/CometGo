@@ -52,6 +52,17 @@ type engine struct {
 	// Bounds each listener connect when the DSN sets no connect_timeout.
 	listenConnect time.Duration
 
+	// The change feed's health, for App.Ready. readyGrace is how long the
+	// feed may be down before Ready reports it: longer than a reconnect, so
+	// a Postgres restart does not take every node out of the load balancer.
+	feedMu        sync.Mutex
+	feedUp        bool
+	feedStarted   bool // the feed has been up at least once
+	feedDownSince time.Time
+	feedErr       error
+	readyGrace    time.Duration
+	feedName      string // for Ready's errors
+
 	// Owned by the run goroutine.
 	observers map[string]*observer
 	conns     map[*conn]map[uint64]*subscription
@@ -299,12 +310,14 @@ func newEngine(a *App) *engine {
 		// Under the OS TCP connect timeout (about 2 min on Linux), so a
 		// path that is still dead is retried soon after it comes back.
 		listenConnect: 10 * time.Second,
+		readyGrace:    10 * time.Second,
 	}
 	if a.cfg.Feed == FeedLogical {
-		e.feed = newLogicalFeed(e)
+		lf := newLogicalFeed(e)
+		e.feed, e.feedName = lf, "logical replication slot "+lf.slot
 		e.revalOnly = a.cfg.FeedMigrating
 	} else {
-		e.feed = notifyFeed{e} // Start rejects an unknown Config.Feed
+		e.feed, e.feedName = notifyFeed{e}, "LISTEN" // Start rejects an unknown Config.Feed
 	}
 	return e
 }
@@ -389,6 +402,40 @@ func (e *engine) listening() {
 	e.pending = append(e.pending, notification{n: e.nextN, all: true, listen: e.listenGen})
 	e.mu.Unlock()
 	e.signal()
+}
+
+// feedIsUp records that the change feed delivers.
+func (e *engine) feedIsUp() {
+	e.feedMu.Lock()
+	defer e.feedMu.Unlock()
+	e.feedUp, e.feedStarted, e.feedErr = true, true, nil
+}
+
+// feedIsDown records why the change feed does not deliver.
+func (e *engine) feedIsDown(err error) {
+	e.feedMu.Lock()
+	defer e.feedMu.Unlock()
+	if e.feedUp || e.feedDownSince.IsZero() {
+		e.feedDownSince = time.Now()
+	}
+	e.feedUp, e.feedErr = false, err
+}
+
+// feedReady reports the change feed as App.Ready does.
+func (e *engine) feedReady(now time.Time) error {
+	e.feedMu.Lock()
+	defer e.feedMu.Unlock()
+	switch {
+	case e.feedUp:
+		return nil
+	case !e.feedStarted && e.feedErr == nil:
+		return fmt.Errorf("cometgo: change feed (%s) starting", e.feedName)
+	case !e.feedStarted:
+		return fmt.Errorf("cometgo: change feed (%s) not up yet: %v", e.feedName, e.feedErr)
+	case now.Sub(e.feedDownSince) < e.readyGrace:
+		return nil // a reconnect, most likely
+	}
+	return fmt.Errorf("cometgo: change feed (%s) down since %s: %v", e.feedName, e.feedDownSince.Format(time.RFC3339), e.feedErr)
 }
 
 func (e *engine) setFenceXid(token string, xid uint64) {
@@ -1899,6 +1946,9 @@ func (e *engine) listen(ctx context.Context) {
 	backoff := minBackoff
 	for ctx.Err() == nil {
 		listenedAt, err := e.listenOnce(ctx)
+		if !e.revalOnly { // the logical feed's re-check LISTEN is not the feed
+			e.feedIsDown(err)
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -1954,6 +2004,9 @@ func (e *engine) listenOnce(ctx context.Context) (listenedAt time.Time, err erro
 		}
 		// Notifications sent while we were not listening are lost.
 		e.listening()
+		if !e.revalOnly {
+			e.feedIsUp()
+		}
 		return nil
 	}()
 	if err != nil {

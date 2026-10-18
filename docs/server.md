@@ -489,6 +489,26 @@ srv.Shutdown(shutdownCtx)
 
 Sessions do not survive the shutdown: a client that comes back resyncs.
 
+## Readiness
+
+`App.Ready()` returns nil while the node serves fresh data, and an error saying why it does not. Wire it to your load balancer's readiness check:
+
+```go
+http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+	if err := app.Ready(); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	}
+})
+```
+
+It is an error:
+
+- before `Start`, and from `Shutdown` on;
+- until the change feed is first up: the `LISTEN` connection, or the logical feed's replication slot. Creating a slot waits for every transaction holding a transaction ID, which can take a while;
+- when the feed has been down for more than 10 s.
+
+Shorter outages are reported ready, so a Postgres restart, which every node reconnects from within seconds, does not take every node out of rotation at once. Meanwhile subscriptions lag, and calls wait for their writes up to `FenceTimeout`. The error names the feed and its last connection error.
+
 ## Slow clients
 
 A client that reads more slowly than its subscriptions change (a phone on a bad network, a tab in the background) does not make the server buffer every change for it. Once more than 256 KiB of diffs is queued for a connection, the server stops sending it diffs and only notes which subscriptions changed. When the client has caught up below 64 KiB, it gets one transaction that resets those subscriptions to the current data. The client applies a reset as a diff against what it holds, so rows that did not change are not re-rendered. Server memory per connection stays bounded by the size of the results, not by how fast they change.

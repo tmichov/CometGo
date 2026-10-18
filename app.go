@@ -410,6 +410,23 @@ func (a *App) Start(ctx context.Context) error {
 	return nil
 }
 
+// Ready reports whether this node serves fresh data, for a load balancer's
+// readiness check: nil once Start has run and the change feed (the LISTEN
+// connection, or the logical feed's replication slot) is up. A feed that
+// went down is still reported ready for 10 s, the time a reconnect takes,
+// so a Postgres restart does not take every node out at once; after that,
+// and before the feed was ever up (a logical slot can take long to
+// create), the error says why. During Shutdown it is an error too.
+func (a *App) Ready() error {
+	if !a.serving.Load() {
+		return errors.New("cometgo: not started")
+	}
+	if a.shutting.Load() {
+		return errors.New("cometgo: shutting down")
+	}
+	return a.engine.feedReady(time.Now())
+}
+
 // checkWalLevel fails when a node would send logical messages (the logical
 // feed, or re-checks while FeedMigrating) that Postgres refuses without
 // wal_level = logical: every Revalidate would fail, and every method
