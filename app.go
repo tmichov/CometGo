@@ -124,6 +124,11 @@ type Config struct {
 	// carry it. Required with FeedLogical.
 	ReplicationDSN string
 
+	// OrphanSlotAfter is how long a cometgo_* slot of this database must
+	// have been inactive before a logical-mode node drops it as left behind
+	// by a crashed process. Default 10 min; negative disables the sweep.
+	OrphanSlotAfter time.Duration
+
 	// SlotName names this node's replication slot, cometgo_<SlotName>, in
 	// logical mode: lowercase letters, digits and underscores, at most 55.
 	// Default: the random node ID. Set a stable name (a pod or host name)
@@ -287,6 +292,9 @@ func New(cfg Config) *App {
 	def(&cfg.Heartbeat, 25*time.Second)
 	def(&cfg.MinTickInterval, 20*time.Millisecond)
 	def(&cfg.FenceTimeout, 5*time.Second)
+	if cfg.OrphanSlotAfter == 0 {
+		cfg.OrphanSlotAfter = 10 * time.Minute
+	}
 	def(&cfg.QueryTimeout, 30*time.Second)
 	def(&cfg.SlowObserverAfter, time.Second)
 	switch {
