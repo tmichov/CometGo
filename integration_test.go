@@ -82,7 +82,17 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 	logs := newTestLog(t) // first, so its cleanup runs last and shutdown logs still show
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	pool, err := pgxpool.New(ctx, dsn)
+	pcfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pgxpool sizes its pool by the machine's CPUs (at least 4), and the
+	// MaxDetached default by the pool: on a 2-CPU CI runner nothing would
+	// detach. Tests run with the same pool everywhere unless the DSN says.
+	if !strings.Contains(dsn, "pool_max_conns") {
+		pcfg.MaxConns = 10
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		t.Fatal(err)
 	}

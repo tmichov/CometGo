@@ -29,13 +29,18 @@ func execAll(t *testing.T, e *testEnv, qs ...string) {
 	}
 }
 
-// pubCols returns the table's column list in the publication, nil if it
-// is not a member.
+// pubCols returns the table's published columns, nil if it is not a
+// member. Before PG 15 there are no column lists: every column of a member.
 func pubCols(t *testing.T, e *testEnv, table string) []string {
 	t.Helper()
 	var cols []string
 	err := e.pool.QueryRow(context.Background(), `
-		SELECT coalesce(attnames, '{}') FROM pg_publication_tables
+		SELECT CASE WHEN to_jsonb(pt) ? 'attnames'
+			THEN ARRAY(SELECT jsonb_array_elements_text(to_jsonb(pt)->'attnames'))
+			ELSE ARRAY(SELECT a.attname FROM pg_attribute a
+				WHERE a.attrelid = (pt.schemaname || '.' || pt.tablename)::regclass AND a.attnum > 0 AND NOT a.attisdropped
+				ORDER BY a.attnum) END
+		FROM pg_publication_tables pt
 		WHERE pubname = 'cometgo' AND schemaname || '.' || tablename = $1`, qualifyTable(table)).Scan(&cols)
 	if err != nil {
 		return nil
@@ -43,24 +48,77 @@ func pubCols(t *testing.T, e *testEnv, table string) []string {
 	return cols
 }
 
+// pubRelOID identifies the table's membership row: a DROP and ADD gives a
+// new one, so an unchanged oid shows an install left the table alone.
+func pubRelOID(t *testing.T, e *testEnv, table string) (oid uint32) {
+	t.Helper()
+	if err := e.pool.QueryRow(context.Background(), `
+		SELECT pr.oid FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid
+		WHERE p.pubname = 'cometgo' AND pr.prrelid = $1::regclass`, table).Scan(&oid); err != nil {
+		t.Fatal(err)
+	}
+	return oid
+}
+
+// keyListsSupported reports whether the server has publication column
+// lists (PG 15+); before, InstallPublicationKeysOnly must refuse.
+func keyListsSupported(t *testing.T, e *testEnv) bool {
+	t.Helper()
+	var v int
+	if err := e.pool.QueryRow(context.Background(), "SELECT current_setting('server_version_num')::int").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v < 150000 {
+		if err := InstallPublicationKeysOnly(context.Background(), e.pool, e.table); err == nil || !strings.Contains(err.Error(), "needs PostgreSQL 15") {
+			t.Fatalf("PG %d: InstallPublicationKeysOnly gave %v, want the version error", v, err)
+		}
+		return false
+	}
+	return true
+}
+
 func TestInstallPublicationIdempotent(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
 	all := []string{"id", "owner", "name", "n"}
-	for range 2 {
+	var first uint32
+	for i := range 2 {
 		if err := InstallPublication(ctx, e.pool, e.table); err != nil {
 			t.Fatal(err)
 		}
 		if got := pubCols(t, e, e.table); !slices.Equal(got, all) {
 			t.Fatalf("whole rows: columns %v, want %v", got, all)
 		}
-	}
-	for range 2 {
-		if err := InstallPublicationKeysOnly(ctx, e.pool, e.table); err != nil {
-			t.Fatal(err)
+		if oid := pubRelOID(t, e, e.table); i == 0 {
+			first = oid
+		} else if oid != first {
+			t.Error("whole rows: the second install re-added the table")
 		}
-		if got := pubCols(t, e, e.table); !slices.Equal(got, []string{"id"}) {
-			t.Fatalf("keys only: columns %v, want [id]", got)
+	}
+	if !keyListsSupported(t, e) {
+		return
+	}
+	// A key declared out of column order: the list must match it however
+	// Postgres orders it, or every install re-adds the table.
+	comp := e.table + "_comp"
+	execAll(t, e, "CREATE TABLE "+comp+" (a int, b text, v int, PRIMARY KEY (b, a))")
+	t.Cleanup(func() { e.pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+comp) })
+	for _, c := range []struct {
+		table string
+		want  []string
+	}{{e.table, []string{"id"}}, {comp, []string{"a", "b"}}} {
+		for i := range 2 {
+			if err := InstallPublicationKeysOnly(ctx, e.pool, c.table); err != nil {
+				t.Fatal(err)
+			}
+			if got := pubCols(t, e, c.table); !slices.Equal(got, c.want) {
+				t.Fatalf("%s keys only: columns %v, want %v", c.table, got, c.want)
+			}
+			if oid := pubRelOID(t, e, c.table); i == 0 {
+				first = oid
+			} else if oid != first {
+				t.Errorf("%s keys only: the second install re-added the table", c.table)
+			}
 		}
 	}
 	if err := checkLogical(e, e.table); err != nil {
@@ -101,6 +159,9 @@ func TestInstallPublicationRefusesUnusableIdentity(t *testing.T) {
 	if err := checkLogical(e, full); err != nil {
 		t.Errorf("FULL with a generated column: %v", err)
 	}
+	if !keyListsSupported(t, e) {
+		return
+	}
 	if err := InstallPublicationKeysOnly(ctx, e.pool, full); err == nil || !strings.Contains(err.Error(), "REPLICA IDENTITY FULL") {
 		t.Errorf("FULL keys only: %v", err)
 	}
@@ -118,8 +179,11 @@ func TestCheckTablesLogical(t *testing.T) {
 	if err := InstallPublication(ctx, e.pool, nothing, dropped, idx); err != nil {
 		t.Fatal(err)
 	}
-	if err := InstallPublicationKeysOnly(ctx, e.pool, moved); err != nil {
-		t.Fatal(err)
+	keyLists := keyListsSupported(t, e)
+	if keyLists {
+		if err := InstallPublicationKeysOnly(ctx, e.pool, moved); err != nil {
+			t.Fatal(err)
+		}
 	}
 	execAll(t, e,
 		"ALTER TABLE "+nothing+" REPLICA IDENTITY NOTHING",
@@ -136,6 +200,9 @@ func TestCheckTablesLogical(t *testing.T) {
 		{idx, "REPLICA IDENTITY USING INDEX"},
 		{moved, "does not cover the replica identity of " + moved + " (missing k)"},
 	} {
+		if c.table == moved && !keyLists {
+			continue // no column lists before PG 15
+		}
 		err := checkLogical(e, c.table)
 		if err == nil || !strings.Contains(err.Error(), "table public."+c.table+":") || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: got %v, want %q naming the table", c.table, err, c.want)
