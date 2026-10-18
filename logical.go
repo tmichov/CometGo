@@ -53,6 +53,23 @@ type decoder struct {
 	xid    uint32
 	groups []*keyGroup // this transaction's, in first-seen order
 	notes  []notification
+
+	// Protocol 2 streaming (design §8): a large transaction arrives in
+	// chunks while it runs. inStream is set between Stream Start and Stream
+	// Stop; streams holds each streamed transaction, by top-level xid,
+	// until its Stream Commit or Abort.
+	inStream bool
+	streams  map[uint32]*streamTx
+	streamID uint32 // the transaction of the current chunk
+}
+
+// streamTx is a streamed transaction folded down: the tables it changed,
+// each reported dirty at its commit (its keys would cost what streaming
+// saves), and its comet messages.
+type streamTx struct {
+	all    bool // a change to a relation never described
+	tables []string
+	msgs   []notification
 }
 
 type keyGroup struct {
@@ -63,12 +80,94 @@ type keyGroup struct {
 }
 
 func newDecoder(pkColumns func(context.Context, uint32) ([]string, error)) *decoder {
-	return &decoder{pkColumns: pkColumns, rels: map[uint32]*decRel{}}
+	return &decoder{pkColumns: pkColumns, rels: map[uint32]*decRel{}, streams: map[uint32]*streamTx{}}
 }
 
 // handle applies one message. It returns a finished transaction at COMMIT,
 // and a non-transactional comet message at once.
 func (d *decoder) handle(ctx context.Context, m pglogrepl.Message) (*decodedTx, error) {
+	// Protocol 2 wraps each message; outside a stream it is the same.
+	switch v := m.(type) {
+	case *pglogrepl.StreamStartMessageV2:
+		d.inStream, d.streamID = true, v.Xid
+		if d.streams[v.Xid] == nil {
+			d.streams[v.Xid] = &streamTx{}
+		}
+		return nil, nil
+	case *pglogrepl.StreamStopMessageV2:
+		d.inStream = false
+		return nil, nil
+	case *pglogrepl.StreamAbortMessageV2:
+		st := d.streams[v.Xid]
+		if v.SubXid == v.Xid || st == nil {
+			delete(d.streams, v.Xid)
+			return nil, nil
+		}
+		// A savepoint rolled back. Its tables stay dirty (a few more
+		// re-runs, never a missed change). Its messages cannot be told
+		// apart: pgoutput streams them under the top-level xid. So every
+		// event streamed so far goes, since one from the savepoint must
+		// not be delivered and events are at-most-once; re-checks stay,
+		// since an extra one only re-runs fn; and the fence, always the
+		// last statement, comes after any savepoint.
+		st.msgs = slices.DeleteFunc(st.msgs, func(n notification) bool { return n.evt != nil })
+		return nil, nil
+	case *pglogrepl.StreamCommitMessageV2:
+		st := d.streams[v.Xid]
+		delete(d.streams, v.Xid)
+		tx := &decodedTx{xid: v.Xid, end: v.TransactionEndLSN}
+		if st != nil {
+			if st.all {
+				tx.notes = append(tx.notes, notification{all: true})
+			}
+			for _, t := range st.tables {
+				tx.notes = append(tx.notes, notification{table: t})
+			}
+			tx.notes = append(tx.notes, st.msgs...)
+		}
+		return tx, nil
+	case *pglogrepl.RelationMessageV2:
+		m = &v.RelationMessage
+	case *pglogrepl.InsertMessageV2:
+		if d.inStream {
+			d.streamTable(v.RelationID)
+			return nil, nil
+		}
+		m = &v.InsertMessage
+	case *pglogrepl.UpdateMessageV2:
+		if d.inStream {
+			d.streamTable(v.RelationID)
+			return nil, nil
+		}
+		m = &v.UpdateMessage
+	case *pglogrepl.DeleteMessageV2:
+		if d.inStream {
+			d.streamTable(v.RelationID)
+			return nil, nil
+		}
+		m = &v.DeleteMessage
+	case *pglogrepl.TruncateMessageV2:
+		if d.inStream {
+			for _, id := range v.RelationIDs {
+				d.streamTable(id)
+			}
+			return nil, nil
+		}
+		m = &v.TruncateMessage
+	case *pglogrepl.LogicalDecodingMessageV2:
+		if d.inStream && v.Transactional {
+			if v.Prefix == "comet" {
+				if n, ok := parseMessage(string(v.Content)); ok {
+					st := d.streams[d.streamID]
+					st.msgs = append(st.msgs, n)
+				}
+			}
+			return nil, nil
+		}
+		m = &v.LogicalDecodingMessage
+	case *pglogrepl.TypeMessageV2:
+		return nil, nil
+	}
 	switch m := m.(type) {
 	case *pglogrepl.RelationMessage:
 		pk, err := d.pkColumns(ctx, m.RelationID)
@@ -131,6 +230,19 @@ func (d *decoder) handle(ctx context.Context, m pglogrepl.Message) (*decodedTx, 
 		return tx, nil
 	}
 	return nil, nil
+}
+
+// streamTable records a change to relation relID in the current chunk's
+// transaction.
+func (d *decoder) streamTable(relID uint32) {
+	st := d.streams[d.streamID]
+	r := d.rels[relID]
+	switch {
+	case r == nil:
+		st.all = true
+	case !slices.Contains(st.tables, r.name):
+		st.tables = append(st.tables, r.name)
+	}
 }
 
 // parseMessage parses a comet message: f|token, e|event JSON or v|userID.

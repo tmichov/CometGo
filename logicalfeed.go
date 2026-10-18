@@ -51,6 +51,7 @@ type logicalFeed struct {
 	senderTimeout time.Duration // wal_sender_timeout on the connection
 	statusEvery   time.Duration
 	createTimeout time.Duration
+	noStreaming   bool // protocol 1, as before streaming (tests)
 }
 
 func newLogicalFeed(e *engine) *logicalFeed {
@@ -272,9 +273,14 @@ func (f *logicalFeed) runOnce(ctx context.Context) (startedAt time.Time, err err
 	// commits below a start above confirmed_flush, so nothing the engine
 	// already has comes again, and a half-received transaction comes whole.
 	// 0 (a fresh process on an existing slot) means confirmed_flush.
-	err = pglogrepl.StartReplication(ctx, conn, f.slot, start, pglogrepl.StartReplicationOptions{
-		PluginArgs: []string{"proto_version '1'", "publication_names '" + pubName + "'", "messages 'true'"},
-	})
+	// Protocol 2 streams a large transaction while it runs (design §8),
+	// instead of decoding it whole at its commit while every later commit
+	// waits behind it.
+	args := []string{"proto_version '2'", "streaming 'on'", "publication_names '" + pubName + "'", "messages 'true'"}
+	if f.noStreaming {
+		args = []string{"proto_version '1'", "publication_names '" + pubName + "'", "messages 'true'"}
+	}
+	err = pglogrepl.StartReplication(ctx, conn, f.slot, start, pglogrepl.StartReplicationOptions{PluginArgs: args})
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -378,7 +384,7 @@ func (f *logicalFeed) stream(ctx context.Context, conn *pgconn.PgConn) error {
 			probeBy = now.Add(f.e.listenProbe)
 			reply = true
 		}
-		if c := f.confirmable(d.xid != 0, walEnd); reply || c != sent && !now.Before(nextStatus) {
+		if c := f.confirmable(d.xid != 0 || len(d.streams) > 0, walEnd); reply || c != sent && !now.Before(nextStatus) {
 			err := pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
 				WALWritePosition: c, WALFlushPosition: c, WALApplyPosition: c,
 				ReplyRequested: !probeBy.IsZero(),
@@ -425,7 +431,7 @@ func (f *logicalFeed) stream(ctx context.Context, conn *pgconn.PgConn) error {
 				if err != nil {
 					return err
 				}
-				msg, err := pglogrepl.Parse(x.WALData)
+				msg, err := pglogrepl.ParseV2(x.WALData, d.inStream)
 				if err != nil {
 					return err
 				}

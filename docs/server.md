@@ -586,6 +586,17 @@ The counterpart of `InstallTriggers` for the logical feed (`FeedLogical`). It ad
 
 **Replica identity.** Postgres refuses `UPDATE` and `DELETE` on a published table that has no usable replica identity. So both functions refuse a table, or a partition, that has neither `REPLICA IDENTITY DEFAULT` with a primary key nor `FULL`. A migration that runs later and drops the primary key, sets `REPLICA IDENTITY NOTHING`, or (under a key-only list) changes the key, makes the app's own writes to that table fail until it is fixed. The check at `Start` catches this only when it already happened before the restart. After changing a key under a key-only list, run `InstallPublicationKeysOnly` again.
 
+## Large transactions on the logical feed
+
+Postgres decodes the write-ahead log in commit order, so a transaction's changes reach the server only at or after its commit, and every later commit waits behind it. Up to `logical_decoding_work_mem` (64 MB by default), Postgres keeps a transaction's decoded changes in memory. Beyond that, the logical feed has them **streamed**: sent while the transaction still runs, and handed to the engine at its commit, or dropped if it aborts.
+
+- **Table-dirty only.** A streamed transaction is reported as "these tables changed", without row keys, and its fences, events and re-checks follow at its commit, as usual. Subscriptions on those tables re-run in full once, which is what a transaction this large would cost them anyway.
+- **Savepoints.** If a streamed transaction rolls back a savepoint, the events it emitted before that rollback are not delivered, even those outside the savepoint: Postgres streams them without saying which savepoint they belong to, and events are at-most-once. Re-checks and the call's result are unaffected.
+- **What streaming saves.** A long batch job is decoded while it runs, so calls that commit after it are not held while all of it is read back and decoded at its commit.
+- **What it does not save.** The changes still have to be read: a short burst that writes faster than the walsender decodes still delays the calls behind it, by the time it takes to read through it.
+- **Spilling to disk.** Without streaming (protocol 1), a transaction larger than `logical_decoding_work_mem` spills to disk on the database server, once per node, and is read back at its commit, while every later commit on that node waits. Streaming needs PostgreSQL 14 or later, which the logical feed requires anyway.
+- **Monitoring.** `pg_stat_replication_slots` shows a slot's `stream_txns` and `spill_txns`. With streaming, spills should be rare: Postgres still spills a transaction it cannot stream at that moment, for example in the middle of a TOAST write.
+
 ## Moving to the logical feed
 
 A running app moves from `FeedNotify` to `FeedLogical` one node at a time, without downtime. During the move some nodes run each feed, and both kinds of nodes serve the same subscriptions correctly. Only events are affected (below).

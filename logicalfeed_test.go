@@ -386,3 +386,84 @@ func TestRevalOnlyListenReleasesNoFence(t *testing.T) {
 	}
 	e.dropFence(token)
 }
+
+// largeTxThenCall commits a 200,000-row transaction, then a small fenced
+// call, and returns how long the call took. The replication connection
+// runs with logical_decoding_work_mem at its minimum, so the large
+// transaction is streamed (or, without streaming, spilled to disk).
+func largeTxThenCall(t *testing.T, streaming bool) (time.Duration, slotStats) {
+	t.Helper()
+	dsn := os.Getenv("COMETGO_TEST_DATABASE_URL")
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	e := setupFull(t, func(c *Config) {
+		c.Feed, c.ReplicationDSN = FeedLogical, dsn+sep+"logical_decoding_work_mem=64kB"
+	}, func(env *testEnv, app *App) {
+		if err := InstallPublication(context.Background(), env.pool, env.table); err != nil {
+			t.Fatal(err)
+		}
+		app.engine.feed.(*logicalFeed).noStreaming = !streaming
+	})
+	e.waitListening(t)
+	a, _ := e.dial(t, nil)
+	// 200,000 rows in one transaction, written over about two seconds, as
+	// a long batch job would: streamed, they are decoded as they come.
+	tx, err := e.pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 20 {
+		if _, err := tx.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) SELECT 'big', 'x' FROM generate_series(1, 10000); SELECT pg_sleep(0.1)"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "o", "Name": "small"}})
+	for {
+		m := a.next()
+		if m["t"] != "res" {
+			continue
+		}
+		if m["ok"] != true || m["lag"] == true {
+			t.Fatalf("small call: %v", m)
+		}
+		took := time.Since(start)
+		// The walsender reports its slot's statistics when it is stopped;
+		// read them once it has.
+		slot := e.app.engine.feed.(*logicalFeed).slot
+		execAll(t, e, "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = '"+slot+"' AND active_pid IS NOT NULL")
+		var st slotStats
+		waitFor(t, "the slot's statistics", func() bool {
+			e.pool.QueryRow(context.Background(), "SELECT stream_txns, spill_txns FROM pg_stat_replication_slots WHERE slot_name = $1", slot).Scan(&st.streamed, &st.spilled)
+			return st.streamed+st.spilled > 0
+		})
+		return took, st
+	}
+}
+
+type slotStats struct{ streamed, spilled int64 }
+
+// A large transaction is streamed while it runs, so a small fenced call
+// committed after it is not held while the large one is decoded at its
+// commit, as it is without streaming.
+func TestLargeTransactionStreamed(t *testing.T) {
+	without, spilled := largeTxThenCall(t, false)
+	with, streamed := largeTxThenCall(t, true)
+	t.Logf("small call after a 200,000-row transaction: %v streamed %+v, %v not %+v", with, streamed, without, spilled)
+	if streamed.streamed == 0 || streamed.spilled != 0 {
+		t.Errorf("streaming feed: %+v, want the transaction streamed, not spilled", streamed)
+	}
+	if spilled.spilled == 0 {
+		t.Errorf("protocol 1 feed: %+v, want the transaction spilled", spilled)
+	}
+	// Without streaming the whole transaction is decoded after its commit,
+	// ahead of the call's; streamed, most of it was decoded while it ran.
+	if with > without/2 {
+		t.Errorf("small call took %v streamed, %v without streaming: not held for less than half the decode", with, without)
+	}
+}
