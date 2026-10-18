@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -465,5 +468,66 @@ func TestLargeTransactionStreamed(t *testing.T) {
 	// ahead of the call's; streamed, most of it was decoded while it ran.
 	if with > without/2 {
 		t.Errorf("small call took %v streamed, %v without streaming: not held for less than half the decode", with, without)
+	}
+}
+
+// proxiedFeed is a feedEnv whose replication connection goes through a
+// pauseProxy, with short liveness timings.
+func proxiedFeed(t *testing.T) (*feedEnv, *pauseProxy) {
+	t.Helper()
+	fe := newFeedEnv(t)
+	cc, err := pgconn.ParseConfig(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := newPauseProxy(t, net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port))))
+	t.Cleanup(proxy.resume) // before the feed's cleanup, so it can stop
+	u, err := url.Parse(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Host = proxy.ln.Addr().String()
+	q := u.Query()
+	q.Set("sslmode", "disable") // one connect attempt per try: no TLS, no fallback
+	u.RawQuery = q.Encode()
+	fe.app.cfg.ReplicationDSN = u.String()
+	eng := fe.app.engine
+	eng.listenIdle, eng.listenProbe, eng.listenConnect = 300*time.Millisecond, 200*time.Millisecond, 300*time.Millisecond
+	return fe, proxy
+}
+
+// A replication connection whose path goes silent, without a TCP reset,
+// is noticed by the probe within listenIdle + listenProbe and replaced
+// once the path is back; writes made meanwhile arrive exactly once.
+func TestLogicalFeedProbesSilentPath(t *testing.T) {
+	fe, proxy := proxiedFeed(t)
+	fe.start()
+	waitFor(t, "the slot", func() bool { return fe.app.engine.starts.Load() > 0 })
+	fe.insert(t, 1)
+	waitFor(t, "id 1", func() bool { return fe.ids(t)["1"] == 1 })
+	before := fe.app.engine.starts.Load()
+
+	proxy.pause()
+	fe.insert(t, 2, 3)      // while the path is dead
+	time.Sleep(time.Second) // past listenIdle + listenProbe, and a few connect timeouts
+	proxy.resume()
+	waitFor(t, "the feed back", func() bool { return fe.app.engine.starts.Load() > before })
+	waitFor(t, "ids 2 and 3", func() bool { return fe.ids(t)["3"] >= 1 })
+	for _, id := range []string{"1", "2", "3"} {
+		if n := fe.ids(t)[id]; n != 1 {
+			t.Errorf("id %s notified %d times, want once", id, n)
+		}
+	}
+}
+
+// A quiet connection on a live path is probed and answered: no reconnect.
+func TestLogicalFeedQuietPathStays(t *testing.T) {
+	fe, _ := proxiedFeed(t)
+	fe.start()
+	waitFor(t, "the slot", func() bool { return fe.app.engine.starts.Load() > 0 })
+	before := fe.app.engine.starts.Load()
+	time.Sleep(2 * time.Second) // several listenIdle periods without a change
+	if n := fe.app.engine.starts.Load(); n != before {
+		t.Errorf("feed restarted %d times on a quiet, live path", n-before)
 	}
 }
