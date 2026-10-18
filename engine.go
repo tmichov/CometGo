@@ -381,25 +381,18 @@ func (e *engine) markCommitted(token string) {
 
 // listening records a successful LISTEN, with listenMu held for writing,
 // and marks everything dirty: notifications sent while nobody listened are
-// lost.
+// lost. On a logical node's re-check LISTEN (revalOnly) only re-checks were
+// lost: every sub is re-checked (reval.all) without re-running observers,
+// and the logical feed's restarted ignores the generation, so no fence is
+// released by it.
 func (e *engine) listening() {
-	if e.revalOnly {
-		// Only re-checks were lost: re-check every sub (reval.all), without
-		// re-running observers; the logical feed's restarted ignores the
-		// generation, so no fence is released by it.
-		e.mu.Lock()
-		e.listenGen++
-		e.nextN++
-		e.pending = append(e.pending, notification{n: e.nextN, listen: e.listenGen})
-		e.mu.Unlock()
-		e.signal()
-		return
+	if !e.revalOnly {
+		e.starts.Add(1)
 	}
-	e.starts.Add(1)
 	e.mu.Lock()
 	e.listenGen++
 	e.nextN++
-	e.pending = append(e.pending, notification{n: e.nextN, all: true, listen: e.listenGen})
+	e.pending = append(e.pending, notification{n: e.nextN, all: !e.revalOnly, listen: e.listenGen})
 	e.mu.Unlock()
 	e.signal()
 }
