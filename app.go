@@ -119,6 +119,17 @@ type Config struct {
 	// implemented yet, and Start rejects it.
 	Feed Feed
 
+	// ReplicationDSN is a direct connection to the database of DB for the
+	// logical feed's replication protocol (FeedLogical): poolers do not
+	// carry it. Required with FeedLogical.
+	ReplicationDSN string
+
+	// SlotName names this node's replication slot, cometgo_<SlotName>, in
+	// logical mode: lowercase letters, digits and underscores, at most 55.
+	// Default: the random node ID. Set a stable name (a pod or host name)
+	// so a restarted process resumes its slot instead of leaving one.
+	SlotName string
+
 	// Authenticate validates a bearer token sent in hello or auth. Return an
 	// *Error (e.g. UNAUTHENTICATED) to reject it. If nil, tokens are rejected.
 	Authenticate func(ctx context.Context, token string) (*Identity, error)
@@ -341,6 +352,9 @@ func (a *App) Start(ctx context.Context) error {
 		feedErr = errors.New("cometgo: Config.Feed: FeedLogical is not implemented yet")
 	default:
 		feedErr = fmt.Errorf("cometgo: Config.Feed: unknown feed %d", a.cfg.Feed)
+	}
+	if a.cfg.SlotName != "" && !validSlotName(a.cfg.SlotName) {
+		feedErr = fmt.Errorf("cometgo: Config.SlotName %q: use lowercase letters, digits and underscores, at most 55", a.cfg.SlotName)
 	}
 	if feedErr != nil {
 		a.log.Error("start failed", "err", feedErr)

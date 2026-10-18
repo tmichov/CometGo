@@ -33,6 +33,9 @@ type engine struct {
 	fenceN  uint64
 	wake    chan struct{}
 	feed    feed
+	// drained is the number of the last notification a tick has drained
+	// (the logical feed confirms its slot up to it).
+	drained atomic.Uint64
 	// listenGen counts successful LISTENs (listening).
 	listenGen uint64
 	// listenMu orders fenced commits against LISTEN: commitFenced holds it
@@ -313,6 +316,23 @@ func (e *engine) notify(n notification) {
 	e.signal()
 }
 
+// notifyAll queues notes in order, numbered consecutively, and returns the
+// number of the last one: with none, the last number given out.
+func (e *engine) notifyAll(notes []notification) uint64 {
+	e.mu.Lock()
+	for _, n := range notes {
+		e.nextN++
+		n.n = e.nextN
+		e.pending = append(e.pending, n)
+	}
+	last := e.nextN
+	e.mu.Unlock()
+	if len(notes) > 0 {
+		e.signal()
+	}
+	return last
+}
+
 // registerFence must be called before the method's transaction commits, so
 // the fence is known by the time its notification can be drained.
 func (e *engine) registerFence(c *conn) (string, *fence) {
@@ -409,6 +429,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 	notes, reqs := e.pending, e.reqs
 	e.pending, e.reqs = nil, nil
 	cutoff := e.nextN
+	e.drained.Store(cutoff)
 	evts := e.carryEvts
 	e.carryEvts = nil
 	reval := revalidateReq{users: map[string]bool{}}
