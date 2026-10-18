@@ -43,6 +43,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `OriginPatterns []string` | none | Extra allowed `Origin` hosts for the WebSocket upgrade, as host patterns (e.g. `"app.example.com"`, `"*.example.com"`). Same-origin requests are always allowed; other origins are refused. |
 | `Heartbeat` | 25s | The server pings every interval and closes the connection with 4408 if a ping gets no pong within twice the interval. Also sent to the client, which uses it for its own liveness check. |
 | `MinTickInterval` | 20ms | Minimum time between engine ticks. Bursts of changes inside the interval are coalesced into one re-run. |
+| `Feed` | `FeedNotify` | Change feed. `FeedNotify` listens for the triggers' notifications (see `InstallTriggers`). `FeedLogical` (logical decoding) is not implemented yet: `Start` returns an error. |
 | `FenceTimeout` | 5s | How long a method result waits for its writes to reach the caller's subscriptions. After that the result is sent with `lag: true`. |
 | `IdempotencyTTL` | 24h | How long the result of a call carrying an [idempotency key](#idempotency-keys) is kept. A retry after that runs the method again. Keep it above an hour: the TypeScript client retries a call for up to an hour after first sending it. |
 | `QueryTimeout` | 30s | Hard `statement_timeout` for publication queries. A query that exceeds it ends its subscriptions with `TIMEOUT`. Also bounds the column-type lookup for user-defined types, including the wait for its pool connection. |

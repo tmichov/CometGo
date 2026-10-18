@@ -164,3 +164,20 @@ func TestNewRejectsSingleConnPool(t *testing.T) {
 	}()
 	New(Config{DB: pool})
 }
+
+// Start refuses a feed that is not implemented, and an unknown one.
+func TestStartChecksFeed(t *testing.T) {
+	e := setup(t)
+	for _, c := range []struct {
+		feed Feed
+		want string
+	}{
+		{FeedLogical, "not implemented yet"},
+		{Feed(7), "unknown feed 7"},
+	} {
+		app := New(Config{DB: e.pool, Feed: c.feed})
+		if err := app.Start(context.Background()); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("Feed %d: got %v, want %q", c.feed, err, c.want)
+		}
+	}
+}

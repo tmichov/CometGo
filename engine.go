@@ -32,6 +32,7 @@ type engine struct {
 	fences  map[string]*fence
 	fenceN  uint64
 	wake    chan struct{}
+	feed    feed
 	// listenGen counts successful LISTENs (listening).
 	listenGen uint64
 	// listenMu orders fenced commits against LISTEN: commitFenced holds it
@@ -117,6 +118,9 @@ type notification struct {
 	token  string // fence
 	evt    *evtNote
 	reval  string // comet_reval: the user ID to re-check
+	// xid is the transaction the notification came from, 0 when unknown
+	// (the notify feed never knows it).
+	xid uint64
 }
 
 type fence struct {
@@ -127,7 +131,7 @@ type fence struct {
 	// or a reconnect's all-dirty one); 0 until then. Engine mutex.
 	p uint64
 	// committed is set once the method's transaction has committed, and gen
-	// is listenGen at that moment (commitFenced).
+	// is listenGen at that moment (notifyFeed.commitFenced).
 	committed bool
 	gen       uint64
 }
@@ -259,7 +263,7 @@ type queuedReq struct {
 }
 
 func newEngine(a *App) *engine {
-	return &engine{
+	e := &engine{
 		a:           a,
 		fences:      map[string]*fence{},
 		wake:        make(chan struct{}, 1),
@@ -282,6 +286,8 @@ func newEngine(a *App) *engine {
 		// path that is still dead is retried soon after it comes back.
 		listenConnect: 10 * time.Second,
 	}
+	e.feed = notifyFeed{e} // Start rejects every other Config.Feed
+	return e
 }
 
 func (e *engine) signal() {
@@ -317,21 +323,6 @@ func (e *engine) registerFence(c *conn) (string, *fence) {
 	f := &fence{token: token, released: make(chan struct{}), c: c}
 	e.fences[token] = f
 	return token, f
-}
-
-// commitFenced commits a method's transaction whose last statement
-// notified token's fence, and marks the fence committed. Postgres drops
-// notifications for a channel nobody listens on, so the fence of a method
-// that committed while the listener was down never arrives; the all-dirty
-// tick of the next successful LISTEN releases it instead (tick).
-func (e *engine) commitFenced(ctx context.Context, tx pgx.Tx, token string) error {
-	e.listenMu.RLock()
-	defer e.listenMu.RUnlock()
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	e.markCommitted(token)
-	return nil
 }
 
 func (e *engine) markCommitted(token string) {
@@ -441,20 +432,8 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 			listened, listenN = n.listen, n.n
 		}
 	}
-	// A fence committed before listener generation `listened` issued LISTEN
-	// (listenMu) never reaches that connection: its notifications were
-	// either received earlier, and so are in this drain or an earlier one,
-	// or lost. The all-dirty notification of that LISTEN makes every
-	// observer stale from listenN, so the fence is released once they
-	// reflect it, and the fence's events, if received, go out before its
-	// res. A fence committed later is left to its own notification:
-	// releasing it here could send its res ahead of its events.
 	if listened > 0 {
-		for _, f := range e.fences {
-			if f.committed && f.gen < listened && f.p == 0 {
-				f.p = listenN
-			}
-		}
+		e.feed.restarted(listened, listenN)
 	}
 	// Drained fences stay registered until released, so FenceTimeout's
 	// dropFence takes a carried one out too.

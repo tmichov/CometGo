@@ -925,7 +925,7 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 		c.a.engine.dropFence(token)
 		return val, false, tx.Commit(ctx)
 	}
-	if err := c.a.engine.commitFenced(ctx, tx, token); err != nil {
+	if err := c.a.engine.feed.commitFenced(ctx, tx, token); err != nil {
 		return nil, false, err
 	}
 	// Committed: return the connection before waiting on the fence, as
