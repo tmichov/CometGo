@@ -115,6 +115,10 @@ type Config struct {
 	// DB is the Postgres pool used for publications, methods and LISTEN.
 	DB *pgxpool.Pool
 
+	// Feed selects the change feed. Default FeedNotify; FeedLogical is not
+	// implemented yet, and Start rejects it.
+	Feed Feed
+
 	// Authenticate validates a bearer token sent in hello or auth. Return an
 	// *Error (e.g. UNAUTHENTICATED) to reject it. If nil, tokens are rejected.
 	Authenticate func(ctx context.Context, token string) (*Identity, error)
@@ -330,6 +334,18 @@ func (a *App) Start(ctx context.Context) error {
 	if a.started {
 		panic("cometgo: Start called twice")
 	}
+	var feedErr error
+	switch a.cfg.Feed {
+	case FeedNotify:
+	case FeedLogical:
+		feedErr = errors.New("cometgo: Config.Feed: FeedLogical is not implemented yet")
+	default:
+		feedErr = fmt.Errorf("cometgo: Config.Feed: unknown feed %d", a.cfg.Feed)
+	}
+	if feedErr != nil {
+		a.log.Error("start failed", "err", feedErr)
+		return feedErr
+	}
 	if a.shutting.Load() {
 		a.started = true
 		return nil
@@ -348,7 +364,7 @@ func (a *App) Start(ctx context.Context) error {
 		a.log.Warn("slow publication queries will not be detached: each one holds its tick (Config.MaxDetached is off, or the pool has fewer than 5 connections)")
 	}
 	ctx, a.stop = context.WithCancel(ctx)
-	for _, run := range []func(context.Context){a.engine.listen, a.engine.run, a.cleanIdempotency} {
+	for _, run := range []func(context.Context){a.engine.feed.run, a.engine.run, a.cleanIdempotency} {
 		a.running.Add(1)
 		go func() {
 			defer a.running.Done()
