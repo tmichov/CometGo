@@ -41,6 +41,12 @@ type logicalFeed struct {
 	dropIn    atomic.Pointer[pgSnapshot]
 	confirmed pglogrepl.LSN // owned by stream
 
+	// swept is what the last sweep saw of each inactive slot, when Postgres
+	// has no inactive_since (before 17); noInactiveSince forces that path
+	// (tests). Owned by the sweeper.
+	swept           map[string]seenSlot
+	noInactiveSince bool
+
 	// Timings, settable by tests.
 	senderTimeout time.Duration // wal_sender_timeout on the connection
 	statusEvery   time.Duration
@@ -134,6 +140,7 @@ func (f *logicalFeed) confirmable(midTx bool, walEnd pglogrepl.LSN) pglogrepl.LS
 }
 
 func (f *logicalFeed) run(ctx context.Context) {
+	go f.sweepLoop(ctx)
 	go func() {
 		for ctx.Err() == nil {
 			if err := f.gate.run(ctx); err != nil && ctx.Err() == nil {
@@ -226,7 +233,10 @@ func (f *logicalFeed) runOnce(ctx context.Context) (startedAt time.Time, err err
 	case len(rows[0].Rows) == 0:
 		// Missing: new, dropped by a sweep, or its WAL removed. Its
 		// consistent point is where decoding starts; changes before it are
-		// covered by an all-dirty tick (the rule of CMTG-87).
+		// covered by an all-dirty tick (restart).
+		if err := f.checkHeadroom(ctx); err != nil {
+			return time.Time{}, err
+		}
 		cctx, cancel := context.WithTimeout(ctx, f.createTimeout)
 		res, err := pglogrepl.CreateReplicationSlot(cctx, conn, f.slot, "pgoutput",
 			pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication, SnapshotAction: "NOEXPORT_SNAPSHOT"})
