@@ -1,9 +1,9 @@
 // Command feedbench measures what the change feed costs a write workload:
 // committed transactions per second on one table, with no feed, with the
 // NOTIFY feed (InstallTriggers, plus a fence per transaction as a fenced call
-// sends), and with a logical-decoding feed (a publication and a slot being
-// read, plus a fence as a logical message). It is the M4 measurement tool;
-// see docs/bench/README.md.
+// sends), and with the logical feed (InstallPublication and a cometgo App on
+// FeedLogical streaming its slot, plus a fence as a logical message). It is
+// the M4 measurement tool; see docs/bench/README.md.
 //
 // Every mode runs the same transaction: one UPDATE of a random row by
 // primary key, from -writers concurrent connections. The logical modes need
@@ -11,6 +11,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"flag"
 	"fmt"
@@ -48,7 +49,7 @@ var modes = []mode{
 	{name: "triggers", desc: "InstallTriggers, one listener", triggers: true},
 	{name: "triggers+fence", desc: "InstallTriggers and a NOTIFY fence per transaction", triggers: true,
 		fence: "SELECT pg_notify('comet', '1|f|bench:' || $1::text)"},
-	{name: "logical", desc: "publication (whole rows) and a slot read every 50 ms", logical: true},
+	{name: "logical", desc: "InstallPublication (whole rows), an App on FeedLogical streaming its slot", logical: true},
 	{name: "logical+fence", desc: "logical, and a transactional logical message per transaction", logical: true,
 		fence: "SELECT pg_logical_emit_message(true, 'comet', 'f|bench:' || $1::text)"},
 }
@@ -58,7 +59,6 @@ type result struct {
 	commits  int64
 	took     time.Duration
 	p50, p99 time.Duration
-	decoded  int64 // bytes read from the slot, logical modes
 }
 
 func main() {
@@ -69,6 +69,7 @@ func main() {
 	only := flag.String("modes", "", "comma-separated modes to run (default all)")
 	payload := flag.Int("payload", 100, "bytes in each row's text column; the logical modes decode whole rows, so wide rows cost them more")
 	out := flag.String("out", "", "also write the Markdown report to this file")
+	rounds := flag.Int("rounds", 1, "rounds of all modes, alternating; the report gives each mode's median and range (every transaction waits on a WAL flush, so one run is noisy)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -87,7 +88,7 @@ func main() {
 	if err := pool.QueryRow(ctx, "SELECT current_setting('wal_level'), current_setting('server_version')").Scan(&walLevel, &version); err != nil {
 		log.Fatal(err)
 	}
-	var results []result
+	var selected []mode
 	for _, m := range modes {
 		if *only != "" && !slices.Contains(strings.Split(*only, ","), m.name) {
 			continue
@@ -96,14 +97,20 @@ func main() {
 			log.Printf("skipping %s: wal_level is %s, not logical", m.name, walLevel)
 			continue
 		}
-		r, err := run(ctx, pool, *dsn, m, *writers, *payload, *warmup, *duration)
-		if err != nil {
-			log.Fatalf("%s: %v", m.name, err)
-		}
-		log.Printf("%-15s %8.0f tx/s  p50 %v  p99 %v", m.name, float64(r.commits)/r.took.Seconds(), r.p50, r.p99)
-		results = append(results, r)
+		selected = append(selected, m)
 	}
-	report := render(results, *writers, *payload, *duration, walLevel, version)
+	results := make([][]result, len(selected))
+	for round := range *rounds {
+		for i, m := range selected {
+			r, err := run(ctx, pool, *dsn, m, *writers, *payload, *warmup, *duration)
+			if err != nil {
+				log.Fatalf("%s: %v", m.name, err)
+			}
+			log.Printf("round %d %-15s %8.0f tx/s  p50 %v  p99 %v", round+1, m.name, r.tps(), r.p50, r.p99)
+			results[i] = append(results[i], r)
+		}
+	}
+	report := render(results, *rounds, *writers, *payload, *duration, walLevel, version)
 	fmt.Print(report)
 	if *out != "" {
 		if err := os.WriteFile(*out, []byte(report), 0o644); err != nil {
@@ -118,7 +125,6 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, p
 	}
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	var feed sync.WaitGroup
-	var decoded atomic.Int64
 	feedErr := make(chan error, 1)
 	switch {
 	case m.triggers:
@@ -130,7 +136,7 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, p
 		}
 	case m.logical:
 		ready := make(chan error, 1)
-		feed.Go(func() { feedErr <- readSlot(feedCtx, dsn, &decoded, ready) })
+		feed.Go(func() { feedErr <- logicalFeed(feedCtx, dsn, ready) })
 		if err := <-ready; err != nil {
 			stopFeed()
 			return result{}, err
@@ -178,7 +184,6 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, p
 	}
 	time.Sleep(warmup)
 	measuring.Store(true)
-	decoded0 := decoded.Load()
 	begin := time.Now()
 	time.Sleep(duration)
 	measuring.Store(false)
@@ -196,7 +201,7 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, p
 	}
 	all := slices.Concat(lat...)
 	slices.Sort(all)
-	r := result{mode: m, commits: commits.Load(), took: took, decoded: decoded.Load() - decoded0}
+	r := result{mode: m, commits: commits.Load(), took: took}
 	if len(all) > 0 {
 		r.p50, r.p99 = all[len(all)/2], all[len(all)*99/100]
 	}
@@ -213,17 +218,17 @@ func setup(ctx context.Context, pool *pgxpool.Pool, m mode, payload int) error {
 		fmt.Sprintf("INSERT INTO %s (id, payload) SELECT g, repeat('x', %d) FROM generate_series(1, %d) g", table, payload, rows),
 		"VACUUM ANALYZE " + table,
 	}
-	if m.logical {
-		// Whole rows, the feed's default (a key-only column list is opt-in).
-		stmts = append(stmts, "CREATE PUBLICATION feedbench FOR TABLE "+table)
-	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
 			return fmt.Errorf("%s: %w", s, err)
 		}
 	}
-	if m.triggers {
+	switch {
+	case m.triggers:
 		return cometgo.InstallTriggers(ctx, pool, table)
+	case m.logical:
+		// Whole rows, the feed's default (a key-only column list is opt-in).
+		return cometgo.InstallPublication(ctx, pool, table)
 	}
 	return nil
 }
@@ -251,63 +256,70 @@ func listen(ctx context.Context, dsn string, ready chan<- error) error {
 	}
 }
 
-// readSlot creates a temporary pgoutput slot and reads it through the SQL
-// interface every 50 ms, which costs the server the same decoding as a
-// streaming consumer.
-func readSlot(ctx context.Context, dsn string, decoded *atomic.Int64, ready chan<- error) error {
-	conn, err := pgx.Connect(ctx, dsn)
+// logicalFeed runs a cometgo App on FeedLogical: the real streaming
+// consumer, with its replication connection, visibility gate and engine,
+// on slot cometgo_feedbench. Shutdown drops the slot.
+func logicalFeed(ctx context.Context, dsn string, ready chan<- error) error {
+	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		ready <- err
 		return err
 	}
-	defer conn.Close(context.Background())
-	if _, err := conn.Exec(ctx, "SELECT pg_create_logical_replication_slot('feedbench', 'pgoutput', true)"); err != nil {
+	defer pool.Close()
+	app := cometgo.New(cometgo.Config{DB: pool, Feed: cometgo.FeedLogical, ReplicationDSN: dsn, SlotName: "feedbench"})
+	if err := app.Start(context.Background()); err != nil {
 		ready <- err
 		return err
 	}
-	ready <- nil
-	for {
-		var n int64
-		err := conn.QueryRow(ctx, `SELECT coalesce(sum(length(data)), 0) FROM pg_logical_slot_get_binary_changes('feedbench', NULL, NULL,
-			'proto_version', '1', 'publication_names', 'feedbench', 'messages', 'true')`).Scan(&n)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
+	defer app.Shutdown(context.Background())
+	for deadline := time.Now().Add(time.Minute); app.Ready() != nil; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			err := fmt.Errorf("feed not ready: %w", app.Ready())
+			ready <- err
 			return err
 		}
-		decoded.Add(n)
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(50 * time.Millisecond):
-		}
 	}
+	ready <- nil
+	<-ctx.Done()
+	return nil
 }
 
-func render(results []result, writers, payload int, duration time.Duration, walLevel, version string) string {
+func (r result) tps() float64 { return float64(r.commits) / r.took.Seconds() }
+
+// median returns the middle value of f over rs (the upper one for an even
+// count).
+func median[T cmp.Ordered](rs []result, f func(result) T) T {
+	vs := make([]T, len(rs))
+	for i, r := range rs {
+		vs[i] = f(r)
+	}
+	slices.Sort(vs)
+	return vs[len(vs)/2]
+}
+
+func render(results [][]result, rounds, writers, payload int, duration time.Duration, walLevel, version string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# feedbench: change-feed cost on writes\n\n")
 	fmt.Fprintf(&b, "Run %s.\n\n", time.Now().UTC().Format("2006-01-02 15:04 UTC"))
 	fmt.Fprintf(&b, "- Postgres %s, wal_level=%s, on the same machine as the driver\n", version, walLevel)
 	fmt.Fprintf(&b, "- Go %s, %s/%s, %d logical CPUs\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
-	fmt.Fprintf(&b, "- %d writers, %s measured per mode; each transaction updates one random row of %d (%d-byte text column) by primary key\n\n", writers, duration, rows, payload)
-	fmt.Fprintf(&b, "| Mode | What runs | tx/s | vs plain | p50 | p99 | decoded |\n|---|---|---|---|---|---|---|\n")
+	fmt.Fprintf(&b, "- %d writers, %s measured per mode; each transaction updates one random row of %d (%d-byte text column) by primary key\n", writers, duration, rows, payload)
+	fmt.Fprintf(&b, "- %d rounds, the modes alternating within each; tx/s, p50 and p99 are each mode's median over the rounds, and \"vs plain\" compares medians\n\n", rounds)
+	fmt.Fprintf(&b, "| Mode | What runs | tx/s | range | vs plain | p50 | p99 |\n|---|---|---|---|---|---|---|\n")
 	var plain float64
-	for _, r := range results {
-		tps := float64(r.commits) / r.took.Seconds()
-		if r.mode.name == "plain" {
+	for _, rs := range results {
+		m := rs[0].mode
+		tps := median(rs, result.tps)
+		if m.name == "plain" {
 			plain = tps
 		}
 		rel := "–"
 		if plain > 0 {
 			rel = fmt.Sprintf("%.0f%%", tps/plain*100)
 		}
-		dec := "–"
-		if r.mode.logical {
-			dec = fmt.Sprintf("%.1f MiB", float64(r.decoded)/(1<<20))
-		}
-		fmt.Fprintf(&b, "| %s | %s | %.0f | %s | %s | %s | %s |\n", r.mode.name, r.mode.desc, tps, rel, ms(r.p50), ms(r.p99), dec)
+		lo, hi := slices.MinFunc(rs, func(a, b result) int { return cmp.Compare(a.tps(), b.tps()) }), slices.MaxFunc(rs, func(a, b result) int { return cmp.Compare(a.tps(), b.tps()) })
+		fmt.Fprintf(&b, "| %s | %s | %.0f | %.0f–%.0f | %s | %s | %s |\n", m.name, m.desc, tps, lo.tps(), hi.tps(), rel,
+			ms(median(rs, func(r result) time.Duration { return r.p50 })), ms(median(rs, func(r result) time.Duration { return r.p99 })))
 	}
 	return b.String()
 }

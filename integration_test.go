@@ -127,7 +127,7 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 		},
 	}
 	if testLogical {
-		cfg.Feed, cfg.ReplicationDSN = FeedLogical, dsn
+		cfg.Feed, cfg.ReplicationDSN = FeedLogical, testDirectDSN()
 	}
 	if tweak != nil {
 		tweak(&cfg)
@@ -269,6 +269,28 @@ func dropSlotAfter(t testing.TB, app *App, pool *pgxpool.Pool, cancel context.Ca
 		}
 		t.Errorf("slot %s not dropped", lf.slot)
 	})
+}
+
+// testPooled is set when Config.DB goes through a transaction-mode pooler
+// (COMETGO_TEST_DATABASE_URL, e.g. PgBouncer) and COMETGO_TEST_DIRECT_URL
+// is the direct connection, which the replication protocol needs.
+var testPooled = os.Getenv("COMETGO_TEST_DIRECT_URL") != ""
+
+// testDirectDSN is a direct connection to the test database.
+func testDirectDSN() string {
+	if testPooled {
+		return os.Getenv("COMETGO_TEST_DIRECT_URL")
+	}
+	return os.Getenv("COMETGO_TEST_DATABASE_URL")
+}
+
+// skipPooled skips a test that needs a session of its own on the pool,
+// which a transaction-mode pooler does not keep across transactions.
+func skipPooled(t testing.TB, why string) {
+	t.Helper()
+	if testPooled {
+		t.Skip("needs a direct connection: " + why)
+	}
 }
 
 // skipLogical skips a test of the notify feed's own mechanics.

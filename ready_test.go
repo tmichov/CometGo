@@ -2,7 +2,6 @@ package cometgo
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -69,7 +68,7 @@ func TestReadyWaitsForLogicalSlot(t *testing.T) {
 	var app *App
 	release := make(chan struct{})
 	e := setupFull(t, func(c *Config) {
-		c.Feed, c.ReplicationDSN = FeedLogical, os.Getenv("COMETGO_TEST_DATABASE_URL")
+		c.Feed, c.ReplicationDSN = FeedLogical, testDirectDSN()
 	}, func(env *testEnv, a *App) {
 		app = a
 		if err := InstallPublication(context.Background(), env.pool, env.table); err != nil {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,7 +33,7 @@ func newFeedEnv(t *testing.T) *feedEnv {
 	if err := InstallPublication(context.Background(), e.pool, e.table); err != nil {
 		t.Fatal(err)
 	}
-	app := New(Config{DB: e.pool, ReplicationDSN: os.Getenv("COMETGO_TEST_DATABASE_URL"), SlotName: "t" + e.table})
+	app := New(Config{DB: e.pool, ReplicationDSN: testDirectDSN(), SlotName: "t" + e.table})
 	fe := &feedEnv{testEnv: e, app: app, f: newLogicalFeed(app.engine)}
 	t.Cleanup(func() {
 		fe.halt()
@@ -307,7 +306,7 @@ func TestDeliverDropsTransactionsVisibleInS(t *testing.T) {
 func TestRecreatedSlotSpanningCall(t *testing.T) {
 	release := make(chan struct{})
 	e := setupFull(t, func(c *Config) {
-		c.Feed, c.ReplicationDSN = FeedLogical, os.Getenv("COMETGO_TEST_DATABASE_URL")
+		c.Feed, c.ReplicationDSN = FeedLogical, testDirectDSN()
 	}, func(env *testEnv, app *App) {
 		if err := InstallPublication(context.Background(), env.pool, env.table); err != nil {
 			t.Fatal(err)
@@ -397,7 +396,7 @@ func TestRevalOnlyListenReleasesNoFence(t *testing.T) {
 // transaction is streamed (or, without streaming, spilled to disk).
 func largeTxThenCall(t *testing.T, streaming bool) (time.Duration, slotStats) {
 	t.Helper()
-	dsn := os.Getenv("COMETGO_TEST_DATABASE_URL")
+	dsn := testDirectDSN()
 	sep := "?"
 	if strings.Contains(dsn, "?") {
 		sep = "&"
@@ -542,13 +541,13 @@ func TestSecondPassWaitsForSInProgress(t *testing.T) {
 func proxiedFeed(t *testing.T) (*feedEnv, *pauseProxy) {
 	t.Helper()
 	fe := newFeedEnv(t)
-	cc, err := pgconn.ParseConfig(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	cc, err := pgconn.ParseConfig(testDirectDSN())
 	if err != nil {
 		t.Fatal(err)
 	}
 	proxy := newPauseProxy(t, net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port))))
 	t.Cleanup(proxy.resume) // before the feed's cleanup, so it can stop
-	u, err := url.Parse(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	u, err := url.Parse(testDirectDSN())
 	if err != nil {
 		t.Fatal(err)
 	}

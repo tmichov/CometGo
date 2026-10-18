@@ -3,7 +3,6 @@ package cometgo
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -90,7 +89,7 @@ func TestSweeperKeepsOtherDatabase(t *testing.T) {
 	ctx := context.Background()
 	db := "cometgo_other_" + fe.table
 	execAll(t, fe.testEnv, "CREATE DATABASE "+db)
-	cfg, err := pgx.ParseConfig(os.Getenv("COMETGO_TEST_DATABASE_URL"))
+	cfg, err := pgx.ParseConfig(testDirectDSN())
 	if err != nil {
 		t.Fatal(err)
 	}

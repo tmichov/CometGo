@@ -238,6 +238,7 @@ func TestCheckPublicationSettings(t *testing.T) {
 // A partitioned table is checked by its leaves' identity, and its changes
 // are decoded under the parent's name, as Tables lists it.
 func TestPartitionedTablePublishedUnderRoot(t *testing.T) {
+	skipPooled(t, "it holds a temporary slot on a pool connection")
 	e := setup(t)
 	ctx := context.Background()
 	parent := e.table + "_part"

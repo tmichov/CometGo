@@ -302,6 +302,7 @@ func canonical(t *testing.T, keys string) []string {
 // The decoder encodes keys exactly as the triggers do, per key type, for
 // the same writes: inserts, a non-key update, a key change and a delete.
 func TestDecoderTriggerParity(t *testing.T) {
+	skipPooled(t, "it LISTENs and holds a temporary slot on pool connections")
 	e := setup(t)
 	ctx := context.Background()
 	type keyCase struct {
@@ -514,6 +515,7 @@ func TestDecoderStreamed(t *testing.T) {
 // Real pgoutput protocol 2, streamed: no event from a savepoint that rolls
 // back, a nested one included, comes out.
 func TestDecoderStreamedSavepointsReal(t *testing.T) {
+	skipPooled(t, "it holds a temporary slot on a pool connection")
 	e := setup(t)
 	ctx := context.Background()
 	if err := InstallPublication(ctx, e.pool, e.table); err != nil {
