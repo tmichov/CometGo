@@ -505,7 +505,9 @@ It is an error:
 
 - before `Start`, and from `Shutdown` on;
 - until the change feed is first up: the `LISTEN` connection, or the logical feed's replication slot. Creating a slot waits for every transaction holding a transaction ID, which can take a while;
-- when the feed has been down for more than 10 s.
+- when the feed has been down for more than 10 s. On the logical feed, "down" also covers a stream that is up but cannot hand anything to the engine, because its own connection for visibility checks keeps failing.
+
+The 10 s count from when the node notices the outage. A connection that drops with a reset is noticed at once. A network path that goes silent is noticed only after the idle probe: about 35 s with nothing received, then a probe that gets no answer.
 
 Shorter outages are reported ready, so a Postgres restart, which every node reconnects from within seconds, does not take every node out of rotation at once. Meanwhile subscriptions lag, and calls wait for their writes up to `FenceTimeout`. The error names the feed and its last connection error.
 
