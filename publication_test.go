@@ -85,7 +85,8 @@ func TestInstallPublicationRefusesUnusableIdentity(t *testing.T) {
 	nopk, full := e.table+"_nopk", e.table+"_full"
 	execAll(t, e,
 		"CREATE TABLE "+nopk+" (a int)",
-		"CREATE TABLE "+full+" (id int PRIMARY KEY, a int)",
+		// The generated column is not published, and FULL needs no list.
+		"CREATE TABLE "+full+" (id int PRIMARY KEY, a int, g int GENERATED ALWAYS AS (a * 2) STORED)",
 		"ALTER TABLE "+full+" REPLICA IDENTITY FULL")
 	t.Cleanup(func() { e.pool.Exec(context.Background(), "DROP TABLE IF EXISTS "+nopk+", "+full) })
 	if err := InstallPublication(ctx, e.pool, nopk); err == nil || !strings.Contains(err.Error(), nopk) || !strings.Contains(err.Error(), "no primary key") {
@@ -96,6 +97,9 @@ func TestInstallPublicationRefusesUnusableIdentity(t *testing.T) {
 	}
 	if err := InstallPublication(ctx, e.pool, full); err != nil {
 		t.Errorf("FULL: %v", err)
+	}
+	if err := checkLogical(e, full); err != nil {
+		t.Errorf("FULL with a generated column: %v", err)
 	}
 	if err := InstallPublicationKeysOnly(ctx, e.pool, full); err == nil || !strings.Contains(err.Error(), "REPLICA IDENTITY FULL") {
 		t.Errorf("FULL keys only: %v", err)

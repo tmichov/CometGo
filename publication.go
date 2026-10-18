@@ -112,23 +112,20 @@ func publishTable(ctx context.Context, tx pgx.Tx, table string, keysOnly bool) e
 			return errors.New("no primary key")
 		}
 	}
-	// A member's column list, from pg_publication_tables.attnames (PG 15+;
-	// to_jsonb leaves it null before). With no list it names every column.
-	var member bool
-	var have, all []string
+	// A member's column list: listed is false for whole rows (no list).
+	var member, listed bool
+	var have []string
 	err = tx.QueryRow(ctx, `
-		SELECT true,
-			ARRAY(SELECT jsonb_array_elements_text(coalesce(to_jsonb(pt)->'attnames', '[]'))),
-			ARRAY(SELECT a.attname FROM pg_attribute a WHERE a.attrelid = $3 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum)
-		FROM pg_publication_tables pt
-		WHERE pt.pubname = $1 AND pt.schemaname = $2 AND pt.tablename = $4`, pubName, schema, oid, rel).Scan(&member, &have, &all)
+		SELECT true, `+pubListed+`,
+			ARRAY(SELECT jsonb_array_elements_text(coalesce(to_jsonb(pt)->'attnames', '[]')))
+		FROM pg_publication_tables pt `+pubRelJoin+`
+		WHERE pt.pubname = $1 AND pt.schemaname = $2 AND pt.tablename = $4`, pubName, schema, oid, rel).Scan(&member, &listed, &have)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
 	qtable := pgx.Identifier{schema, rel}.Sanitize()
 	if member {
-		wholeRows := len(have) == 0 || slices.Equal(have, all)
-		if keysOnly && slices.Equal(have, want) || !keysOnly && wholeRows {
+		if keysOnly && listed && slices.Equal(have, want) || !keysOnly && !listed {
 			return nil
 		}
 		// Swapped in this transaction, so the feed never sees the table
@@ -148,6 +145,17 @@ func publishTable(ctx context.Context, tx pgx.Tx, table string, keysOnly bool) e
 	_, err = tx.Exec(ctx, add)
 	return err
 }
+
+// pubListed, over pg_publication_tables pt joined by pubRelJoin with the
+// table's oid as $3, is whether the table has a column list. attnames
+// cannot tell: from PG 15 it names the published columns either way, and
+// leaves out generated ones. prattrs is read through to_jsonb, which is
+// null before PG 15, where column lists do not exist.
+const (
+	pubRelJoin = `LEFT JOIN pg_publication p ON p.pubname = pt.pubname
+		LEFT JOIN pg_publication_rel pr ON pr.prpubid = p.oid AND pr.prrelid = $3`
+	pubListed = `coalesce(jsonb_typeof(to_jsonb(pr)->'prattrs') = 'array', false)`
+)
 
 type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -210,10 +218,10 @@ func (a *App) checkPublished(ctx context.Context, table string, oid uint32) erro
 	var cols []string
 	var listed bool
 	err := a.db.QueryRow(ctx, `
-		SELECT coalesce(to_jsonb(pt)->'attnames' IS NOT NULL, false),
+		SELECT `+pubListed+`,
 			ARRAY(SELECT jsonb_array_elements_text(coalesce(to_jsonb(pt)->'attnames', '[]')))
-		FROM pg_publication_tables pt
-		WHERE pt.pubname = $1 AND pt.schemaname || '.' || pt.tablename = $2`, pubName, table).Scan(&listed, &cols)
+		FROM pg_publication_tables pt `+pubRelJoin+`
+		WHERE pt.pubname = $1 AND pt.schemaname || '.' || pt.tablename = $2`, pubName, table, oid).Scan(&listed, &cols)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("not in publication %q; run cometgo.InstallPublication for it", pubName)
 	}
