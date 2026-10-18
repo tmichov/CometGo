@@ -215,7 +215,12 @@ func TestLogicalFeedRecreatesDroppedSlot(t *testing.T) {
 	fe.start()
 	waitFor(t, "the slot", func() bool { return len(fe.notes()) > 0 })
 	fe.halt()
-	execAll(t, fe.testEnv, "SELECT pg_drop_replication_slot('"+fe.f.slot+"')")
+	// The walsender may still hold the slot for a moment after the feed's
+	// connection closed.
+	waitFor(t, "the slot dropped", func() bool {
+		_, err := fe.pool.Exec(context.Background(), "SELECT pg_drop_replication_slot($1)", fe.f.slot)
+		return err == nil
+	})
 	before := len(fe.notes())
 	fe.start()
 	// Changes before the new slot's consistent point are never decoded;
