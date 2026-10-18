@@ -450,8 +450,8 @@ func TestGateErrorDeliversOnce(t *testing.T) {
 }
 
 // A streamed transaction is folded into its tables, dirty, then its comet
-// messages, at its Stream Commit; a rolled-back savepoint's messages go,
-// an aborted transaction leaves nothing, and a transaction committed
+// messages, at its Stream Commit; a savepoint's rollback drops the events
+// streamed before it, an aborted transaction leaves nothing, and a transaction committed
 // between chunks goes out on its own, in commit order.
 func TestDecoderStreamed(t *testing.T) {
 	d := testDecoder(t)
@@ -487,9 +487,9 @@ func TestDecoderStreamed(t *testing.T) {
 		start(100), ins(100, 1, "1", "0"), ins(100, 2, "a", "1", "0"), msg(100, "e|"+`{"p":"items","t":"x"}`), stop,
 		// A small transaction commits between chunks.
 		&pglogrepl.BeginMessage{Xid: 7}, &pglogrepl.InsertMessage{RelationID: 1, Tuple: textTuple("5", "0")}, &pglogrepl.CommitMessage{TransactionEndLSN: 50},
-		start(100), ins(101, 1, "2", "0"), msg(101, "v|gone"), ins(100, 9, "1"), stop,
+		start(100), ins(101, 1, "2", "0"), msg(100, "v|kept"), ins(100, 9, "1"), stop,
 		&pglogrepl.StreamAbortMessageV2{Xid: 100, SubXid: 101}, // savepoint 101 rolled back
-		start(100), msg(100, "f|tok"), stop,
+		start(100), msg(100, `e|{"p":"after","t":"x"}`), msg(100, "f|tok"), stop,
 		&pglogrepl.StreamCommitMessageV2{Xid: 100, TransactionEndLSN: 90},
 		start(200), ins(200, 1, "3", "0"), stop,
 		&pglogrepl.StreamAbortMessageV2{Xid: 200, SubXid: 200},
@@ -500,11 +500,107 @@ func TestDecoderStreamed(t *testing.T) {
 	if got := noteStrings(out[0].notes); out[0].xid != 7 || !slices.Equal(got, []string{`public.items [["5"]]`}) {
 		t.Errorf("between chunks: xid %d %q", out[0].xid, got)
 	}
-	want := []string{"all", "public.items dirty", "s.comp dirty", "evt items", "fence tok"}
+	// The event streamed before the savepoint's rollback goes with it; the
+	// re-check stays, as does what came after.
+	want := []string{"all", "public.items dirty", "s.comp dirty", "reval kept", "evt after", "fence tok"}
 	if got := noteStrings(out[1].notes); out[1].xid != 100 || out[1].end != 90 || !slices.Equal(got, want) {
 		t.Errorf("streamed: xid %d end %d\n  got  %q\n  want %q", out[1].xid, out[1].end, got, want)
 	}
 	if len(d.streams) != 0 || d.inStream {
 		t.Errorf("stream state left: %v %v", d.streams, d.inStream)
+	}
+}
+
+// Real pgoutput protocol 2, streamed: no event from a savepoint that rolls
+// back, a nested one included, comes out.
+func TestDecoderStreamedSavepointsReal(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	if err := InstallPublication(ctx, e.pool, e.table); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := e.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	slot := "cometgo_stream_" + e.table
+	if _, err := conn.Exec(ctx, "SELECT pg_create_logical_replication_slot($1, 'pgoutput', true)", slot); err != nil {
+		t.Fatal(err)
+	}
+	// One transaction, far over the decoding memory set below, so it streams.
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := "INSERT INTO " + e.table + " (owner, name) SELECT 'o', 'x' FROM generate_series(1, 5000)"
+	recheck := func(s string) string { return "SELECT pg_logical_emit_message(true, 'comet', 'v|" + s + "')" }
+	event := func(s string) string {
+		return `SELECT pg_logical_emit_message(true, 'comet', 'e|{"p":"` + s + `","t":"x"}')`
+	}
+	for _, q := range []string{
+		insert, recheck("kept1"), event("before"),
+		"SAVEPOINT a", insert, event("gone-a"), recheck("dup-a"),
+		"SAVEPOINT b", insert, event("gone-b"), "RELEASE SAVEPOINT b",
+		"ROLLBACK TO SAVEPOINT a",
+		"SAVEPOINT c", insert, event("kept-c"), "RELEASE SAVEPOINT c",
+		insert, recheck("kept2"),
+	} {
+		if _, err := tx.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "SET logical_decoding_work_mem = '64kB'"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := conn.Query(ctx, `
+		SELECT data FROM pg_logical_slot_get_binary_changes($1, NULL, NULL,
+			'proto_version', '2', 'streaming', 'on', 'publication_names', 'cometgo', 'messages', 'true')`, slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raws [][]byte
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			t.Fatal(err)
+		}
+		raws = append(raws, b)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	d := newDecoder(func(ctx context.Context, rel uint32) ([]string, error) { return pkColumns(ctx, e.pool, rel) })
+	var got []string
+	streamed := false
+	for _, b := range raws {
+		m, err := pglogrepl.ParseV2(b, d.inStream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := m.(*pglogrepl.StreamStartMessageV2); ok {
+			streamed = true
+		}
+		dtx, err := d.handle(ctx, m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dtx != nil {
+			got = append(got, noteStrings(dtx.notes)...)
+		}
+	}
+	if !streamed {
+		t.Fatal("the transaction was not streamed")
+	}
+	// pgoutput streams messages under the top-level xid, so the rollback of
+	// a drops every event streamed before it ("before" too: events are
+	// at-most-once); re-checks stay, a's included, since an extra one only
+	// re-runs fn. An event after the rollback is kept.
+	want := []string{"public." + e.table + " dirty", "reval kept1", "reval dup-a", "evt kept-c", "reval kept2"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got  %q\nwant %q", got, want)
 	}
 }

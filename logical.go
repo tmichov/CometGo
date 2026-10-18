@@ -65,17 +65,11 @@ type decoder struct {
 
 // streamTx is a streamed transaction folded down: the tables it changed,
 // each reported dirty at its commit (its keys would cost what streaming
-// saves), and its comet messages, tagged with the (sub)transaction that
-// sent them so a rolled-back savepoint takes its own away.
+// saves), and its comet messages.
 type streamTx struct {
 	all    bool // a change to a relation never described
 	tables []string
-	msgs   []streamMsg
-}
-
-type streamMsg struct {
-	xid uint32
-	n   notification
+	msgs   []notification
 }
 
 type keyGroup struct {
@@ -109,9 +103,14 @@ func (d *decoder) handle(ctx context.Context, m pglogrepl.Message) (*decodedTx, 
 			delete(d.streams, v.Xid)
 			return nil, nil
 		}
-		// A savepoint rolled back: its messages go, its tables stay dirty
-		// (a few more re-runs, never a missed change).
-		st.msgs = slices.DeleteFunc(st.msgs, func(sm streamMsg) bool { return sm.xid == v.SubXid })
+		// A savepoint rolled back. Its tables stay dirty (a few more
+		// re-runs, never a missed change). Its messages cannot be told
+		// apart: pgoutput streams them under the top-level xid. So every
+		// event streamed so far goes, since one from the savepoint must
+		// not be delivered and events are at-most-once; re-checks stay,
+		// since an extra one only re-runs fn; and the fence, always the
+		// last statement, comes after any savepoint.
+		st.msgs = slices.DeleteFunc(st.msgs, func(n notification) bool { return n.evt != nil })
 		return nil, nil
 	case *pglogrepl.StreamCommitMessageV2:
 		st := d.streams[v.Xid]
@@ -124,9 +123,7 @@ func (d *decoder) handle(ctx context.Context, m pglogrepl.Message) (*decodedTx, 
 			for _, t := range st.tables {
 				tx.notes = append(tx.notes, notification{table: t})
 			}
-			for _, sm := range st.msgs {
-				tx.notes = append(tx.notes, sm.n)
-			}
+			tx.notes = append(tx.notes, st.msgs...)
 		}
 		return tx, nil
 	case *pglogrepl.RelationMessageV2:
@@ -162,7 +159,7 @@ func (d *decoder) handle(ctx context.Context, m pglogrepl.Message) (*decodedTx, 
 			if v.Prefix == "comet" {
 				if n, ok := parseMessage(string(v.Content)); ok {
 					st := d.streams[d.streamID]
-					st.msgs = append(st.msgs, streamMsg{xid: v.Xid, n: n})
+					st.msgs = append(st.msgs, n)
 				}
 			}
 			return nil, nil
