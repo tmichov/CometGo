@@ -154,6 +154,79 @@ $cg$`, fn("trunc"), lit("1|t|T|"+wireName))
 	return err
 }
 
+// UninstallTriggers removes the change-feed triggers InstallTriggers
+// created on each table, and their functions. Run it once every node uses
+// the logical feed (FeedLogical): a node on the notify feed refuses to
+// start without the triggers. It is idempotent.
+func UninstallTriggers(ctx context.Context, db *pgxpool.Pool, tables ...string) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	for _, t := range tables {
+		if err := uninstallTable(ctx, tx, qualifyTable(t)); err != nil {
+			return fmt.Errorf("cometgo: uninstall triggers on %s: %w", t, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func uninstallTable(ctx context.Context, tx pgx.Tx, table string) error {
+	var oid *uint32
+	var qtable string
+	if err := tx.QueryRow(ctx, `SELECT to_regclass($1)::oid, coalesce(to_regclass($1)::text, '')`, table).Scan(&oid, &qtable); err != nil {
+		return err
+	}
+	if oid == nil {
+		return errors.New("table not found")
+	}
+	// The functions are found through the triggers, not triggerFuncPrefix:
+	// a table renamed since InstallTriggers still calls its old-name ones.
+	rows, err := tx.Query(ctx, `
+		SELECT t.tgname, t.tgfoid::regprocedure::text
+		FROM pg_trigger t
+		WHERE t.tgrelid = $1 AND t.tgname = ANY($2)`, *oid, triggerNames())
+	if err != nil {
+		return err
+	}
+	type trig struct{ name, fn string }
+	trigs, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (trig, error) {
+		var t trig
+		return t, r.Scan(&t.name, &t.fn)
+	})
+	if err != nil {
+		return err
+	}
+	for _, t := range trigs {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("DROP TRIGGER %s ON %s", pgx.Identifier{t.name}.Sanitize(), qtable)); err != nil {
+			return err
+		}
+	}
+	for _, t := range trigs {
+		// Kept while another table's trigger calls it: a table created
+		// under this one's old name shares its functions.
+		var used bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT FROM pg_trigger WHERE tgfoid = $1::regprocedure)", t.fn).Scan(&used); err != nil {
+			return err
+		}
+		if !used {
+			if _, err := tx.Exec(ctx, "DROP FUNCTION IF EXISTS "+t.fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func triggerNames() []string {
+	names := make([]string, len(triggerSuffixes))
+	for i, sfx := range triggerSuffixes {
+		names[i] = "cometgo_" + sfx
+	}
+	return names
+}
+
 // triggerFuncPrefix names the trigger functions for a table. The functions
 // embed wireName in their payloads, so the name ties them to it.
 func triggerFuncPrefix(wireName string) string {
@@ -167,12 +240,18 @@ func triggerFuncPrefix(wireName string) string {
 var triggerSuffixes = []string{"ins", "upd", "del", "trunc"}
 
 // checkTables fails if a table in any publication's Tables does not exist
-// under exactly that name, or lacks an enabled trigger from InstallTriggers.
-// Either would leave its subscriptions silently stale: the engine matches
+// under exactly that name, or lacks an enabled trigger from InstallTriggers
+// (in logical mode: is not published as checkPublished requires). Either
+// would leave its subscriptions silently stale: the engine matches
 // notifications to Tables by exact string. It runs once, at Start.
 func (a *App) checkTables(ctx context.Context) error {
 	seen := map[string]bool{}
 	var errs []error
+	if a.cfg.Feed == FeedLogical {
+		if err := a.checkPublication(ctx); err != nil {
+			return err
+		}
+	}
 	for _, name := range slices.Sorted(maps.Keys(a.pubs)) {
 		for _, t := range a.pubs[name].tables {
 			if seen[t] {
@@ -188,18 +267,13 @@ func (a *App) checkTables(ctx context.Context) error {
 }
 
 func (a *App) checkTable(ctx context.Context, table string) error {
-	var fns map[string]string // trigger name -> function name
+	var oid uint32
 	// Matched as the engine matches notifications: schema + "." + relname,
 	// exactly, so a miscased or unqualified non-public name fails here too.
-	// Replica-only ('R') and disabled ('D') triggers don't fire normally.
 	err := a.db.QueryRow(ctx, `
-		SELECT coalesce(jsonb_object_agg(t.tgname, p.proname) FILTER (WHERE t.tgname IS NOT NULL), '{}')
-		FROM pg_class c
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		LEFT JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname LIKE 'cometgo\_%' AND t.tgenabled IN ('O', 'A')
-		LEFT JOIN pg_proc p ON p.oid = t.tgfoid
-		WHERE n.nspname || '.' || c.relname = $1
-		GROUP BY c.oid`, table).Scan(&fns)
+		SELECT c.oid
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname || '.' || c.relname = $1`, table).Scan(&oid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// to_regclass applies case folding and search_path, so it finds
 		// what the name most likely meant. Tables entries without a schema
@@ -213,6 +287,18 @@ func (a *App) checkTable(ctx context.Context, table string) error {
 		}
 		return errors.New("not found")
 	}
+	if err != nil {
+		return err
+	}
+	if a.cfg.Feed == FeedLogical {
+		return a.checkPublished(ctx, table, oid)
+	}
+	var fns map[string]string // trigger name -> function name
+	// Replica-only ('R') and disabled ('D') triggers don't fire normally.
+	err = a.db.QueryRow(ctx, `
+		SELECT coalesce(jsonb_object_agg(t.tgname, p.proname), '{}')
+		FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
+		WHERE t.tgrelid = $1 AND t.tgname LIKE 'cometgo\_%' AND t.tgenabled IN ('O', 'A')`, oid).Scan(&fns)
 	if err != nil {
 		return err
 	}

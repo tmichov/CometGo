@@ -546,6 +546,14 @@ Requirements:
 
 Per table it creates statement-level `AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` and `AFTER TRUNCATE` triggers named `cometgo_ins`, `cometgo_upd`, `cometgo_del` and `cometgo_trunc`, and their functions in the table's schema. Each statement sends one notification on the channel `comet` listing the changed primary keys, or a "whole table changed" marker when more than 1,000 rows changed or the keys do not fit in one notification. Every notification for a table re-runs the observers that read it, except observers whose query declares [`Match`](#skipping-unaffected-re-runs-querymatch), which re-run only if the changed rows can affect them.
 
+### UninstallTriggers
+
+```go
+func UninstallTriggers(ctx context.Context, db *pgxpool.Pool, tables ...string) error
+```
+
+Removes the `cometgo_` triggers from each table and drops their functions, in one transaction. It is idempotent. It finds the functions through the triggers, so it also cleans up a table that was renamed after `InstallTriggers`. Run it only once every node uses the logical feed: a node on the notify feed refuses to start without the triggers (below), so a rollback after `UninstallTriggers` fails at `Start` instead of serving stale subscriptions.
+
 ### Table checks at Start
 
 A publication whose table is never notified loads once and then never updates. To catch this early, `Start` checks every distinct table in every publication's `Tables` and returns an error, without starting anything, if:
@@ -555,6 +563,21 @@ A publication whose table is never notified loads once and then never updates. T
 
 All failing tables are reported in one error, which `Start` also logs. Because of this check, every table must exist and have its triggers before `Start`, so run migrations and `InstallTriggers` first. The check also needs the database: if it is unreachable, `Start` fails within `QueryTimeout` instead of starting and reconnecting in the background. Retry `Start`, or exit and let your supervisor restart the process.
 
+With `Config.Feed` set to `FeedLogical`, the trigger check is replaced by publication checks (see [InstallPublication](#installpublication)): the publication `cometgo` must exist and publish inserts, updates, deletes and truncates via the partition root, and each table must be in it under its own name. Each table, or each partition of a partitioned table, must have `REPLICA IDENTITY DEFAULT` with a primary key, or `FULL`. Under a key-only column list, the list must still contain every replica-identity column. Each error names the table, or the partition, at fault.
+
 The check runs once, at `Start`. Dropping or disabling the triggers, or dropping the table, while the server runs is not detected, and the affected subscriptions silently stop updating.
 
 If the server's `LISTEN` connection drops, notifications sent meanwhile are lost, so on reconnect the server re-runs every observer. It reconnects after 500 ms, doubling the wait after each attempt that fails or drops soon, up to 2 s. Calls committed while it is down wait for the reconnect, so the cap keeps them under the default `FenceTimeout`. After a connection that stayed up for 30 s, the wait starts again at 500 ms. See [protocol §11](protocol.md#11-postgres-change-feed-server-internal-v1) for the payload format.
+
+## InstallPublication
+
+```go
+func InstallPublication(ctx context.Context, db *pgxpool.Pool, tables ...string) error
+func InstallPublicationKeysOnly(ctx context.Context, db *pgxpool.Pool, tables ...string) error
+```
+
+The counterpart of `InstallTriggers` for the logical feed (`FeedLogical`, not available yet). It adds each table to the publication `cometgo`, creating the publication if it is missing. The publication publishes inserts, updates, deletes and truncates, with `publish_via_partition_root`, so the changes of a partitioned table are reported under the partitioned table's own name, the name `Tables` uses. It is idempotent and runs in one transaction. Running it while the triggers are still installed is fine: the notify feed ignores the publication.
+
+`InstallPublication` publishes whole rows. `InstallPublicationKeysOnly` limits each table's column list to its primary key, which keeps the change stream small for wide tables. It needs PostgreSQL 15 or newer and `REPLICA IDENTITY DEFAULT`. Each function switches a table that is already in the publication to its own form.
+
+**Replica identity.** Postgres refuses `UPDATE` and `DELETE` on a published table that has no usable replica identity. So both functions refuse a table, or a partition, that has neither `REPLICA IDENTITY DEFAULT` with a primary key nor `FULL`. A migration that runs later and drops the primary key, sets `REPLICA IDENTITY NOTHING`, or (under a key-only list) changes the key, makes the app's own writes to that table fail until it is fixed. The check at `Start` catches this only when it already happened before the restart. After changing a key under a key-only list, run `InstallPublicationKeysOnly` again.
