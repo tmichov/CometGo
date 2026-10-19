@@ -338,11 +338,11 @@ func TestResumeAfterExpiryInGap(t *testing.T) {
 	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'a1')"); err != nil {
 		t.Fatal(err)
 	}
-	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-short"}}))
+	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-1s"}}))
 	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
 	snap := a.next()
 	a.kill()
-	time.Sleep(500 * time.Millisecond) // the token expires while detached
+	time.Sleep(1200 * time.Millisecond) // the token expires while detached
 
 	// Another principal cannot take the session over.
 	_, wb := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "bob"},
@@ -356,39 +356,47 @@ func TestResumeAfterExpiryInGap(t *testing.T) {
 	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'a1')"); err != nil {
 		t.Fatal(err)
 	}
-	a, w = e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-short"}}))
+	a, w = e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-1s"}}))
 	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
 	snap = a.next()
 	a.kill()
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1200 * time.Millisecond)
 	_, w2 := e.dial(t, resumeHello(map[string]any{"resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
 	if w2["resumed"] != false {
 		t.Fatalf("anonymous resumed alice's expired session: %v", w2)
 	}
 }
 
-// expiredInGap subscribes alice with a 300 ms token, drops the socket, lets
+// expiredInGap subscribes alice with a 1 s token, drops the socket, lets
 // the token expire while detached, and inserts a row for alice meanwhile. It
-// returns the session id and the last seq the client had.
+// returns the session id and the last seq the client had, and fails if the
+// token expired before the server noticed the drop (then the session is
+// downgraded, and the test would not exercise the detached path).
 func expiredInGap(t *testing.T, e *testEnv) (session any, seq uint64) {
 	t.Helper()
-	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-short"}}))
+	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-1s"}}))
 	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
 	snap := a.next()
 	a.kill()
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
 		c := e.session(t, w["session"])
 		c.mu.Lock()
-		detached := c.sock == nil
+		detached, ident := c.sock == nil, c.ident
 		c.mu.Unlock()
 		if detached {
+			if ident == nil || !ident.ExpiresAt.After(time.Now()) {
+				t.Fatal("the token expired before the server noticed the drop; the test is too slow for its 1 s token")
+			}
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the session never noticed its socket died")
 		}
 	}
-	time.Sleep(500 * time.Millisecond) // the token expires while detached
+	time.Sleep(1200 * time.Millisecond) // the token expires while detached
+	if e.session(t, w["session"]).identity() == nil {
+		t.Fatal("the detached session was downgraded at expiry")
+	}
 	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'gap')"); err != nil {
 		t.Fatal(err)
 	}

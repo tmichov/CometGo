@@ -329,9 +329,9 @@ A deliberate close (WebSocket close code 1000 or 1001, e.g. `Comet.close()` or a
 
 The client re-sends its subs pipelined after `hello`, as in §7.1, but holds calls and auths sent before the drop until `welcome` arrives. It re-sends them with their original ids only on `resumed:true`. On `resumed:false` it rejects them with `CONNECTION_LOST`.
 
-**Fallback.** If the session is gone (restart, different node, expired grace window, replay overflow), the `seq` is out of range, or the principal differs, the server answers `resumed:false` with a new `session`, and the client falls back to §7.1. A failed resume ends the old session, because its owner has given up on it.
+**Fallback.** If the session is gone (restart, different node, expired grace window, replay overflow), the `seq` is out of range, the principal differs (connecting without a token after a logged-in session counts), or the identity has already expired, the server answers `resumed:false` with a new `session`, and the client falls back to §7.1. A failed resume ends the old session, because its owner has given up on it.
 
-An identity change during the gap is part of the replay. For example, a token that expires while the client is away produces the usual reset `tx` and `authRes{AUTH_EXPIRED}` (§3.2). The session is then anonymous, so only an anonymous `hello` can resume it.
+An identity change during the gap is part of the replay. A token that expires while the session is detached is the exception: the session keeps its identity, so the same principal with a fresh token resumes it with no reset (a phone that slept through its token's lifetime). Expiry before the server noticed the drop (up to three heartbeats) is an identity change like any other: the replay holds the usual reset `tx` and `authRes{AUTH_EXPIRED}` (§3.2), and the session, now anonymous, resumes only for an anonymous `hello`.
 
 **Multi-node.** Sessions live in one node's memory, so resume requires sticky routing: the reconnect must reach the node that served the session. A reconnect that lands on another node gets `resumed:false` and resyncs, which is correct, just more expensive.
 

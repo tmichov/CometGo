@@ -459,8 +459,11 @@ func (c *conn) expire(ident *Identity) {
 		return // refreshed in the meantime
 	}
 	c.mu.Lock()
-	detached := c.sock == nil && !c.closed
+	closed, detached := c.closed, c.sock == nil
 	c.mu.Unlock()
+	if closed {
+		return
+	}
 	if detached {
 		return
 	}
