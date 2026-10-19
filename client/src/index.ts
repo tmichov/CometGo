@@ -75,6 +75,7 @@ function browserLifecycle(): Lifecycle | null {
     const visible = () => on(w.document.visibilityState === "visible" ? "foreground" : "background");
     w.window.addEventListener("online", online);
     w.document.addEventListener("visibilitychange", visible);
+    if (w.document.visibilityState === "hidden") on("background"); // loaded in a hidden tab
     return () => {
       w.window.removeEventListener("online", online);
       w.document.removeEventListener("visibilitychange", visible);
@@ -269,6 +270,8 @@ export class Comet {
   #probeTimer?: ReturnType<typeof setTimeout>;
   #noProbeUntil = 0;
   #background = false;
+  // The pending reconnect waits out a goaway's delay: a wake must not skip it.
+  #goawayWait = false;
   #unlisten?: () => void;
 
   constructor(opts: ConnectOptions) {
@@ -396,7 +399,9 @@ export class Comet {
   }
 
   async #open(): Promise<void> {
-    if (this.#closed || this.#opening) return;
+    this.#goawayWait = false;
+    // Closed for the background: the foreground wake reopens.
+    if (this.#closed || this.#opening || (this.#background && this.#opts.closeInBackground)) return;
     this.#opening = true;
     try {
       await this.#openSocket();
@@ -427,8 +432,9 @@ export class Comet {
     ws.onopen = async () => {
       // Dropped while connecting: close() on a connecting socket may not
       // stop it opening (React Native), so close it now.
-      if (this.#ws !== ws) {
-        ws.close(4000);
+      // close() leaves #ws, so check #closed too.
+      if (this.#closed || this.#ws !== ws) {
+        ws.close(this.#closed ? 1000 : 4000);
         return;
       }
       // Opened after the app went to the background.
@@ -464,7 +470,7 @@ export class Comet {
     ws.onmessage = (ev) => {
       // A dropped socket may still deliver (React Native does after
       // close()): its frames must not reach #txParts or #seq.
-      if (this.#ws !== ws) return;
+      if (this.#closed || this.#ws !== ws) return;
       this.#lastRecv = Date.now();
       this.#pinged = false;
       let msg: any;
@@ -501,6 +507,7 @@ export class Comet {
   // ahead of authExp, but then refreshes every 5 s; measure skew if that bites.
   #scheduleRefresh(authExp: unknown): void {
     clearTimeout(this.#refreshTimer);
+    this.#refreshAt = undefined;
     this.#authExp = typeof authExp === "number" ? authExp : undefined;
     const source = this.#opts.token;
     if (typeof authExp !== "number" || typeof source !== "function") return;
@@ -519,7 +526,9 @@ export class Comet {
     if (this.#closed) return;
     if (e === "background") {
       this.#background = true;
-      if (this.#opts.closeInBackground && this.#ws) this.#drop(4001, "");
+      if (!this.#opts.closeInBackground) return;
+      clearTimeout(this.#reconnectTimer);
+      if (this.#ws) this.#drop(4001, "");
       return;
     }
     if (e === "foreground") this.#background = false;
@@ -535,6 +544,7 @@ export class Comet {
     if (this.#opening) return;
     const ws = this.#ws;
     if (!ws) {
+      if (this.#goawayWait) return; // the server spreads reconnects out
       clearTimeout(this.#reconnectTimer);
       void this.#open(); // keeps #attempt: a flapping network still backs off
       return;
@@ -623,6 +633,7 @@ export class Comet {
   // exponential backoff with full jitter.
   #scheduleReconnect(): void {
     const delay = this.#goaway ?? Math.random() * Math.min(30_000, 500 * 2 ** this.#attempt++);
+    this.#goawayWait = this.#goaway !== undefined;
     this.#goaway = undefined;
     clearTimeout(this.#reconnectTimer); // two #opens can fail at once (a wake)
     this.#reconnectTimer = setTimeout(() => void this.#open(), delay);
@@ -1035,7 +1046,7 @@ function canceled(): CometError {
 // (WebSocket refuses one). A relative url resolves against the page. No URL
 // setters: bare React Native does not implement them.
 function routeUrl(url: string | undefined, key: string): string {
-  let u = url ?? "/_comet";
+  let u = url?.trim() ?? "/_comet";
   if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) {
     const base = globalThis.location?.href;
     if (!base) throw new TypeError(url === undefined ? "cometgo: url is required outside a browser" : `cometgo: url ${u} is relative, and there is no page to resolve it against`);

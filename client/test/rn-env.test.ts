@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 // A React Native-like environment, as measured on a device (M6 design §9):
 // window without addEventListener, no document, crypto or location, and here
 // no URL either (bare React Native's does not implement its setters).
+// Changing globals is safe only because node --test runs each file in its own
+// process.
 (globalThis as any).window = {};
 Object.defineProperty(globalThis, "crypto", { value: undefined, configurable: true });
 delete (globalThis as any).URL;

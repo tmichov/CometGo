@@ -246,3 +246,71 @@ test("closeInBackground closes a socket created after the app went to the backgr
   assert.equal(ws.closedWith, 4001);
   assert.equal(ws.of("hello").length, 0);
 });
+
+test("close() while connecting: a socket that opens anyway is closed and sends nothing", async () => {
+  comet = connect({ url: "ws://test/_comet", routeKey: "k", WebSocket: FakeWS as any, lifecycle: null });
+  await flush();
+  const ws = FakeWS.all[0]!;
+  comet.close();
+  ws.open(); // React Native opens a connecting socket despite close()
+  assert.equal(ws.closedWith, 1000);
+  assert.equal(ws.of("hello").length, 0);
+});
+
+test("closeInBackground: a pending reconnect does not open a socket in the background", async () => {
+  let calls = 0;
+  const ws = await start({ closeInBackground: true, token: () => (calls++, "t") });
+  ws.drop(); // backoff pending
+  const before = calls;
+  emit("background");
+  mock.timers.tick(60_000);
+  await flush();
+  assert.equal(FakeWS.all.length, 1);
+  assert.equal(calls, before);
+  emit("foreground");
+  await flush();
+  assert.equal(FakeWS.all.length, 2);
+});
+
+test("no refresh on wake after a welcome without authExp", async () => {
+  let calls = 0;
+  const ws = await start({ token: () => (calls++, "t") });
+  ws.recv({ ...welcome, authExp: Math.floor(Date.now() / 1000) + 100 });
+  ws.recv({ ...welcome }); // no authExp now
+  const before = calls;
+  mock.timers.setTime(Date.now() + 200_000);
+  emit("foreground");
+  await flush();
+  assert.equal(calls, before);
+});
+
+test("a wake does not skip a goaway's delay", async () => {
+  const ws = await start();
+  ws.recv({ t: "goaway", retryInMs: 3000 });
+  ws.drop();
+  emit("network");
+  await flush();
+  assert.equal(FakeWS.all.length, 1);
+  mock.timers.tick(3000);
+  await flush();
+  assert.equal(FakeWS.all.length, 2);
+});
+
+test("the browser default: a page loaded in a hidden tab with closeInBackground waits for visibility", async () => {
+  const listeners: Record<string, () => void> = {};
+  const doc = { visibilityState: "hidden", addEventListener: (t: string, f: () => void) => (listeners[t] = f), removeEventListener() {} };
+  (globalThis as any).window = { addEventListener() {}, removeEventListener() {} };
+  (globalThis as any).document = doc;
+  try {
+    comet = connect({ url: "ws://test/_comet", routeKey: "k", WebSocket: FakeWS as any, closeInBackground: true });
+    await flush();
+    assert.equal(FakeWS.all.length, 0);
+    doc.visibilityState = "visible";
+    listeners.visibilitychange!();
+    await flush();
+    assert.equal(FakeWS.all.length, 1);
+  } finally {
+    delete (globalThis as any).window;
+    delete (globalThis as any).document;
+  }
+});
