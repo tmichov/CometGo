@@ -67,6 +67,7 @@ Only `DB` is required. Zero or negative durations and limits are replaced with t
 | `ResumeBuffer int` | 1 MiB | Bytes of not-yet-acknowledged messages kept per session for replay, at most 4 MiB (half the outbound queue limit, since a resume sends the whole replay at once). A disconnected session that outgrows it ends, and its client resyncs. |
 | `Logger *slog.Logger` | `slog.Default()` | Where the framework logs, including the details of `INTERNAL` errors. |
 | `Metrics func(Metric)` | nil | Receives engine and connection health measurements. See [Metrics](#metrics). |
+| `Tenant func(*Identity) string` | `Identity.ScopeKey` | Names an identity's tenant for `Metric.Tenant`. Called when a session's identity changes, never without `Metrics`. It must be fast and safe for concurrent use; a panic counts as no tenant. See [Metrics](#metrics). |
 
 `MaxSubs`, `MaxInflight` and `MaxMsg` are also advertised to the client in `welcome.limits`.
 
@@ -568,9 +569,11 @@ Set `Config.Metrics` to receive health measurements, for example to feed Prometh
 
 ```go
 type Metric struct {
-	Name  string  // one of the Metric* constants below
-	Pub   string  // the publication, for MetricPubRun and MetricStale; "" otherwise
-	Value float64 // seconds for durations, a number otherwise
+	Name   string  // one of the Metric* constants below
+	Pub    string  // the publication, for MetricPubRun, MetricStale and MetricFn; "" otherwise
+	Method string  // the method, for MetricCall; "" otherwise
+	Tenant string  // the tenant, on the metrics marked "with Tenant" below
+	Value  float64 // seconds for durations, a number otherwise
 }
 ```
 
@@ -582,13 +585,19 @@ type Metric struct {
 | `MetricSubscriptions` (`subscriptions`) | gauge | after every tick: bound subscriptions, on all sessions, including detached ones |
 | `MetricQueuedBytes` (`queued_bytes`) | gauge | after every tick: bytes waiting to be written, summed over every live session's socket |
 | `MetricCoalescing` (`coalescing_conns`) | gauge | after every tick: connections that are [coalescing](#slow-clients) |
-| `MetricFenceWait` (`fence_wait_seconds`) | duration | per fenced method call: from its commit until its update was sent (its fence released), or until `FenceTimeout` for a lagged call |
-| `MetricFenceLag` (`fence_lag`) | counter | 1 per call answered with `lag: true` after `FenceTimeout` |
-| `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed as a slow consumer: its queue went over 8 MiB, or a write timed out. A write that fails because the peer went away also closes with 4429, but is not counted |
+| `MetricFenceWait` (`fence_wait_seconds`) | duration | per fenced method call, with `Tenant`: from its commit until its update was sent (its fence released), or until `FenceTimeout` for a lagged call |
+| `MetricFenceLag` (`fence_lag`) | counter | 1 per call answered with `lag: true` after `FenceTimeout`, with `Tenant` |
+| `MetricSlowClose` (`slow_closes`) | counter | 1 per socket closed as a slow consumer, with `Tenant`: its queue went over 8 MiB, or a write timed out. A write that fails because the peer went away also closes with 4429, but is not counted |
+| `MetricCall` (`call_seconds`) | duration | per call of a registered method, with `Method` and `Tenant`: from receiving the call until its `res` is enqueued, fence wait included. Calls to unknown method names are not reported, since the client chooses the name |
+| `MetricFn` (`fn_seconds`) | duration | per publication `fn` call, with `Pub` and `Tenant`: subscribes, re-binds and `Revalidate` re-checks |
 | `MetricListenReconnect` (`listen_reconnects`) | counter | 1 per failed `LISTEN` attempt: each drop, and each failed reconnect during an outage (retried with backoff up to 10 s) |
-| `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` set, reported once the tick's snapshot commits, or for a detached query once its result is applied |
+| `MetricPubRun` (`pub_run_seconds`) | duration | per observer query run, with `Pub` and `Tenant` set, reported once the tick's snapshot commits, or for a detached query once its result is applied |
 | `MetricDetached` (`detached_observers`) | gauge | after every tick: queries running detached from their tick (`MaxDetached`) |
-| `MetricStale` (`stale_seconds`) | duration | per observer result delivered after a change, with `Pub` set: from the tick that drained the first notification the observer's old result did not reflect, until its new result was enqueued to its subscribers (or held for a [coalescing](#slow-clients) connection). A run only to snapshot a new subscription, or a Match candidate the change cannot affect, reports nothing |
+| `MetricStale` (`stale_seconds`) | duration | per observer result delivered after a change, with `Pub` and `Tenant` set: from the tick that drained the first notification the observer's old result did not reflect, until its new result was enqueued to its subscribers (or held for a [coalescing](#slow-clients) connection). A run only to snapshot a new subscription, or a Match candidate the change cannot affect, reports nothing |
+| `MetricTenantSubs` (`tenant_subscriptions`) | gauge | once a second, per tenant: bound subscriptions |
+| `MetricTenantQueued` (`tenant_queued_bytes`) | gauge | once a second, per tenant: bytes waiting to be written to its sessions' sockets |
+
+**Tenants.** `Tenant` is `Identity.ScopeKey` by default, or what `Config.Tenant` returns for the identity. It is `""` for anonymous sessions and identities without a tenant. It is worked out when a session's identity changes and kept with the session, so the hook is not called per measurement. A call and its fence count for the identity the call started with. A subscription counts for the identity it was bound with. An observer's runs (`pub_run_seconds`, `stale_seconds`) name a tenant only when all its subscriptions belong to that one tenant; an observer shared by several tenants reports `""`. `ScopeUser` publications, and `ScopeShared` ones keyed by a tenant argument, are single-tenant. The per-tenant gauges go out once a second whether or not the engine is busy. A tenant left with no subscriptions and no sessions gets one last `0`, so an exporter does not keep a stale value. The engine passes tenant names as they are, so how many series that makes is the exporter's choice.
 
 Gauges are the current value, so map them to a gauge and set it; a counter is reported as `1` per occurrence; a duration is one observation, for a histogram. A tick happens only when there is work (a change, a request, a timer), so an idle server reports no gauges until something happens.
 
