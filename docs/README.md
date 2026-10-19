@@ -34,5 +34,6 @@ promise resolves ◄────────── res ──────  (sent
 - [M3 design: slow-work isolation](design/m3-slow-work.md): the engine design for detaching slow queries and slow publication `fn` calls, and per-connection fences, with how it was verified.
 - [M4 design: the logical-replication change feed](design/m4-logical-feed.md): the design for replacing NOTIFY with logical decoding, now implemented (`Config.Feed = FeedLogical`), with the measurements behind it; its exit criterion is met at 16 writers, not yet at 64 writers or with wide rows.
 - [M5 design: hosted, multi-tenant and multi-node foundations](design/m5-hosted.md): the hosted product's shape, tenant routing and metrics, and the conditional hub fan-out design, with the first milestone's exit criterion.
+- [M6 design: mobile apps with React Native](design/m6-mobile.md): the React Native client changes, the `cometgo` CLI for running and building Expo apps, and resuming across sleep, with the milestone's exit criterion.
 - [Known limitations](limitations.md): what the current engine does not do well, and when that matters.
 - [Stability policy](stability.md): versioning, and what may change before 1.0.
