@@ -270,6 +270,11 @@ export class Comet {
   #probeTimer?: ReturnType<typeof setTimeout>;
   #noProbeUntil = 0;
   #background = false;
+  // When the liveness check last ran, and when it last found that it had not
+  // run for a while: the app was suspended (React Native pauses timers in
+  // the background), so silence before that says nothing about the socket.
+  #lastCheck = 0;
+  #suspendedAt = 0;
   // The pending reconnect waits out a goaway's delay: a wake must not skip it.
   #goawayWait = false;
   #unlisten?: () => void;
@@ -686,9 +691,18 @@ export class Comet {
   }
 
   #checkLiveness(): void {
+    const now = Date.now();
+    const gap = this.#lastCheck !== 0 && now - this.#lastCheck > 3000;
+    this.#lastCheck = now;
     if (!this.#isOpen()) return;
     this.#ack();
-    const idle = Date.now() - this.#lastRecv;
+    if (gap) {
+      // Resumed after a suspension: count silence from now, and probe.
+      this.#suspendedAt = now;
+      this.#probe(this.#ws!);
+      return;
+    }
+    const idle = now - Math.max(this.#lastRecv, this.#suspendedAt);
     if (idle > this.#hb + 10_000) {
       this.#drop(4408, ""); // dead connection
     } else if (idle > this.#hb && !this.#pinged) {

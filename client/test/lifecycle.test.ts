@@ -314,3 +314,25 @@ test("the browser default: a page loaded in a hidden tab with closeInBackground 
     delete (globalThis as any).document;
   }
 });
+
+test("after a suspension the liveness check probes instead of dropping a healthy socket", async () => {
+  const ws = await start({ lifecycle: null });
+  mock.timers.tick(1000);
+  mock.timers.setTime(Date.now() + 60_000); // suspended: no timer ran for a minute
+  mock.timers.tick(1000);
+  assert.equal(ws.closedWith, undefined);
+  assert.equal(ws.of("ping").length, 1);
+  ws.recv({ t: "pong" });
+  mock.timers.tick(10_000);
+  assert.equal(ws.closedWith, undefined);
+  assert.equal(comet.status, "connected");
+});
+
+test("after a suspension a dead socket is dropped once the probe times out", async () => {
+  const ws = await start({ lifecycle: null });
+  mock.timers.tick(1000);
+  mock.timers.setTime(Date.now() + 60_000);
+  mock.timers.tick(1000);
+  mock.timers.tick(5000);
+  assert.equal(ws.closedWith, 4408);
+});
