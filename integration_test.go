@@ -320,9 +320,15 @@ type client struct {
 
 func (e *testEnv) dial(t testing.TB, hello map[string]any) (*client, map[string]any) {
 	t.Helper()
+	return dialURL(t, "ws"+strings.TrimPrefix(e.srv.URL, "http"), hello)
+}
+
+// dialURL connects to url and completes the handshake with hello.
+func dialURL(t testing.TB, url string, hello map[string]any) (*client, map[string]any) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http"), &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,6 +391,23 @@ func TestUpgradeRequiresSubprotocol(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusUpgradeRequired {
 		t.Fatalf("status %d, want 426", resp.StatusCode)
+	}
+}
+
+// The client's route parameter is for load balancers; the server ignores it.
+func TestRouteParamIgnored(t *testing.T) {
+	e := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/?route=acme", &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ws.CloseNow() })
+	c := &client{t: t, ws: ws}
+	c.send(map[string]any{"t": "hello", "v": 1})
+	if w := c.next(); w["t"] != "welcome" {
+		t.Fatalf("expected welcome, got %v", w)
 	}
 }
 

@@ -35,6 +35,7 @@ Creates a `Comet` and starts connecting immediately. With a schema generated fro
 | `token?: TokenSource` | none | Bearer token. Omit it to use cookie sessions. |
 | `build?: string` | none | This client's build id, sent to the server in `hello`. |
 | `WebSocket?: typeof WebSocket` | global `WebSocket` | WebSocket implementation, for environments without a global one. |
+| `routeKey?: string` | a random id per `Comet` | Sent as the `route` query parameter on every connect, for a load balancer that hashes on it ([routing to nodes](server.md#routing-to-nodes)). Set it to the tenant or user id so their connections share a node. It shows up in access logs, so use an opaque id, never an email address. Any `route` already in `url` is replaced. |
 
 ```ts
 type TokenSource = string | null | (() => string | null | Promise<string | null>);

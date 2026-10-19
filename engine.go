@@ -110,6 +110,9 @@ type engine struct {
 	fns    map[uint64]map[fnKey]*fnCall
 	fnSem  chan struct{} // Config.FnWorkers
 	reqSeq uint64
+	// tenantsReported is the tenants the last per-tenant gauges had
+	// (tenantGauges).
+	tenantsReported map[string]bool
 	// carry holds the requests a tick could not apply yet, in order: each
 	// one whose fn calls had not finished within FnBudget, and every later
 	// request of its connection. blocked holds their connections, whose
@@ -171,8 +174,11 @@ type observer struct {
 	keyIdx []int
 	res    *result
 
-	subs  map[*subscription]struct{}
-	dirty bool
+	subs map[*subscription]struct{}
+	// tenants counts subs per tenant (subscription.tenant), so a run's
+	// metrics name the tenant without scanning subs. Only with Metrics.
+	tenants map[string]int
+	dirty   bool
 	// dirtyAt is when the first notification not yet reflected in res was
 	// drained, for MetricStale; zero when fresh or without Config.Metrics.
 	dirtyAt time.Time
@@ -215,6 +221,7 @@ type subscription struct {
 	argsKey string
 	obs     *observer
 	userID  string // the UserID it was last bound for
+	tenant  string // the tenant it was last bound for (Config.Tenant)
 	// bindSeq numbers each bind (engine.bindSeq), so a detached result can
 	// tell a sub bound before it from one rebound since (applyDetached).
 	bindSeq uint64
@@ -447,10 +454,21 @@ func (e *engine) dropFence(token string) {
 
 func (e *engine) run(ctx context.Context) {
 	minTick := e.a.cfg.MinTickInterval
+	// The per-tenant gauges go out on their own clock: an idle engine does
+	// not tick, and they must not keep their last value meanwhile.
+	var gauges <-chan time.Time
+	if e.a.cfg.Metrics != nil {
+		tk := time.NewTicker(tenantGaugeEvery)
+		defer tk.Stop()
+		gauges = tk.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-gauges:
+			e.tenantGauges()
+			continue
 		case <-e.wake:
 		}
 		var start time.Time
@@ -852,7 +870,7 @@ func (e *engine) tick(ctx context.Context) (retry bool) {
 		for _, obs := range e.observers {
 			// A detached observer reports when its result is applied.
 			if !obs.dirty && !obs.inFlight && !obs.dirtyAt.IsZero() {
-				e.a.metric(MetricStale, obs.pub.name, time.Since(obs.dirtyAt).Seconds())
+				e.a.report(Metric{Name: MetricStale, Pub: obs.pub.name, Tenant: obs.tenant(), Value: time.Since(obs.dirtyAt).Seconds()})
 				obs.dirtyAt = time.Time{}
 			}
 		}
@@ -1118,6 +1136,13 @@ func (e *engine) bind(ctx context.Context, seq uint64, sub *subscription, ident 
 	obs.subs[sub] = struct{}{}
 	e.bindSeq++
 	sub.obs, sub.userID, sub.bindSeq = obs, ident.userID(), e.bindSeq
+	if e.a.cfg.Metrics != nil {
+		sub.tenant = sub.c.tenantFor(ident)
+		if obs.tenants == nil {
+			obs.tenants = map[string]int{}
+		}
+		obs.tenants[sub.tenant]++
+	}
 	return nil
 }
 
@@ -1138,9 +1163,10 @@ type fnKey struct {
 }
 
 type fnCall struct {
-	pub   *publication
-	args  json.RawMessage
-	ident *Identity
+	pub    *publication
+	args   json.RawMessage
+	ident  *Identity
+	tenant string // for MetricFn
 	// done is closed once q and err are set.
 	done chan struct{}
 	q    Query
@@ -1150,9 +1176,16 @@ type fnCall struct {
 	stale bool
 }
 
-// runFn calls pub's fn. A panic, which would otherwise take down the
-// goroutine it runs on, becomes an error that ends only this sub.
-func runFn(ctx context.Context, pub *publication, args json.RawMessage, ident *Identity) (q Query, err error) {
+// runFn calls pub's fn and reports its time as tenant's. A panic, which
+// would otherwise take down the goroutine it runs on, becomes an error
+// that ends only this sub.
+func (e *engine) runFn(ctx context.Context, pub *publication, args json.RawMessage, ident *Identity, tenant string) (q Query, err error) {
+	if e.a.cfg.Metrics != nil {
+		start := time.Now()
+		defer func() {
+			e.a.report(Metric{Name: MetricFn, Pub: pub.name, Tenant: tenant, Value: time.Since(start).Seconds()})
+		}()
+	}
 	defer recoverErr(&err)
 	return pub.build(&SubCtx{Context: ctx, Identity: ident}, args)
 }
@@ -1164,7 +1197,7 @@ func (e *engine) fn(ctx context.Context, seq uint64, sub *subscription, pub *pub
 	if call := e.fns[seq][fnKey{sub.c, sub.s}]; call != nil && call.ident == ident && !call.stale && isDone(call) {
 		return call.q, call.err
 	}
-	return runFn(ctx, pub, sub.args, ident)
+	return e.runFn(ctx, pub, sub.args, ident, sub.c.tenantFor(ident))
 }
 
 // startFn runs call on its own goroutine, at most Config.FnWorkers calls at
@@ -1174,7 +1207,7 @@ func (e *engine) startFn(ctx context.Context, call *fnCall) {
 	call.done = make(chan struct{})
 	go func() {
 		e.fnSem <- struct{}{}
-		call.q, call.err = runFn(ctx, call.pub, call.args, call.ident)
+		call.q, call.err = e.runFn(ctx, call.pub, call.args, call.ident, call.tenant)
 		<-e.fnSem
 		close(call.done)
 		e.signal()
@@ -1207,7 +1240,7 @@ func (e *engine) newCall(ctx context.Context, seq uint64, c *conn, s uint64, nam
 	if call := calls[fnKey{c, s}]; call != nil && !call.stale && call.ident == ident {
 		return call, false, true
 	}
-	call = &fnCall{pub: pub, args: args, ident: ident}
+	call = &fnCall{pub: pub, args: args, ident: ident, tenant: c.tenantFor(ident)}
 	calls[fnKey{c, s}] = call
 	e.startFn(ctx, call)
 	return call, true, true
@@ -1399,6 +1432,11 @@ func (e *engine) detach(sub *subscription) {
 	}
 	delete(obs.subs, sub)
 	sub.obs = nil
+	if obs.tenants != nil { // nil without Metrics
+		if obs.tenants[sub.tenant]--; obs.tenants[sub.tenant] <= 0 {
+			delete(obs.tenants, sub.tenant)
+		}
+	}
 	if len(obs.subs) == 0 {
 		delete(e.observers, obs.key)
 	}
@@ -1588,7 +1626,7 @@ func (e *engine) runObservers(ctx context.Context, toRun, cands []*observer, cha
 		// Reported after the commit: runs of a failed snapshot are retried
 		// and would be counted twice.
 		for _, r := range staged {
-			e.a.metric(MetricPubRun, r.obs.pub.name, r.took.Seconds())
+			e.a.report(Metric{Name: MetricPubRun, Pub: r.obs.pub.name, Tenant: r.obs.tenant(), Value: r.took.Seconds()})
 		}
 	}
 	for _, r := range staged {
@@ -1756,7 +1794,7 @@ func (e *engine) applyDetached(d detachedDone) {
 	// tick again, so a query slow once is not kept off ticks for good.
 	obs.knownSlow = d.out.took >= e.a.cfg.SlowObserverAfter
 	if e.a.cfg.Metrics != nil {
-		e.a.metric(MetricPubRun, obs.pub.name, d.out.took.Seconds())
+		e.a.report(Metric{Name: MetricPubRun, Pub: obs.pub.name, Tenant: obs.tenant(), Value: d.out.took.Seconds()})
 	}
 	staleAt := obs.dirtyAt
 	obs.dirtyAt, obs.dirtySinceAt = obs.dirtySinceAt, time.Time{}
@@ -1788,7 +1826,7 @@ func (e *engine) applyDetached(d detachedDone) {
 		return
 	}
 	if e.a.cfg.Metrics != nil && !staleAt.IsZero() {
-		e.a.metric(MetricStale, obs.pub.name, time.Since(staleAt).Seconds())
+		e.a.report(Metric{Name: MetricStale, Pub: obs.pub.name, Tenant: obs.tenant(), Value: time.Since(staleAt).Seconds()})
 	}
 	ops := e.newResult(obs, runResult{cols: d.out.cols, keyIdx: d.out.keyIdx, res: d.out.res}, subs)
 	var opsJSON []json.RawMessage

@@ -1,4 +1,4 @@
-.PHONY: db todo test test-logical test-pgbouncer chaos build gen gen-check bench bench-feed
+.PHONY: db todo test test-logical test-pgbouncer test-routing chaos build gen gen-check bench bench-feed bench-nodes
 
 db:
 	docker compose up -d
@@ -35,6 +35,11 @@ test-pgbouncer:
 	COMETGO_TEST_DIRECT_URL=postgres://comet:comet@localhost:54329/comet \
 	go test -count=1 .
 
+# Sticky routing through nginx (docker compose up -d nginx): the test runs two
+# nodes on ports 54341 and 54342 and connects through nginx on 54331.
+test-routing:
+	COMETGO_TEST_NGINX_URL=ws://localhost:54331 go test -count=1 -run TestRouting -v .
+
 # Fault-injection tests, as CI runs them (needs the db and COMETGO_TEST_DATABASE_URL).
 chaos:
 	COMETGO_TEST_PG_RESTART="docker compose restart postgres" go test -race -count=3 -run TestChaos .
@@ -50,3 +55,10 @@ bench-feed:
 	go run ./cmd/feedbench -rounds 5 -writers 16 -out docs/bench/feedbench.md
 	go run ./cmd/feedbench -rounds 5 -writers 64 -out docs/bench/feedbench-64.md
 	go run ./cmd/feedbench -rounds 5 -writers 16 -payload 1800 -out docs/bench/feedbench-wide.md
+
+# Per-node slots at N = 1, 2, 5, 10 (M5 hub decision; docs/bench/README.md).
+bench-nodes:
+	for n in 1 2 5 10; do \
+		go run ./cmd/feedbench -rounds 5 -writers 16 -modes plain,logical,logical+fence -nodes $$n \
+			-proc "docker compose exec -T postgres cat" -out docs/bench/feedbench-nodes-$$n.md || exit 1; \
+	done

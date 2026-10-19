@@ -108,7 +108,10 @@ func (f *logicalFeed) withCatalog(ctx context.Context, fn func(*pgx.Conn) error)
 	return fn(f.catalog)
 }
 
+// snapshot runs pg_current_snapshot() on the catalog connection, for the
+// gate and the restart rule, and counts it (MetricFeedSnapshots).
 func (f *logicalFeed) snapshot(ctx context.Context) (s pgSnapshot, err error) {
+	f.e.a.metric(MetricFeedSnapshots, "", 1)
 	err = f.withCatalog(ctx, func(c *pgx.Conn) error {
 		s, err = currentSnapshot(ctx, c)
 		return err
