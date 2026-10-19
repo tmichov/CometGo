@@ -601,3 +601,27 @@ func TestLogicalFeedQuietPathStays(t *testing.T) {
 		t.Errorf("feed restarted %d times on a quiet, live path", n-before)
 	}
 }
+
+// Each snapshot query of the feed (the gate's, here) is counted.
+func TestLogicalFeedCountsSnapshots(t *testing.T) {
+	log := &metricLog{}
+	fe := newFeedEnv(t)
+	fe.app.cfg.Metrics = log.hook
+	fe.start()
+	waitFor(t, "the slot", func() bool { return len(fe.notes()) > 0 }) // the restart's own snapshot
+	log.mu.Lock()
+	before := len(log.seen[MetricFeedSnapshots])
+	log.mu.Unlock()
+	fe.insert(t, 1)
+	waitFor(t, "id 1", func() bool { return fe.ids(t)["1"] == 1 })
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if after := len(log.seen[MetricFeedSnapshots]); after <= before {
+		t.Fatalf("gate snapshots: %d before the write, %d after", before, after)
+	}
+	for _, m := range log.seen[MetricFeedSnapshots] {
+		if m.Value != 1 {
+			t.Fatalf("counter reported %v", m.Value)
+		}
+	}
+}

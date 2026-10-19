@@ -40,6 +40,7 @@ const (
 	MetricPubRun          = "pub_run_seconds"    // duration of one observer query, with Pub and Tenant
 	MetricStale           = "stale_seconds"      // duration: notification drained to its observer's result delivered, with Pub and Tenant
 	MetricDetached        = "detached_observers" // gauge: observer queries running detached from their tick
+	MetricFeedSnapshots   = "feed_snapshots"     // counter: a pg_current_snapshot() query of the logical feed (its visibility gate, and restarts)
 	MetricCall            = "call_seconds"       // duration: a method call, received to res sent, with Method and Tenant
 	MetricFn              = "fn_seconds"         // duration: one publication fn call, with Pub and Tenant
 	// Per-tenant gauges, reported once a second, one per Tenant with
