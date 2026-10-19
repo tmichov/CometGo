@@ -1,0 +1,31 @@
+name: routing
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The docs' nginx consistent-hash recipe in front of two nodes, as make
+  # test-routing runs it.
+  routing:
+    runs-on: ubuntu-latest
+    name: sticky routing through nginx
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Start Postgres and nginx
+        run: |
+          docker compose up -d postgres nginx
+          for i in $(seq 60); do
+            docker compose exec -T postgres pg_isready -U comet -d comet -h 127.0.0.1 && exit 0
+            sleep 1
+          done
+          docker compose logs
+          exit 1
+      - name: Routing test
+        env:
+          COMETGO_TEST_DATABASE_URL: postgres://comet:comet@localhost:54329/comet
+        run: make test-routing

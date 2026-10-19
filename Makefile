@@ -1,4 +1,4 @@
-.PHONY: db todo test test-logical test-pgbouncer chaos build gen gen-check bench bench-feed
+.PHONY: db todo test test-logical test-pgbouncer test-routing chaos build gen gen-check bench bench-feed
 
 db:
 	docker compose up -d
@@ -34,6 +34,11 @@ test-pgbouncer:
 	COMETGO_TEST_DATABASE_URL=postgres://comet:comet@localhost:54330/comet \
 	COMETGO_TEST_DIRECT_URL=postgres://comet:comet@localhost:54329/comet \
 	go test -count=1 .
+
+# Sticky routing through nginx (docker compose up -d nginx): the test runs two
+# nodes on ports 54341 and 54342 and connects through nginx on 54331.
+test-routing:
+	COMETGO_TEST_NGINX_URL=ws://localhost:54331 go test -count=1 -run TestRouting -v .
 
 # Fault-injection tests, as CI runs them (needs the db and COMETGO_TEST_DATABASE_URL).
 chaos:
