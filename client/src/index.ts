@@ -175,7 +175,8 @@ export class Comet {
   serverBuild?: string;
 
   #opts: ConnectOptions;
-  // Random by default so keyless clients do not all hash to one node.
+  // The socket URL with its route key: random by default, so keyless
+  // clients do not all hash to one node.
   #url: string;
   #ws?: WebSocket;
   #subs = new Map<number, Subscription<any>>();
