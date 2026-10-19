@@ -102,3 +102,11 @@ test("a bad url throws from connect", () => {
   assert.throws(() => connect({ ...opts, url: "ws://[" }), TypeError);
   assert.throws(() => connect({ ...opts, url: "ftp://test/c" }), /not ws/);
 });
+
+test("surrounding whitespace in the url is ignored", async () => {
+  FakeWS.urls = [];
+  const comet = connect({ url: " ws://test/_comet ", WebSocket: FakeWS as any, routeKey: "k" });
+  await settle();
+  comet.close();
+  assert.equal(FakeWS.urls[0], "ws://test/_comet?route=k");
+});

@@ -38,6 +38,49 @@ export interface ConnectOptions {
    * logs. Defaults to a random id kept for this client's lifetime. The
    * server ignores it. */
   routeKey?: string;
+  /**
+   * Where the client hears that the app came to the foreground, went to the
+   * background, or changed network, as a function that subscribes and
+   * returns an unsubscribe. On `foreground` and `network` the client checks
+   * its connection at once instead of waiting for its liveness check. By
+   * default, in a browser: page visibility and `online`; elsewhere none.
+   * `@cometgo/client/react-native` passes one built on AppState and NetInfo.
+   * Pass null for none.
+   */
+  lifecycle?: Lifecycle | null;
+  /**
+   * Close the connection as soon as the app goes to the background, and
+   * reconnect when it returns. The session stays resumable for the server's
+   * ResumeGrace, so a short absence resumes without a resync. Off by default.
+   */
+  closeInBackground?: boolean;
+}
+
+export type LifecycleEvent = "foreground" | "background" | "network";
+/** Subscribes `on` to lifecycle events; returns the unsubscribe. */
+export type Lifecycle = (on: (e: LifecycleEvent) => void) => () => void;
+
+// A probe that gets nothing back within this drops the socket; after such a
+// drop the next socket is not probed for PROBE_PAUSE_MS, so a slow or
+// flapping network cannot make every wake a reconnect.
+const PROBE_TIMEOUT_MS = 5_000;
+const PROBE_PAUSE_MS = 30_000;
+
+// The browser's lifecycle: page visibility and the online event.
+function browserLifecycle(): Lifecycle | null {
+  const w = globalThis as any;
+  if (typeof w.window?.addEventListener !== "function" || typeof w.document?.addEventListener !== "function") return null;
+  return (on) => {
+    const online = () => on("network");
+    const visible = () => on(w.document.visibilityState === "visible" ? "foreground" : "background");
+    w.window.addEventListener("online", online);
+    w.document.addEventListener("visibilitychange", visible);
+    if (w.document.visibilityState === "hidden") on("background"); // loaded in a hidden tab
+    return () => {
+      w.window.removeEventListener("online", online);
+      w.document.removeEventListener("visibilitychange", visible);
+    };
+  };
 }
 
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
@@ -173,6 +216,8 @@ export class Comet {
   user: unknown = null;
   /** Server's client build id from the last welcome. */
   serverBuild?: string;
+  /** Whether the last connect resumed the session (no resync, §7.2). */
+  resumed = false;
 
   #opts: ConnectOptions;
   // The socket URL with its route key: random by default, so keyless
@@ -194,8 +239,11 @@ export class Comet {
   #pinged = false;
   #closed = false;
   #reconnectTimer?: ReturnType<typeof setTimeout>;
-  // Proactive refresh of a function token source before its authExp (§3.2).
+  // Proactive refresh of a function token source before its authExp (§3.2),
+  // and when it is due: a backgrounded app's timers do not fire, so a wake
+  // runs an overdue one.
   #refreshTimer?: ReturnType<typeof setTimeout>;
+  #refreshAt?: number;
   #authExp?: number; // the current identity's expiry, Unix seconds
   #hbTimer?: ReturnType<typeof setInterval>;
   #statusListeners = new Set<() => void>();
@@ -213,20 +261,33 @@ export class Comet {
   // shutting down, so new calls wait for the next connection, which is
   // opened after this delay instead of the usual backoff.
   #goaway?: number;
-  // Kept so close() can remove them. Not an AbortController signal: jsdom
-  // rejects a signal from another realm, such as Node's global one.
-  #onOnline = () => this.#reconnectNow();
-  #onVisible = () => {
-    if (document.visibilityState === "visible") this.#reconnectNow();
-  };
+  // #open is between its start and creating its socket (or giving up): a
+  // wake then does nothing, so the token source is not called twice.
+  #opening = false;
+  // The socket a probe is waiting on, and until when a new socket is not
+  // probed after a probe dropped one.
+  #probing?: WebSocket;
+  #probeTimer?: ReturnType<typeof setTimeout>;
+  #noProbeUntil = 0;
+  #background = false;
+  // When the liveness check last ran, and when it last found that it had not
+  // run for a while: the app was suspended (React Native pauses timers in
+  // the background), so silence before that says nothing about the socket.
+  #lastCheck = 0;
+  #suspendedAt = 0;
+  // The pending reconnect waits out a goaway's delay: a wake must not skip it.
+  #goawayWait = false;
+  #unlisten?: () => void;
 
   constructor(opts: ConnectOptions) {
     this.#opts = opts;
     // Built here so a bad url throws from connect(), not inside #open.
     this.#url = routeUrl(opts.url, opts.routeKey ?? uuid());
-    if (typeof window !== "undefined") {
-      window.addEventListener("online", this.#onOnline);
-      document.addEventListener("visibilitychange", this.#onVisible);
+    const lifecycle = opts.lifecycle === undefined ? browserLifecycle() : opts.lifecycle;
+    try {
+      this.#unlisten = lifecycle?.((e) => this.#lifecycle(e));
+    } catch (e) {
+      console.warn("cometgo: lifecycle failed", e);
     }
     this.#hbTimer = setInterval(() => this.#checkLiveness(), 1000);
     void this.#open();
@@ -310,11 +371,13 @@ export class Comet {
 
   close(): void {
     this.#closed = true;
-    if (typeof window !== "undefined") {
-      window.removeEventListener("online", this.#onOnline);
-      document.removeEventListener("visibilitychange", this.#onVisible);
+    try {
+      this.#unlisten?.();
+    } catch (e) {
+      console.warn("cometgo: lifecycle unsubscribe failed", e);
     }
     clearTimeout(this.#reconnectTimer);
+    clearTimeout(this.#probeTimer);
     clearTimeout(this.#refreshTimer);
     clearInterval(this.#hbTimer);
     this.#ws?.close(1000);
@@ -341,7 +404,18 @@ export class Comet {
   }
 
   async #open(): Promise<void> {
-    if (this.#closed) return;
+    this.#goawayWait = false;
+    // Closed for the background: the foreground wake reopens.
+    if (this.#closed || this.#opening || (this.#background && this.#opts.closeInBackground)) return;
+    this.#opening = true;
+    try {
+      await this.#openSocket();
+    } finally {
+      this.#opening = false;
+    }
+  }
+
+  async #openSocket(): Promise<void> {
     this.#setStatus("connecting");
     const first = await this.#credential();
     if (!first) {
@@ -352,7 +426,7 @@ export class Comet {
       this.#scheduleReconnect();
       return;
     }
-    // While the token resolved, close() may have run, or #reconnectNow may
+    // While the token resolved, close() may have run, or a wake may
     // have started another #open that already has its socket.
     if (this.#closed || this.#ws) return;
     const WS = this.#opts.WebSocket ?? WebSocket;
@@ -361,6 +435,18 @@ export class Comet {
     this.#ws = ws;
     this.#helloSent = false;
     ws.onopen = async () => {
+      // Dropped while connecting: close() on a connecting socket may not
+      // stop it opening (React Native), so close it now.
+      // close() leaves #ws, so check #closed too.
+      if (this.#closed || this.#ws !== ws) {
+        ws.close(this.#closed ? 1000 : 4000);
+        return;
+      }
+      // Opened after the app went to the background.
+      if (this.#background && this.#opts.closeInBackground) {
+        this.#drop(4001, "");
+        return;
+      }
       // Pipelined handshake (§3.1): no need to wait for welcome. Calls that
       // were sent before the drop wait for it, though: they are re-sent only
       // if the session resumes (§7.2).
@@ -374,8 +460,7 @@ export class Comet {
         if (!next) {
           // As in #open: no anonymous hello. Drop this socket before hello
           // (no session is touched) and reconnect with backoff.
-          ws.close(4000);
-          this.#onDisconnect(4000, "token source failed"); // its onclose then sees another #ws
+          this.#drop(4000, "token source failed");
           return;
         }
         cred = next;
@@ -388,6 +473,9 @@ export class Comet {
       for (const c of this.#calls.values()) if (!c.sent) this.#sendCall(c);
     };
     ws.onmessage = (ev) => {
+      // A dropped socket may still deliver (React Native does after
+      // close()): its frames must not reach #txParts or #seq.
+      if (this.#closed || this.#ws !== ws) return;
       this.#lastRecv = Date.now();
       this.#pinged = false;
       let msg: any;
@@ -424,17 +512,102 @@ export class Comet {
   // ahead of authExp, but then refreshes every 5 s; measure skew if that bites.
   #scheduleRefresh(authExp: unknown): void {
     clearTimeout(this.#refreshTimer);
+    this.#refreshAt = undefined;
     this.#authExp = typeof authExp === "number" ? authExp : undefined;
     const source = this.#opts.token;
     if (typeof authExp !== "number" || typeof source !== "function") return;
     const delay = Math.min(2 ** 31 - 1, Math.max(5_000, 0.8 * (authExp * 1000 - Date.now())));
-    this.#refreshTimer = setTimeout(() => {
-      if (this.#opts.token === source && this.#isOpen()) this.setToken(source).catch(() => {});
-    }, delay);
+    this.#refreshAt = Date.now() + delay;
+    this.#refreshTimer = setTimeout(() => this.#refresh(source), delay);
+  }
+
+  #refresh(source: TokenSource): void {
+    clearTimeout(this.#refreshTimer);
+    this.#refreshAt = undefined;
+    if (this.#opts.token === source && this.#isOpen()) this.setToken(source).catch(() => {});
+  }
+
+  #lifecycle(e: LifecycleEvent): void {
+    if (this.#closed) return;
+    if (e === "background") {
+      this.#background = true;
+      if (!this.#opts.closeInBackground) return;
+      clearTimeout(this.#reconnectTimer);
+      if (this.#ws) this.#drop(4001, "");
+      return;
+    }
+    if (e === "foreground") this.#background = false;
+    this.#wake(e);
+  }
+
+  // Checks the connection now (§2.1 of the M6 design): a socket that looks
+  // open after a network change or a suspension is usually dead.
+  #wake(e: "foreground" | "network"): void {
+    if (this.#refreshAt !== undefined && Date.now() >= this.#refreshAt && typeof this.#opts.token === "function") {
+      this.#refresh(this.#opts.token);
+    }
+    if (this.#opening) return;
+    const ws = this.#ws;
+    if (!ws) {
+      if (this.#goawayWait) return; // the server spreads reconnects out
+      clearTimeout(this.#reconnectTimer);
+      void this.#open(); // keeps #attempt: a flapping network still backs off
+      return;
+    }
+    if (ws.readyState === 0) {
+      if (e === "network") this.#drop(4000, ""); // may be bound to the old network
+      return;
+    }
+    if (ws.readyState !== 1) {
+      this.#drop(4408, ""); // closing, and its onclose can take a minute
+      return;
+    }
+    this.#probe(ws);
+  }
+
+  // Pings ws and drops it if nothing at all arrives within the timeout: a
+  // pong waits behind whatever the server has queued, so any message counts.
+  #probe(ws: WebSocket): void {
+    const now = Date.now();
+    if (!this.#helloSent || this.#probing || now - this.#lastRecv < 1000 || now < this.#noProbeUntil) return;
+    this.#probing = ws;
+    this.#send({ t: "ping" });
+    const expire = (late: boolean) => {
+      if (this.#ws !== ws || this.#lastRecv >= now) {
+        this.#probing = undefined;
+        return;
+      }
+      // The timer itself ran late (a blocked JS thread): a reply may be
+      // queued behind it, so give it one more second.
+      if (late) {
+        this.#probeTimer = setTimeout(() => expire(false), 1000);
+        return;
+      }
+      this.#probing = undefined;
+      this.#noProbeUntil = Date.now() + PROBE_PAUSE_MS;
+      this.#drop(4408, "");
+    };
+    this.#probeTimer = setTimeout(() => expire(Date.now() - now > PROBE_TIMEOUT_MS + 1000), PROBE_TIMEOUT_MS);
+  }
+
+  // Closes the current socket and handles the disconnect now: a dead
+  // connection's onclose can take a minute (OkHttp waits for the close
+  // frame), and everything the socket does afterwards is ignored.
+  #drop(code: number, reason: string): void {
+    const ws = this.#ws;
+    if (!ws) return;
+    try {
+      ws.close(code);
+    } catch {
+      // already closing
+    }
+    this.#onDisconnect(code, reason);
   }
 
   #onDisconnect(code: number, reason: string): void {
     this.#ws = undefined;
+    clearTimeout(this.#probeTimer);
+    this.#probing = undefined;
     clearTimeout(this.#refreshTimer); // the next welcome reschedules it
     this.#txParts = []; // a partial tx is replayed whole: #seq never counted it
     // With a resumable session, sent calls are held until the reconnect:
@@ -466,6 +639,8 @@ export class Comet {
     this.#setStatus("disconnected");
     if (code >= 4400 && code < 4500 && reason) console.warn("cometgo: closed", code, reason);
     if (this.#closed) return;
+    // Closed for the background: reconnect when the app returns.
+    if (this.#background && this.#opts.closeInBackground) return;
     this.#scheduleReconnect();
   }
 
@@ -473,15 +648,10 @@ export class Comet {
   // exponential backoff with full jitter.
   #scheduleReconnect(): void {
     const delay = this.#goaway ?? Math.random() * Math.min(30_000, 500 * 2 ** this.#attempt++);
+    this.#goawayWait = this.#goaway !== undefined;
     this.#goaway = undefined;
-    clearTimeout(this.#reconnectTimer); // two #opens can fail at once (#reconnectNow)
+    clearTimeout(this.#reconnectTimer); // two #opens can fail at once (a wake)
     this.#reconnectTimer = setTimeout(() => void this.#open(), delay);
-  }
-
-  #reconnectNow(): void {
-    if (this.#closed || this.#ws) return;
-    clearTimeout(this.#reconnectTimer);
-    void this.#open();
   }
 
   #resumable(): boolean {
@@ -531,11 +701,20 @@ export class Comet {
   }
 
   #checkLiveness(): void {
+    const now = Date.now();
+    const gap = this.#lastCheck !== 0 && now - this.#lastCheck > 3000;
+    this.#lastCheck = now;
     if (!this.#isOpen()) return;
     this.#ack();
-    const idle = Date.now() - this.#lastRecv;
+    if (gap) {
+      // Resumed after a suspension: count silence from now, and probe.
+      this.#suspendedAt = now;
+      this.#probe(this.#ws!);
+      return;
+    }
+    const idle = now - Math.max(this.#lastRecv, this.#suspendedAt);
     if (idle > this.#hb + 10_000) {
-      this.#ws!.close(4408); // dead connection; onclose reconnects
+      this.#drop(4408, ""); // dead connection
     } else if (idle > this.#hb && !this.#pinged) {
       this.#pinged = true;
       this.#send({ t: "ping" });
@@ -592,6 +771,7 @@ export class Comet {
         this.#session = msg.session;
         this.#welcomed = true;
         this.#canResume = Array.isArray(msg.caps) && msg.caps.includes("resume");
+        this.resumed = !!msg.resumed;
         this.#scheduleRefresh(msg.authExp);
         if (msg.resumed) {
           // Missed messages follow as a replay. Unanswered calls and auths
@@ -885,17 +1065,28 @@ function canceled(): CometError {
   return new CometError({ code: "CANCELED", msg: "call canceled" });
 }
 
-// url (default /_comet) resolved against the page, as ws(s), with route=key
-// replacing any route in its query. The rest of the query keeps its bytes.
+// url (default /_comet) as ws(s), with route=key replacing any route in its
+// query; the rest of the query keeps its bytes and a fragment is dropped
+// (WebSocket refuses one). A relative url resolves against the page. No URL
+// setters: bare React Native does not implement them.
 function routeUrl(url: string | undefined, key: string): string {
-  const base = globalThis.location?.href;
-  if (url === undefined && !base) throw new TypeError("cometgo: url is required outside a browser");
-  const u = new URL(url ?? "/_comet", base);
-  if (u.protocol === "https:") u.protocol = "wss:";
-  else if (u.protocol === "http:") u.protocol = "ws:";
-  if (u.protocol !== "ws:" && u.protocol !== "wss:") throw new TypeError(`cometgo: url ${u.href} is not ws(s) or http(s)`);
-  const q = u.search.slice(1).split("&").filter((p) => p && p !== "route" && !p.startsWith("route="));
+  let u = url?.trim() ?? "/_comet";
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) {
+    const base = globalThis.location?.href;
+    if (!base) throw new TypeError(url === undefined ? "cometgo: url is required outside a browser" : `cometgo: url ${u} is relative, and there is no page to resolve it against`);
+    u = new URL(u, base).href;
+  }
+  const hash = u.indexOf("#");
+  if (hash >= 0) u = u.slice(0, hash);
+  const colon = u.indexOf(":");
+  let scheme = u.slice(0, colon).toLowerCase();
+  scheme = scheme === "https" ? "wss" : scheme === "http" ? "ws" : scheme;
+  if (scheme !== "ws" && scheme !== "wss") throw new TypeError(`cometgo: url ${u} is not ws(s) or http(s)`);
+  const rest = u.slice(colon + 1);
+  const qAt = rest.indexOf("?");
+  const q = (qAt < 0 ? "" : rest.slice(qAt + 1)).split("&").filter((p) => p && p !== "route" && !p.startsWith("route="));
   q.push(`route=${encodeURIComponent(key)}`);
-  u.search = q.join("&");
-  return u.href;
+  const out = `${scheme}:${qAt < 0 ? rest : rest.slice(0, qAt)}?${q.join("&")}`;
+  if (typeof URL === "function") new URL(out); // validates where it can; throws TypeError
+  return out;
 }
