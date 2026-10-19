@@ -90,10 +90,14 @@ With `-nodes N`, the logical modes run N `App`s on `FeedLogical`, each with its 
 |---|---|
 | walsender CPU | user + system time of the slots' walsenders, from `/proc/<pid>/stat` (PIDs from `pg_replication_slots.active_pid`), in cores |
 | decoded, spilled | `total_bytes` and `spill_bytes` of `pg_stat_replication_slots` (PostgreSQL 14+) |
-| retained WAL | `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`, the most one slot holds back, at the end of the window |
+| retained WAL | `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`, the most one slot holds back: the maximum of samples taken at the start, about once a second during the window, and at the end, since it rises and falls as the slot is confirmed |
 | gate snapshots | the visibility gates' `pg_current_snapshot()` queries, from the `feed_snapshots` metric |
 
-The walsender PIDs are the database server's. With the compose Postgres they belong to the container, so pass `-proc "docker compose exec -T postgres cat"`, which prints `/proc/<pid>/stat` from inside it. Without `-proc` feedbench reads this machine's `/proc`, which is right only for a Postgres running directly on it. On managed Postgres neither works and the column says n/a.
+CPU and the slot statistics are each read at the start and end of the window, and each rate is divided by the time between its own two reads, so a slow read does not stretch the window. Walsender CPU counts only when both reads found the same N PIDs; otherwise (a walsender restarted, a slot not yet active) that round's CPU is n/a, and the median is over the rounds that have one.
+
+The walsender PIDs are the database server's. With the compose Postgres they belong to the container, so pass `-proc "docker compose exec -T postgres cat"`: feedbench runs it once per read with every walsender's `/proc/<pid>/stat` and `/proc/<pid>/cmdline` appended, and it prints them from inside the container. Without `-proc` feedbench reads this machine's `/proc`, which is right only for a Postgres running directly on it. Each PID's cmdline must name a walsender, so container PIDs read on the host (unrelated processes, or none) give n/a with one warning rather than another process's CPU. On managed Postgres neither works and the column says n/a.
+
+feedbench drops its slots when a run ends, also on Ctrl-C or SIGTERM and when a run fails. At startup it drops any inactive `cometgo_feedbench*` slot of the database, left by a killed run (it would hold WAL back and add to what the next run decodes), and stops if one is active, since another feedbench is then running against it.
 
 N nodes take N replication slots and N WAL senders. The compose Postgres allows 20 of each (`docker compose up -d postgres` recreates an older container with that setting); the report states both settings.
 

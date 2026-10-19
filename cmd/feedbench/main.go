@@ -22,15 +22,18 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -67,18 +70,26 @@ type result struct {
 	took     time.Duration
 	p50, p99 time.Duration
 	// Logical modes only, over the measured window, summed over the nodes'
-	// slots. cpu is the walsenders' CPU seconds, -1 if unreadable.
-	cpu            float64
-	decoded, spill int64
-	retained       int64 // the most WAL one slot holds back, at the end
-	snapshots      int64 // the gates' pg_current_snapshot() queries
+	// slots. CPU and the slot statistics are sampled apart, so each has its
+	// own interval.
+	cpu                float64 // the walsenders' CPU seconds, -1 if unavailable
+	cpuTook, statsTook time.Duration
+	decoded, spill     int64
+	retained           int64 // the most WAL one slot held back, sampled about once a second
+	snapshots          int64 // the gates' pg_current_snapshot() queries
 }
 
-// slotStats is one sample of the cometgo_feedbench* slots.
+// slotStats is one sample of the cometgo_feedbench* slots: the statistics
+// read at at, and their walsenders' CPU seconds by PID read at cpuAt (nil if
+// unavailable).
 type slotStats struct {
-	cpu                      float64
+	at, cpuAt                time.Time
 	decoded, spill, retained int64
+	cpu                      map[int32]float64
 }
+
+// slots are this database's feedbench slots.
+const slots = `pg_replication_slots r WHERE r.slot_name LIKE 'cometgo\_feedbench%' AND r.database = current_database()`
 
 func main() {
 	dsn := flag.String("db", envOr("DATABASE_URL", "postgres://comet:comet@localhost:54329/comet"), "Postgres DSN")
@@ -90,10 +101,15 @@ func main() {
 	out := flag.String("out", "", "also write the Markdown report to this file")
 	rounds := flag.Int("rounds", 1, "rounds of all modes, alternating; the report gives each mode's median and range (every transaction waits on a WAL flush, so one run is noisy)")
 	nodes := flag.Int("nodes", 1, "logical modes: Apps on FeedLogical, one replication slot each, as the nodes of one app")
-	procCmd := flag.String("proc", "", `logical modes: command that prints /proc/<pid>/stat for a Postgres backend PID appended to it, e.g. "docker compose exec -T postgres cat" (PIDs are the container's); empty reads this machine's /proc`)
+	procCmd := flag.String("proc", "", `logical modes: command that prints, in order, the files appended to it, run once per sample with the walsenders' /proc/<pid>/stat and cmdline, e.g. "docker compose exec -T postgres cat" (PIDs are the container's); empty reads this machine's /proc`)
 	flag.Parse()
+	if *nodes < 1 {
+		log.Fatal("-nodes must be at least 1")
+	}
 
-	ctx := context.Background()
+	// Cancelling ends the run through its deferred shutdown, which drops the slots.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	cfg, err := pgxpool.ParseConfig(*dsn)
 	if err != nil {
 		log.Fatal(err)
@@ -109,6 +125,18 @@ func main() {
 	if err := pool.QueryRow(ctx, `SELECT current_setting('wal_level'), current_setting('server_version'),
 		current_setting('max_replication_slots'), current_setting('max_wal_senders')`).Scan(&walLevel, &version, &maxSlots, &maxSenders); err != nil {
 		log.Fatal(err)
+	}
+	// A slot left by a killed run holds WAL back and adds to what the next
+	// run decodes.
+	var active int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FILTER (WHERE r.active) FROM "+slots).Scan(&active); err != nil {
+		log.Fatal(err)
+	}
+	if active > 0 {
+		log.Fatalf("%d cometgo_feedbench slot(s) in use: another feedbench is running against this database", active)
+	}
+	if _, err := pool.Exec(ctx, "SELECT pg_drop_replication_slot(r.slot_name) FROM "+slots+" AND NOT r.active"); err != nil {
+		log.Fatalf("dropping leftover slots: %v", err)
 	}
 	var selected []mode
 	for _, m := range modes {
@@ -130,8 +158,8 @@ func main() {
 			}
 			log.Printf("round %d %-15s %8.0f tx/s  p50 %v  p99 %v", round+1, m.name, r.tps(), r.p50, r.p99)
 			if m.logical {
-				log.Printf("round %d %-15s walsender CPU %.2f cores, decoded %.1f MB/s, spilled %d B, retained %d B, %.0f snapshots/s",
-					round+1, m.name, r.cores(), mbps(r.decoded, r.took), r.spill, r.retained, float64(r.snapshots)/r.took.Seconds())
+				log.Printf("round %d %-15s walsender CPU %s, decoded %.1f MB/s, spilled %d B, retained %d B, %.0f snapshots/s",
+					round+1, m.name, cores(r.cores()), mbps(r.decoded, r.statsTook), r.spill, r.retained, float64(r.snapshots)/r.took.Seconds())
 			}
 			results[i] = append(results[i], r)
 		}
@@ -180,6 +208,11 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, p
 	lat := make([][]time.Duration, writers)
 	loadCtx, stop := context.WithCancel(ctx)
 	var wg sync.WaitGroup
+	// Runs before the feed's shutdown: on an early return too.
+	defer func() {
+		stop()
+		wg.Wait()
+	}()
 	errs := make(chan error, writers)
 	for w := range writers {
 		wg.Go(func() {
@@ -209,18 +242,50 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, p
 			}
 		})
 	}
-	time.Sleep(warmup)
+	if err := sleep(ctx, warmup); err != nil {
+		return result{}, err
+	}
 	var before, after slotStats
+	var err error
 	if m.logical {
-		before = sample(ctx, pool, procCmd)
+		if before, err = sample(ctx, pool, procCmd); err != nil {
+			return result{}, err
+		}
+	}
+	retained := before.retained
+	winCtx, endWin := context.WithCancel(ctx)
+	var sampler sync.WaitGroup
+	var samplerErr error
+	if m.logical {
+		// Retained WAL is a sawtooth (the slot is confirmed about once a
+		// second), so one point says little: the window's maximum.
+		sampler.Go(func() {
+			for sleep(winCtx, time.Second) == nil {
+				var r int64
+				if err := pool.QueryRow(winCtx, "SELECT coalesce(max(pg_wal_lsn_diff(pg_current_wal_lsn(), r.restart_lsn)), 0)::int8 FROM "+slots).Scan(&r); err != nil {
+					if winCtx.Err() == nil {
+						samplerErr = fmt.Errorf("retained WAL: %w", err)
+					}
+					return
+				}
+				retained = max(retained, r)
+			}
+		})
 	}
 	measuring.Store(true)
 	begin := time.Now()
-	time.Sleep(duration)
+	err = sleep(ctx, duration)
 	measuring.Store(false)
 	took := time.Since(begin)
+	endWin()
+	sampler.Wait()
+	if err = cmp.Or(err, samplerErr); err != nil {
+		return result{}, err
+	}
 	if m.logical {
-		after = sample(ctx, pool, procCmd)
+		if after, err = sample(ctx, pool, procCmd); err != nil {
+			return result{}, err
+		}
 	}
 	stop()
 	wg.Wait()
@@ -238,11 +303,15 @@ func run(ctx context.Context, pool *pgxpool.Pool, dsn string, m mode, writers, p
 	r := result{mode: m, commits: commits.Load(), took: took}
 	if m.logical {
 		r.cpu = -1
-		if before.cpu >= 0 && after.cpu >= 0 {
-			r.cpu = after.cpu - before.cpu
+		if c, ok := walsenderCPU(before.cpu, after.cpu, nodes); ok {
+			r.cpu = c
+		} else if before.cpu != nil && after.cpu != nil {
+			log.Printf("%s: walsender CPU unavailable this round: PIDs %v, then %v, for %d node(s)",
+				m.name, slices.Sorted(maps.Keys(before.cpu)), slices.Sorted(maps.Keys(after.cpu)), nodes)
 		}
+		r.cpuTook, r.statsTook = after.cpuAt.Sub(before.cpuAt), after.at.Sub(before.at)
 		r.decoded, r.spill = after.decoded-before.decoded, after.spill-before.spill
-		r.retained, r.snapshots = after.retained, snapshots.Load()
+		r.retained, r.snapshots = max(retained, after.retained), snapshots.Load()
 	}
 	if len(all) > 0 {
 		r.p50, r.p99 = all[len(all)/2], all[len(all)*99/100]
@@ -337,8 +406,8 @@ func logicalFeed(ctx context.Context, dsn string, n int, snapshots *atomic.Int64
 	deadline := time.Now().Add(time.Minute)
 	for _, app := range apps {
 		for app.Ready() != nil {
-			if time.Now().After(deadline) {
-				err := fmt.Errorf("feed not ready: %w", app.Ready())
+			if ctx.Err() != nil || time.Now().After(deadline) {
+				err := fmt.Errorf("feed not ready: %w", cmp.Or(ctx.Err(), app.Ready()))
 				ready <- err
 				return err
 			}
@@ -352,9 +421,9 @@ func logicalFeed(ctx context.Context, dsn string, n int, snapshots *atomic.Int64
 
 // sample reads the feedbench slots' statistics: decoded and spilled bytes
 // (pg_stat_replication_slots, PG 14+), the most WAL one holds back, and
-// their walsenders' CPU seconds from /proc/<pid>/stat, -1 if any is
-// unreadable. A failure to query is fatal: the run would mean nothing.
-func sample(ctx context.Context, pool *pgxpool.Pool, procCmd string) slotStats {
+// their walsenders' CPU seconds. Unreadable CPU is warned about once and
+// left nil; a failed query is an error, since the run would mean nothing.
+func sample(ctx context.Context, pool *pgxpool.Pool, procCmd string) (slotStats, error) {
 	var st slotStats
 	var pids []int32
 	err := pool.QueryRow(ctx, `
@@ -363,40 +432,95 @@ func sample(ctx context.Context, pool *pgxpool.Pool, procCmd string) slotStats {
 		       coalesce(array_agg(r.active_pid) FILTER (WHERE r.active_pid IS NOT NULL), '{}')
 		FROM pg_replication_slots r
 		LEFT JOIN pg_stat_replication_slots s USING (slot_name)
-		WHERE r.slot_name LIKE 'cometgo\_feedbench%'`).Scan(&st.decoded, &st.spill, &st.retained, &pids)
+		WHERE r.slot_name LIKE 'cometgo\_feedbench%' AND r.database = current_database()`).Scan(&st.decoded, &st.spill, &st.retained, &pids)
 	if err != nil {
-		log.Fatalf("slot stats: %v", err)
+		return st, fmt.Errorf("slot stats: %w", err)
 	}
-	for _, pid := range pids {
-		c, err := procCPU(procCmd, pid)
-		if err != nil {
-			log.Printf("walsender CPU unavailable (set -proc?): %v", err)
-			st.cpu = -1
-			return st
-		}
-		st.cpu += c
+	st.at = time.Now()
+	cpu, err := procCPU(procCmd, pids)
+	st.cpuAt = time.Now()
+	if err != nil {
+		warnCPU.Do(func() { log.Printf("walsender CPU unavailable (set -proc?): %v", err) })
+		return st, nil
 	}
-	return st
+	st.cpu = cpu
+	return st, nil
 }
 
-// procCPU is the user + system CPU seconds of process pid, from
-// /proc/<pid>/stat: read here, or printed by procCmd run with the path.
-func procCPU(procCmd string, pid int32) (float64, error) {
-	path := fmt.Sprintf("/proc/%d/stat", pid)
-	var b []byte
-	var err error
+var warnCPU sync.Once
+
+// walsenderCPU is the CPU seconds the walsenders used between two samples;
+// false unless both read the same nodes PIDs (a walsender that restarted
+// mid-window would count from zero).
+func walsenderCPU(before, after map[int32]float64, nodes int) (float64, bool) {
+	if before == nil || after == nil || len(before) != nodes ||
+		!maps.EqualFunc(before, after, func(float64, float64) bool { return true }) {
+		return 0, false
+	}
+	var cpu float64
+	for pid, c := range after {
+		cpu += c - before[pid]
+	}
+	return cpu, true
+}
+
+// procCPU reads /proc/<pid>/stat and /proc/<pid>/cmdline of each pid,
+// here or by one run of procCmd with every path, and returns each one's CPU
+// seconds.
+func procCPU(procCmd string, pids []int32) (map[int32]float64, error) {
+	if len(pids) == 0 {
+		return map[int32]float64{}, nil
+	}
+	var paths []string
+	for _, pid := range pids {
+		paths = append(paths, fmt.Sprintf("/proc/%d/stat", pid), fmt.Sprintf("/proc/%d/cmdline", pid))
+	}
+	var out []byte
 	if procCmd == "" {
-		b, err = os.ReadFile(path)
+		for _, path := range paths {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, b...)
+		}
 	} else {
-		args := append(strings.Fields(procCmd), path)
-		b, err = exec.Command(args[0], args[1:]...).Output()
+		args := append(strings.Fields(procCmd), paths...)
+		var err error
+		if out, err = exec.Command(args[0], args[1:]...).Output(); err != nil {
+			return nil, fmt.Errorf("%s: %w", procCmd, err)
+		}
 	}
-	if err != nil {
-		return 0, err
-	}
-	cpu, ok := parseStat(string(b))
-	if !ok {
-		return 0, fmt.Errorf("%s: unexpected format %q", path, b)
+	return parseProc(string(out), pids)
+}
+
+// parseProc splits out, the stat line and cmdline of each of pids
+// concatenated in order, and returns each one's CPU seconds; an error if
+// one is malformed or not a walsender (without -proc against a container,
+// its PIDs name this machine's unrelated processes). A stat line starts
+// with its PID and ends in a newline; a cmdline holds no newline.
+func parseProc(out string, pids []int32) (map[int32]float64, error) {
+	cpu := map[int32]float64{}
+	for i, pid := range pids {
+		stat, rest, _ := strings.Cut(out, "\n")
+		c, ok := parseStat(stat)
+		if !ok || !strings.HasPrefix(stat, fmt.Sprintf("%d (", pid)) {
+			return nil, fmt.Errorf("/proc/%d/stat: unexpected format %q", pid, stat)
+		}
+		cmdline := rest
+		if i+1 < len(pids) {
+			// rest runs on into the next stat line, whose "(" follows only its PID.
+			line, _, _ := strings.Cut(rest, "\n")
+			j := strings.LastIndex(line, fmt.Sprintf("%d (", pids[i+1]))
+			if j < 0 {
+				return nil, fmt.Errorf("/proc/%d/stat: not found in %q", pids[i+1], line)
+			}
+			cmdline, out = rest[:j], rest[j:]
+		}
+		if !strings.Contains(cmdline, "walsender") {
+			return nil, fmt.Errorf("PID %d is not a walsender: %q", pid, cmdline)
+		}
+		cpu[pid] = c
 	}
 	return cpu, nil
 }
@@ -427,7 +551,23 @@ func (r result) cores() float64 {
 	if r.cpu < 0 {
 		return -1
 	}
-	return r.cpu / r.took.Seconds()
+	return r.cpu / r.cpuTook.Seconds()
+}
+
+// cpuMedian is the median of cores over the rounds where it was available.
+func cpuMedian(rs []result) (float64, bool) {
+	rs = slices.DeleteFunc(slices.Clone(rs), func(r result) bool { return r.cpu < 0 })
+	if len(rs) == 0 {
+		return 0, false
+	}
+	return median(rs, result.cores), true
+}
+
+func cores(c float64) string {
+	if c < 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.2f cores", c)
 }
 
 func mbps(b int64, d time.Duration) float64 { return float64(b) / 1e6 / d.Seconds() }
@@ -453,7 +593,16 @@ func render(results [][]result, rounds, writers, payload, nodes int, duration ti
 	fmt.Fprintf(&b, "- Go %s, %s/%s, %d logical CPUs\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
 	fmt.Fprintf(&b, "- %d writers, %s measured per mode; each transaction updates one random row of %d (%d-byte text column) by primary key\n", writers, duration, rows, payload)
 	fmt.Fprintf(&b, "- %d rounds, the modes alternating within each; tx/s, p50 and p99 are each mode's median over the rounds, and \"vs plain\" compares medians\n", rounds)
-	fmt.Fprintf(&b, "- logical modes: %d node(s), one App and slot each; max_replication_slots=%s, max_wal_senders=%s\n\n", nodes, maxSlots, maxSenders)
+	var logical [][]result
+	for _, rs := range results {
+		if rs[0].mode.logical {
+			logical = append(logical, rs)
+		}
+	}
+	if len(logical) > 0 {
+		fmt.Fprintf(&b, "- logical modes: %d node(s), one App and slot each; max_replication_slots=%s, max_wal_senders=%s\n", nodes, maxSlots, maxSenders)
+	}
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "| Mode | What runs | tx/s | range | vs plain | p50 | p99 |\n|---|---|---|---|---|---|---|\n")
 	var plain float64
 	for _, rs := range results {
@@ -470,12 +619,6 @@ func render(results [][]result, rounds, writers, payload, nodes int, duration ti
 		fmt.Fprintf(&b, "| %s | %s | %.0f | %.0f–%.0f | %s | %s | %s |\n", m.name, m.desc, tps, lo.tps(), hi.tps(), rel,
 			ms(median(rs, func(r result) time.Duration { return r.p50 })), ms(median(rs, func(r result) time.Duration { return r.p99 })))
 	}
-	var logical [][]result
-	for _, rs := range results {
-		if rs[0].mode.logical {
-			logical = append(logical, rs)
-		}
-	}
 	if len(logical) == 0 {
 		return b.String()
 	}
@@ -483,20 +626,30 @@ func render(results [][]result, rounds, writers, payload, nodes int, duration ti
 	if procCmd != "" {
 		src = "`" + procCmd + "`"
 	}
-	fmt.Fprintf(&b, "\nWhat the %d slot(s) cost the database, per mode, medians over the rounds. Walsender CPU is user + system time of the slots' walsenders from %s, in cores (not available on managed Postgres); decoded and spilled bytes are from `pg_stat_replication_slots`; retained WAL is the most one slot holds back at the end of the window; snapshots are the visibility gates' `pg_current_snapshot()` queries (`feed_snapshots`).\n\n", nodes, src)
+	fmt.Fprintf(&b, "\nWhat the %d slot(s) cost the database, per mode, medians over the rounds. Walsender CPU is user + system time of the slots' walsenders from %s, in cores (not available on managed Postgres); decoded and spilled bytes are from `pg_stat_replication_slots`; retained WAL is the most one slot held back, sampled about once a second over the window; snapshots are the visibility gates' `pg_current_snapshot()` queries (`feed_snapshots`).\n\n", nodes, src)
 	fmt.Fprintf(&b, "| Mode | walsender CPU | decoded | spilled | retained WAL | gate snapshots |\n|---|---|---|---|---|---|\n")
 	for _, rs := range logical {
 		cpu := "n/a"
-		if c := median(rs, result.cores); c >= 0 {
-			cpu = fmt.Sprintf("%.2f cores", c)
+		if c, ok := cpuMedian(rs); ok {
+			cpu = cores(c)
 		}
 		fmt.Fprintf(&b, "| %s | %s | %.1f MB/s | %d B | %d B | %.0f/s |\n", rs[0].mode.name, cpu,
-			median(rs, func(r result) float64 { return mbps(r.decoded, r.took) }),
+			median(rs, func(r result) float64 { return mbps(r.decoded, r.statsTook) }),
 			median(rs, func(r result) int64 { return r.spill }),
 			median(rs, func(r result) int64 { return r.retained }),
 			median(rs, func(r result) float64 { return float64(r.snapshots) / r.took.Seconds() }))
 	}
 	return b.String()
+}
+
+// sleep waits d, or until ctx ends.
+func sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 func ms(d time.Duration) string { return fmt.Sprintf("%.2f ms", float64(d.Microseconds())/1000) }
