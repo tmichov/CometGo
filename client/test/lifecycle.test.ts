@@ -333,6 +333,32 @@ test("after a suspension a dead socket is dropped once the probe times out", asy
   mock.timers.tick(1000);
   mock.timers.setTime(Date.now() + 60_000);
   mock.timers.tick(1000);
+  assert.equal(ws.closedWith, undefined); // not dropped on the gap itself
+  assert.equal(ws.of("ping").length, 1);
   mock.timers.tick(5000);
+  assert.equal(ws.closedWith, 4408);
+});
+
+test("a probe whose timer fires late looks for a queued reply before dropping", async () => {
+  const ws = await start();
+  mock.timers.tick(2000);
+  emit("foreground");
+  mock.timers.setTime(Date.now() + 8000); // JS thread blocked past the deadline
+  mock.timers.tick(5000); // timer fires late
+  assert.equal(ws.closedWith, undefined);
+  ws.recv({ t: "pong" }); // the queued reply
+  mock.timers.tick(1000);
+  assert.equal(ws.closedWith, undefined);
+  assert.equal(comet.status, "connected");
+});
+
+test("a probe whose timer fires late still drops a socket that never replies", async () => {
+  const ws = await start();
+  mock.timers.tick(2000);
+  emit("foreground");
+  mock.timers.setTime(Date.now() + 8000);
+  mock.timers.tick(5000);
+  assert.equal(ws.closedWith, undefined);
+  mock.timers.tick(1000);
   assert.equal(ws.closedWith, 4408);
 });

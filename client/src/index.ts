@@ -572,12 +572,22 @@ export class Comet {
     if (!this.#helloSent || this.#probing || now - this.#lastRecv < 1000 || now < this.#noProbeUntil) return;
     this.#probing = ws;
     this.#send({ t: "ping" });
-    this.#probeTimer = setTimeout(() => {
+    const expire = (late: boolean) => {
+      if (this.#ws !== ws || this.#lastRecv >= now) {
+        this.#probing = undefined;
+        return;
+      }
+      // The timer itself ran late (a blocked JS thread): a reply may be
+      // queued behind it, so give it one more second.
+      if (late) {
+        this.#probeTimer = setTimeout(() => expire(false), 1000);
+        return;
+      }
       this.#probing = undefined;
-      if (this.#ws !== ws || this.#lastRecv >= now) return;
       this.#noProbeUntil = Date.now() + PROBE_PAUSE_MS;
       this.#drop(4408, "");
-    }, PROBE_TIMEOUT_MS);
+    };
+    this.#probeTimer = setTimeout(() => expire(Date.now() - now > PROBE_TIMEOUT_MS + 1000), PROBE_TIMEOUT_MS);
   }
 
   // Closes the current socket and handles the disconnect now: a dead
