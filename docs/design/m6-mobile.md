@@ -9,6 +9,7 @@ Status: agreed design (two review rounds, below). Nothing here is implemented.
 - React Native through Expo is the mobile stack. Native Swift/Kotlin clients and Flutter are out of M6.
 - The mobile app has its own React Native UI, scaffolded, run and built by a `cometgo` CLI that wraps Expo. Wrapping the web UI in a native WebView (Capacitor), which is closer to Meteor's Cordova builds, is a possible later item.
 - Reconnect must be solid across backgrounding, network changes and sleep. Offline data and offline writes are out of M6.
+- M6 is verified on Android only: development happens on Linux, where the iOS Simulator does not run. The code stays cross-platform, and the iOS checks (the iOS half of the device findings and of the exit criterion) are a separate task for when a Mac is available.
 
 **Minimum versions.** Expo SDK 53 (React Native 0.79), the first where Metro resolves package `exports` by default; `@cometgo/client/react` and the new `/react-native` entry are only reachable through `exports`.
 
@@ -149,7 +150,7 @@ The template's `cometURL()`: `EXPO_PUBLIC_COMET_URL` if set (`build`, `run --ser
 
 The resumed/resynced outcome is observable: the client exposes whether its last connect resumed (`comet.resumed`), and the example shows it on screen.
 
-On an Android emulator, a physical Android device and an iOS simulator, with the todo example run by `cometgo run`:
+On an Android emulator and a physical Android device, with the todo example run by `cometgo run` (the same checks on an iOS simulator are a separate task, for a Mac):
 
 - subscribes and shows rows; a call's result arrives after its data (read-your-writes);
 - backgrounded 30 s, then foregrounded: `resumed` is true;
