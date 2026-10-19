@@ -238,6 +238,12 @@ type Config struct {
 	// engine and connection goroutines, so it must be fast and safe for
 	// concurrent use. Nil reports nothing.
 	Metrics func(Metric)
+	// Tenant, if set, names the tenant an identity belongs to, for
+	// Metric.Tenant. Nil uses Identity.ScopeKey. It is called when a
+	// connection's identity changes and for calls and fn runs whose
+	// identity is not the connection's current one, never without Metrics.
+	// It must be fast and safe for concurrent use; a panic counts as "".
+	Tenant func(*Identity) string
 }
 
 // App is a CometGo server. It implements http.Handler for the WebSocket
