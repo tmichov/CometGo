@@ -403,7 +403,9 @@ Called with the upgrade request, so it can read session cookies. Its result is u
 
 ### Expiry: `Identity.ExpiresAt`
 
-If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The TypeScript client refreshes on its own before then when its token source is a function ([client Auth](client.md#auth)); with a string token the app should call `setToken` with a fresh one. The HTTP refresh endpoint is *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
+If `ExpiresAt` is set, the server tells the client when the identity expires (`welcome.authExp` / `authRes.authExp`, in Unix seconds). When that time passes without a new token, the connection is downgraded to anonymous, every subscription is reset as for a logout, and the server sends an `AUTH_EXPIRED` auth result. The TypeScript client does not surface that code: the app sees `comet.user` become `null` and `onChange` fire, the same as a logout. The TypeScript client refreshes on its own before then when its token source is a function ([client Auth](client.md#auth)); with a string token the app should call `setToken` with a fresh one.
+
+A session that is disconnected and waiting to be [resumed](#session-resume) when its identity expires is not downgraded: a phone that slept through its token's lifetime comes back with a fresh token for the same user, and resumes as if the token had been refreshed in time, with no resync. A resume without a valid token for that user resyncs instead, and a session nobody resumes ends after `ResumeGrace` as usual. This only applies once the server has noticed the connection is gone, which takes up to three heartbeats after a phone suspends the app; an identity that expires before then is downgraded as above. `ExpiresAt` is not revocation: while the session waits, its subscriptions stay bound to the expired identity (and keep their queries running, sending nothing). To cut off a user, revoke in the data or call [`Revalidate`](#revoking-access-revalidate), which reaches disconnected sessions too. A resume delivers what the session's queries produced during the gap under the identity it had, as a token refresh within the gap always did: claims that narrow a user's access should change their `ScopeKey` (another principal resyncs) or be checked in the query. The HTTP refresh endpoint is *planned* ([protocol §3.2](protocol.md#32-mid-session-auth)).
 
 ### Revoking access: `Revalidate`
 
@@ -453,9 +455,10 @@ The session is not resumed, and the client falls back to a full resync, when:
 - the server restarted,
 - the grace window passed,
 - the buffer overflowed while the client was away,
-- the reconnecting client authenticates as a different user, or as the same user with a different `ScopeKey`, than the session's.
+- the reconnecting client authenticates as a different user, or as the same user with a different `ScopeKey`, than the session's (connecting without a token, after a logged-in session, counts as a different user),
+- the identity it authenticates as has already expired (`Authenticate` returned an `ExpiresAt` in the past).
 
-A token refresh for the same user and `ScopeKey` is fine. A protocol error, or a deliberate close by the client (code 1000/1001, e.g. a page unload), ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable. An anonymous session is resumable by whoever holds its session id, which the client keeps in memory only.
+A token refresh for the same user and `ScopeKey` is fine, including after the session's identity expired while it was disconnected (see [Expiry](#expiry-identityexpiresat)). A protocol error, or a deliberate close by the client (code 1000/1001, e.g. a page unload), ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable. An anonymous session is resumable by whoever holds its session id, which the client keeps in memory only.
 
 **Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node ([Routing to nodes](#routing-to-nodes)). Without that everything still works, but a reconnect that lands on another node resyncs.
 

@@ -122,6 +122,8 @@ func setupFull(t testing.TB, tweak func(*Config), extra func(*testEnv, *App)) *t
 				return &Identity{UserID: "alice", ScopeKey: strings.TrimPrefix(token, "alice@")}, nil
 			case "alice-short":
 				return &Identity{UserID: "alice", ExpiresAt: time.Now().Add(300 * time.Millisecond)}, nil
+			case "alice-1s": // long enough to subscribe and disconnect before it expires
+				return &Identity{UserID: "alice", ExpiresAt: time.Now().Add(time.Second)}, nil
 			}
 			return nil, NewError(CodeUnauthenticated, "bad token")
 		},

@@ -114,6 +114,36 @@ func TestRevalidateReachesDetachedSession(t *testing.T) {
 	}
 }
 
+// Revalidate reaches a detached session whose identity expired in the gap
+// (it keeps the identity, M6 §3), so a revoked user who resumes with a
+// fresh token gets the end in the replay.
+func TestRevalidateReachesDetachedExpiredSession(t *testing.T) {
+	e, m := setupTeam(t)
+	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-1s"}}))
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "team"})
+	last := a.next()
+	a.kill()
+	c := e.session(t, w["session"])
+	waitConn(t, c, "detached", func() bool { return c.sock == nil })
+	time.Sleep(1200 * time.Millisecond) // expired while detached
+	waitConn(t, c, "kept identity", func() bool { return c.ident != nil && c.ident.UserID == "alice" })
+
+	m.revoke("alice")
+	e.revalidate(t, "alice")
+	waitConn(t, c, "the end", func() bool { return c.seq > seqOf(last) })
+
+	b, w2 := e.dial(t, resumeHello(map[string]any{
+		"auth":   map[string]any{"token": "alice"},
+		"resume": map[string]any{"session": w["session"], "seq": seqOf(last), "subs": []int{1}},
+	}))
+	if w2["resumed"] != true {
+		t.Fatalf("welcome %v", w2)
+	}
+	if en := entries(b.next()); len(en) != 1 || en[0]["s"] != float64(1) || !isForbiddenEnd(en[0]) {
+		t.Fatalf("replay: %v", en)
+	}
+}
+
 // A panic in fn during Revalidate ends that sub with INTERNAL instead of
 // taking down the engine.
 func TestRevalidateRecoversPanic(t *testing.T) {
