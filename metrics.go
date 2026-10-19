@@ -30,6 +30,7 @@ const (
 	MetricPubRun          = "pub_run_seconds"    // duration of one observer query, with Pub
 	MetricStale           = "stale_seconds"      // duration: notification drained to its observer's result delivered, with Pub
 	MetricDetached        = "detached_observers" // gauge: observer queries running detached from their tick
+	MetricFeedSnapshots   = "feed_snapshots"     // counter: a pg_current_snapshot() query of the logical feed (its visibility gate, and restarts)
 )
 
 // metric reports v under name if a hook is set. A panicking hook is logged
