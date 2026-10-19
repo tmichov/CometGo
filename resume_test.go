@@ -351,8 +351,7 @@ func TestResumeAfterExpiryInGap(t *testing.T) {
 		t.Fatalf("bob resumed alice's session: %v", wb)
 	}
 
-	// Fresh setup for the positive case: the session is now anonymous, and
-	// an anonymous resume replays the expiry.
+	// Anonymous (the token was dropped) is another principal too: resync.
 	e = setup(t)
 	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'a1')"); err != nil {
 		t.Fatal(err)
@@ -362,16 +361,80 @@ func TestResumeAfterExpiryInGap(t *testing.T) {
 	snap = a.next()
 	a.kill()
 	time.Sleep(500 * time.Millisecond)
-	b, w2 := e.dial(t, resumeHello(map[string]any{"resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
-	if w2["resumed"] != true || w2["user"] != nil {
-		t.Fatalf("welcome %v", w2)
+	_, w2 := e.dial(t, resumeHello(map[string]any{"resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
+	if w2["resumed"] != false {
+		t.Fatalf("anonymous resumed alice's expired session: %v", w2)
+	}
+}
+
+// expiredInGap subscribes alice with a 300 ms token, drops the socket, lets
+// the token expire while detached, and inserts a row for alice meanwhile. It
+// returns the session id and the last seq the client had.
+func expiredInGap(t *testing.T, e *testEnv) (session any, seq uint64) {
+	t.Helper()
+	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice-short"}}))
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
+	snap := a.next()
+	a.kill()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		c := e.session(t, w["session"])
+		c.mu.Lock()
+		detached := c.sock == nil
+		c.mu.Unlock()
+		if detached {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the session never noticed its socket died")
+		}
+	}
+	time.Sleep(500 * time.Millisecond) // the token expires while detached
+	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'gap')"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // into the replay
+	return w["session"], seqOf(snap)
+}
+
+// A detached session whose token expired is resumed by the same user with a
+// fresh token: the replay has the row written meanwhile, and no expiry.
+func TestResumeWithFreshTokenAfterExpiryInGap(t *testing.T) {
+	e := setup(t)
+	session, seq := expiredInGap(t, e)
+	b, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "alice"},
+		"resume": map[string]any{"session": session, "seq": seq, "subs": []int{1}}}))
+	if w["resumed"] != true || w["user"].(map[string]any)["id"] != "alice" || w["authExp"] != nil {
+		t.Fatalf("welcome %v", w)
 	}
 	tx := b.next()
-	if en := entries(tx); tx["t"] != "tx" || en[0]["end"].(map[string]any)["code"] != CodeForbidden {
-		t.Fatalf("expected replayed FORBIDDEN end, got %v", tx)
+	if tx["t"] != "tx" || len(entries(tx)) != 1 || entries(tx)[0]["end"] != nil || entries(tx)[0]["reset"] != nil {
+		t.Fatalf("expected the gap row as ops, got %v", tx)
 	}
-	if r := b.next(); r["t"] != "authRes" || r["ok"] != false || r["err"].(map[string]any)["code"] != CodeAuthExpired {
-		t.Fatalf("expected replayed AUTH_EXPIRED, got %v", r)
+	if ops := entries(tx)[0]["ops"].([]any); len(ops) != 1 || ops[0].([]any)[2].([]any)[1] != "gap" {
+		t.Fatalf("ops %v", ops)
+	}
+	b.quiet(300 * time.Millisecond) // no AUTH_EXPIRED, no reset
+}
+
+// The same expired session resyncs when the fresh token is refused, or when
+// Authenticate returns an identity that has already expired.
+func TestResumeAfterExpiryInGapNeedsAValidIdentity(t *testing.T) {
+	e := setupWith(t, func(c *Config) {
+		auth := c.Authenticate
+		c.Authenticate = func(ctx context.Context, token string) (*Identity, error) {
+			if token == "alice-expired" {
+				return &Identity{UserID: "alice", ExpiresAt: time.Now().Add(-time.Second)}, nil
+			}
+			return auth(ctx, token)
+		}
+	})
+	for _, token := range []string{"nope", "alice-expired"} {
+		session, seq := expiredInGap(t, e)
+		_, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": token},
+			"resume": map[string]any{"session": session, "seq": seq, "subs": []int{1}}}))
+		if w["resumed"] != false {
+			t.Fatalf("token %q resumed: %v", token, w)
+		}
 	}
 }
 

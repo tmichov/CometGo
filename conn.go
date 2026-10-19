@@ -446,12 +446,23 @@ func (c *conn) setIdentity(ident *Identity) {
 }
 
 // expire downgrades to anonymous when a token lapses without refresh (§3.2).
-// It also runs while the session is detached; the result lands in replay.
+// A detached session keeps its identity instead: its phone is likely asleep and will
+// come back with a fresh token for the same user, which resumes it
+// (resumeSession); a downgrade would only fill the replay with resets that
+// resume then throws away. Sockets attach to a session only in
+// resumeSession, under authMu, so none can attach between the check and
+// the return. With no resume, the grace ends the session as usual.
 func (c *conn) expire(ident *Identity) {
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
 	if c.identity() != ident {
 		return // refreshed in the meantime
+	}
+	c.mu.Lock()
+	detached := c.sock == nil && !c.closed
+	c.mu.Unlock()
+	if detached {
+		return
 	}
 	c.setIdentity(nil)
 	c.a.engine.enqueue(rebindReq{c: c, ident: nil, after: &authResMsg{
@@ -552,9 +563,13 @@ func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr 
 	}
 	c.authMu.Lock()
 	defer c.authMu.Unlock()
-	// A different principal (login, logout or expiry during the gap) cannot
-	// take over the session's subscriptions; it resyncs under its own identity.
-	if !samePrincipal(c.identity(), ident) {
+	// A different principal (login or logout during the gap) cannot take
+	// over the session's subscriptions; it resyncs under its own identity.
+	// So does an identity that has already expired (Authenticate may return
+	// one): resumed, it would be downgraded at once. A session whose
+	// identity expired while detached keeps it (expire), so the same
+	// principal with a fresh token resumes it.
+	if !samePrincipal(c.identity(), ident) || (ident != nil && !ident.ExpiresAt.IsZero() && !ident.ExpiresAt.After(time.Now())) {
 		c.end()
 		return nil
 	}
