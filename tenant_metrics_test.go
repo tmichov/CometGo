@@ -82,20 +82,24 @@ func TestTenantMetricsRebindAndHook(t *testing.T) {
 	log.wait(t, MetricTenantSubs, func(m Metric) bool { return m.Tenant == "ACME" && m.Value == 0 })
 	// One 0, then the tenant is forgotten.
 	time.Sleep(2200 * time.Millisecond)
+	// Counted from its last non-zero report: a gauge between hello and the
+	// sub's bind may report ACME 0 before it ever has a sub.
 	log.mu.Lock()
-	var zeros, after int
+	var acme []float64
 	for _, m := range log.seen[MetricTenantSubs] {
 		if m.Tenant == "ACME" {
-			if m.Value == 0 {
-				zeros++
-			} else if zeros > 0 {
-				after++
-			}
+			acme = append(acme, m.Value)
 		}
 	}
 	log.mu.Unlock()
-	if zeros != 1 || after != 0 {
-		t.Fatalf("ACME after leaving: %d zero reports, %d others; want exactly one 0", zeros, after)
+	last := -1
+	for i, v := range acme {
+		if v != 0 {
+			last = i
+		}
+	}
+	if tail := acme[last+1:]; len(tail) != 1 {
+		t.Fatalf("ACME after leaving: %v; want exactly one 0", tail)
 	}
 
 	a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
@@ -150,23 +154,72 @@ func TestTenantKeptOnSamePrincipalRefresh(t *testing.T) {
 	}
 }
 
-// A resumed session keeps its tenant: its subs stay bound, and its calls
-// and their observers' runs still name it.
+// A resumed session keeps its tenant, even when the resume authenticates
+// the same principal with claims Config.Tenant would read differently.
 func TestTenantKeptOnResume(t *testing.T) {
 	log := &metricLog{}
-	e := setupWith(t, func(c *Config) { c.Metrics = log.hook })
-	auth := map[string]any{"token": "alice@acme"}
-	a, w := e.dial(t, resumeHello(map[string]any{"auth": auth}))
+	e := setupWith(t, func(c *Config) {
+		c.Metrics = log.hook
+		c.Authenticate = func(_ context.Context, token string) (*Identity, error) {
+			return &Identity{UserID: "alice", Data: token}, nil
+		}
+		c.Tenant = func(id *Identity) string { return id.Data.(string) }
+	})
+	a, w := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "one"}}))
 	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
 	snap := a.next()
 	a.kill()
-	b, w2 := e.dial(t, resumeHello(map[string]any{"auth": auth, "resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
+	b, w2 := e.dial(t, resumeHello(map[string]any{"auth": map[string]any{"token": "two"},
+		"resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
 	if w2["resumed"] != true {
 		t.Fatalf("not resumed: %v", w2)
 	}
 	b.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
 	waitRes(t, b, 1)
-	log.wait(t, MetricCall, func(m Metric) bool { return m.Method == "add" && m.Tenant == "acme" })
-	log.wait(t, MetricPubRun, func(m Metric) bool { return m.Pub == "items.mine" && m.Tenant == "acme" })
-	log.wait(t, MetricTenantSubs, func(m Metric) bool { return m.Tenant == "acme" && m.Value == 1 })
+	log.wait(t, MetricCall, func(m Metric) bool { return m.Method == "add" && m.Tenant == "one" })
+	log.wait(t, MetricPubRun, func(m Metric) bool { return m.Pub == "items.mine" && m.Tenant == "one" })
+	time.Sleep(1100 * time.Millisecond) // a round of gauges after the resume
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for name, ms := range log.seen {
+		for _, m := range ms {
+			if m.Tenant == "two" {
+				t.Fatalf("%s named the resumed claim's tenant: %+v", name, m)
+			}
+		}
+	}
+}
+
+// A detached run is attributed to the subs it ran for: a sub of another
+// tenant that joins while it runs does not make it a mixed observer's.
+func TestTenantOfDetachedRun(t *testing.T) {
+	log := &metricLog{}
+	e := setupFull(t, func(c *Config) {
+		fastDetach(c)
+		c.Metrics = log.hook
+	}, slowQ)
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice@acme"}})
+	settleListen(t, e, a)
+	subSlowQ(t, a, 1, 1500, 0)
+	log.mu.Lock()
+	from := len(log.seen[MetricPubRun])
+	log.mu.Unlock()
+	insertName(t, e, "w")
+	time.Sleep(800 * time.Millisecond) // detached, not finished
+	b, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "alice@globex"}})
+	b.send(map[string]any{"t": "sub", "s": 1, "name": "slowq", "args": map[string]any{"Ms": 1500, "K": 0}})
+	if names := rowNames(nextWithin(t, a, 10*time.Second), 1); len(names) != 1 {
+		t.Fatalf("detached result %v", names)
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for _, m := range log.seen[MetricPubRun][from:] {
+		if m.Pub == "slowq" {
+			if m.Tenant != "acme" {
+				t.Fatalf("detached run reported as %q, want acme (the tenant it ran for)", m.Tenant)
+			}
+			return
+		}
+	}
+	t.Fatal("no pub_run_seconds for the detached run")
 }

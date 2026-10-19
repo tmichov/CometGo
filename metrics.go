@@ -85,12 +85,15 @@ func (a *App) tenantOf(ident *Identity) (t string) {
 			t = ""
 		}
 	}()
-	return a.cfg.Tenant(ident)
+	if t = a.cfg.Tenant(ident); t == TenantMixed {
+		t = "" // would read as a mixed observer
+	}
+	return t
 }
 
 // TenantMixed is Metric.Tenant for an observer whose subscriptions belong
 // to more than one tenant, so its cost is not mixed up with untenanted
-// sessions' (""). Config.Tenant should not return it.
+// sessions' (""). Config.Tenant returning it counts as "".
 const TenantMixed = "*"
 
 // tenant is the tenant all of the observer's subs share, TenantMixed when
