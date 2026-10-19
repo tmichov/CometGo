@@ -82,3 +82,24 @@ make bench-feed
 
 It writes [feedbench.md](feedbench.md) (16 writers), [feedbench-64.md](feedbench-64.md) (64 writers) and [feedbench-wide.md](feedbench-wide.md) (16 writers, 1,800-byte rows, just under the TOAST threshold, since the logical feed decodes whole rows). The commit lock that NOTIFY takes shows more with more writers. As with cometload, the numbers are only comparable on one machine with nothing else heavy running. Like cometload, it drops and recreates its schema (`feedbench`) and publication on every run, so point it only at a database you can write to freely.
 
+### Several nodes (`-nodes`)
+
+With `-nodes N`, the logical modes run N `App`s on `FeedLogical`, each with its own slot (`cometgo_feedbench1` to `N`), as N nodes of one app would. Every transaction is then decoded N times. This is the measurement behind the M5 hub decision ([M5 design §8](../design/m5-hosted.md#8-milestones)). Besides throughput, the report gives what the slots cost the database over the measured window, summed over the slots:
+
+| Column | Source |
+|---|---|
+| walsender CPU | user + system time of the slots' walsenders, from `/proc/<pid>/stat` (PIDs from `pg_replication_slots.active_pid`), in cores |
+| decoded, spilled | `total_bytes` and `spill_bytes` of `pg_stat_replication_slots` (PostgreSQL 14+) |
+| retained WAL | `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`, the most one slot holds back, at the end of the window |
+| gate snapshots | the visibility gates' `pg_current_snapshot()` queries, from the `feed_snapshots` metric |
+
+The walsender PIDs are the database server's. With the compose Postgres they belong to the container, so pass `-proc "docker compose exec -T postgres cat"`, which prints `/proc/<pid>/stat` from inside it. Without `-proc` feedbench reads this machine's `/proc`, which is right only for a Postgres running directly on it. On managed Postgres neither works and the column says n/a.
+
+N nodes take N replication slots and N WAL senders. The compose Postgres allows 20 of each (`docker compose up -d postgres` recreates an older container with that setting); the report states both settings.
+
+```sh
+make bench-nodes
+```
+
+runs `logical` and `logical+fence` against `plain` for N = 1, 2, 5 and 10, 5 rounds each, and writes `feedbench-nodes-N.md`. Run it on an idle machine.
+
