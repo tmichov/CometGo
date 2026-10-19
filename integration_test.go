@@ -320,9 +320,15 @@ type client struct {
 
 func (e *testEnv) dial(t testing.TB, hello map[string]any) (*client, map[string]any) {
 	t.Helper()
+	return dialURL(t, "ws"+strings.TrimPrefix(e.srv.URL, "http"), hello)
+}
+
+// dialURL connects to url and completes the handshake with hello.
+func dialURL(t testing.TB, url string, hello map[string]any) (*client, map[string]any) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http"), &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
 	if err != nil {
 		t.Fatal(err)
 	}
