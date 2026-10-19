@@ -31,14 +31,18 @@ Creates a `Comet` and starts connecting immediately. With a schema generated fro
 
 | `ConnectOptions` field | Default | Meaning |
 |---|---|---|
-| `url?: string` | `ws(s)://<page host>/_comet` | WebSocket URL. A relative URL resolves against the page, and `http(s)` becomes `ws(s)`. Required outside a browser. An invalid URL makes `connect` throw. |
+| `url?: string` | `ws(s)://<page host>/_comet` | WebSocket URL. A relative URL resolves against the page, and `http(s)` becomes `ws(s)`. A `#fragment` is dropped. Required outside a browser, where a relative URL is refused. An invalid URL makes `connect` throw. |
 | `token?: TokenSource` | none | Bearer token. Omit it to use cookie sessions. |
 | `build?: string` | none | This client's build id, sent to the server in `hello`. |
 | `WebSocket?: typeof WebSocket` | global `WebSocket` | WebSocket implementation, for environments without a global one. |
 | `routeKey?: string` | a random id per `Comet` | Sent as the `route` query parameter on every connect, for a load balancer that hashes on it ([routing to nodes](server.md#routing-to-nodes)). Set it to the tenant or user id so their connections share a node. It shows up in access logs, so use an opaque id, never an email address. Any `route` already in `url` is replaced. The key is fixed for the `Comet`'s lifetime: `setToken` to another tenant keeps the old key, so create a new connection to change it. |
+| `lifecycle?: Lifecycle \| null` | browser: page visibility and `online`; elsewhere none | Where the client hears that the app came to the `foreground`, went to the `background`, or changed `network`: a function that subscribes to those events and returns an unsubscribe. See [Reconnects](#reconnects). `@cometgo/client/react-native` passes one for React Native. `null` turns it off. |
+| `closeInBackground?: boolean` | false | Close the connection as soon as the app goes to the `background`, and reconnect when it returns. The session stays resumable on the server for its `ResumeGrace`, so a short absence resumes without a resync. Needs a `lifecycle` that reports `background`. |
 
 ```ts
 type TokenSource = string | null | (() => string | null | Promise<string | null>);
+type LifecycleEvent = "foreground" | "background" | "network";
+type Lifecycle = (on: (e: LifecycleEvent) => void) => () => void;
 ```
 
 A function token source is called on every (re)connect, so it can return a freshly refreshed token. It is also called before the identity expires, to refresh it (see [Auth](#auth)). If it throws, the client logs a warning and does not connect: it tries again (calling the function again) with the usual reconnect backoff, and `status` stays `"disconnected"` meanwhile. Connecting anonymously instead would end a resumable session and look like a logout. So throw only for failures worth retrying (a network error reaching your auth service), and return `null` when there is no token and the client should connect anonymously.
@@ -52,12 +56,13 @@ A function token source is called on every (re)connect, so it can return a fresh
 | `status: ConnectionStatus` | `"connecting"`, `"connected"` (after the server's `welcome`) or `"disconnected"`. |
 | `user: unknown` | The authenticated user as the server sent it (`Identity.User`), or `null` when anonymous. |
 | `serverBuild?: string` | The server's `Config.Build` from the last `welcome`. Compare it with your own build to offer a reload. |
+| `resumed: boolean` | Whether the last connection resumed the session ([Reconnects](#reconnects)): `true` when nothing was resynced. |
 | `onChange(fn): () => void` | Calls `fn` whenever `status` or `user` changes. Returns an unsubscribe function. |
 | `subscribe<T>(name, args?): Subscription<T>` | Subscribes to a publication. See [Subscriptions](#subscriptions). |
 | `call<R>(m, args?, opts?): Promise<R>` | Calls a method. See [Calls](#calls). |
 | `callWithStatus<R>(m, args?, opts?): Promise<{ value: R; lag: boolean }>` | Like `call`, but also reports `lag`. |
 | `setToken(token: TokenSource): Promise<unknown>` | Logs in, refreshes, or logs out. See [Auth](#auth). |
-| `close(): void` | Closes the connection for good and stops reconnecting. It also removes the `online` and `visibilitychange` listeners the client added, so a closed client can be garbage-collected. Calls still waiting are rejected: those already sent with `CONNECTION_LOST` (their outcome is unknown), those never sent with `CANCELED`. A call made after `close()` is rejected at once with `CANCELED`. Subscriptions still `loading` end with `CANCELED` (their `ready` rejects); those with data keep their rows. A subscription made after `close()` is returned already ended with `CANCELED`, and nothing is sent. |
+| `close(): void` | Closes the connection for good and stops reconnecting. It also unsubscribes from the `lifecycle`, so a closed client can be garbage-collected. Calls still waiting are rejected: those already sent with `CONNECTION_LOST` (their outcome is unknown), those never sent with `CANCELED`. A call made after `close()` is rejected at once with `CANCELED`. Subscriptions still `loading` end with `CANCELED` (their `ready` rejects); those with data keep their rows. A subscription made after `close()` is returned already ended with `CANCELED`, and nothing is sent. |
 
 ## Subscriptions
 
@@ -179,9 +184,16 @@ try {
 
 The client reconnects by itself:
 
-- **Backoff.** Exponential with full jitter, starting at 500 ms and capped at 30 s, reset after a successful connection. In a browser it also retries immediately on the `online` event and when the tab becomes visible.
+- **Backoff.** Exponential with full jitter, starting at 500 ms and capped at 30 s, reset after a successful connection.
+- **Wake.** On a `foreground` or `network` event from the `lifecycle` (in a browser: the tab becoming visible, or `online`), the client checks its connection at once, because after a network change or a suspended app a connection often looks open but is dead:
+  - no connection: it reconnects now instead of waiting out the backoff (which is not reset, so a flapping network still backs off);
+  - still connecting, on a `network` event: it drops that attempt, which may be bound to the old network;
+  - open: it sends a ping and drops the connection if *nothing* arrives within 5 s. Any message counts, since the reply queues behind whatever the server is sending. It does not probe when a message arrived in the last second, probes one at a time, and after a probe dropped a connection does not probe the next one for 30 s;
+  - a token refresh that came due while the app was suspended (timers do not run there) runs now.
+
+  A dropped connection is given up at once, not when the platform reports it closed, which can take a minute; anything it delivers afterwards is ignored.
 - **Server shutdown.** When the server announces a graceful shutdown (`goaway`, [protocol §7.3](protocol.md#73-server-shutdown)), the client waits the delay the server chose (0–5 s) before reconnecting, instead of the backoff. Calls made in the meantime are held and sent on the new connection. Calls already sent resolve normally if their result arrives before the server closes the connection.
-- **Liveness.** If nothing arrives for the server's heartbeat interval (25 s by default), the client sends a ping. After the heartbeat interval plus 10 s of silence, it closes the connection (code 4408) and reconnects.
+- **Liveness.** If nothing arrives for the server's heartbeat interval (25 s by default), the client sends a ping. After the heartbeat interval plus 10 s of silence, it drops the connection (code 4408) and reconnects.
 - **Session resume.** When the server supports it, the client first tries to resume its session ([protocol §7.2](protocol.md#72-session-resume)). The server replays whatever the client missed, so subscriptions get no snapshot and calls in flight still get their results. The client acks what it has received about once a second, so the server can drop it from the replay buffer.
 - **Subscriptions** survive. While disconnected, `status` is `"resyncing"`. On a resumed session it goes back to `"ready"` and the missed updates are applied as usual. Otherwise each subscription is re-sent; the server sends a fresh snapshot, and the client swaps it in only once it is complete. Unchanged rows keep their objects, so the UI does not flicker.
 - **Calls** that were queued but never sent go out on the new connection. Calls (and `setToken`) that were sent and had no result yet depend on the reconnect:
