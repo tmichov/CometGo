@@ -1748,6 +1748,9 @@ type detachedDone struct {
 	out  queryOut
 	subs map[*subscription]uint64 // bound when it detached, with their bindSeq
 	tick uint64                   // the tick whose snapshot it ran on
+	// tenant is the observer's tenant when it detached: its metrics are
+	// for the subs it ran for, not those bound by the time it is applied.
+	tenant string
 }
 
 // detachRun hands obs's running query, and l whose transaction it runs in,
@@ -1756,7 +1759,7 @@ type detachedDone struct {
 func (e *engine) detachRun(obs *observer, l *lane, done <-chan queryOut) {
 	e.detachedN++
 	obs.inFlight, obs.knownSlow, obs.dirty = true, true, false
-	d := detachedDone{obs: obs, tick: e.tickN, subs: map[*subscription]uint64{}}
+	d := detachedDone{obs: obs, tick: e.tickN, subs: map[*subscription]uint64{}, tenant: obs.tenant()}
 	for sub := range obs.subs {
 		d.subs[sub] = sub.bindSeq
 	}
@@ -1794,7 +1797,7 @@ func (e *engine) applyDetached(d detachedDone) {
 	// tick again, so a query slow once is not kept off ticks for good.
 	obs.knownSlow = d.out.took >= e.a.cfg.SlowObserverAfter
 	if e.a.cfg.Metrics != nil {
-		e.a.report(Metric{Name: MetricPubRun, Pub: obs.pub.name, Tenant: obs.tenant(), Value: d.out.took.Seconds()})
+		e.a.report(Metric{Name: MetricPubRun, Pub: obs.pub.name, Tenant: d.tenant, Value: d.out.took.Seconds()})
 	}
 	staleAt := obs.dirtyAt
 	obs.dirtyAt, obs.dirtySinceAt = obs.dirtySinceAt, time.Time{}
@@ -1826,7 +1829,7 @@ func (e *engine) applyDetached(d detachedDone) {
 		return
 	}
 	if e.a.cfg.Metrics != nil && !staleAt.IsZero() {
-		e.a.report(Metric{Name: MetricStale, Pub: obs.pub.name, Tenant: obs.tenant(), Value: time.Since(staleAt).Seconds()})
+		e.a.report(Metric{Name: MetricStale, Pub: obs.pub.name, Tenant: d.tenant, Value: time.Since(staleAt).Seconds()})
 	}
 	ops := e.newResult(obs, runResult{cols: d.out.cols, keyIdx: d.out.keyIdx, res: d.out.res}, subs)
 	var opsJSON []json.RawMessage

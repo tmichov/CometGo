@@ -244,8 +244,8 @@ type Config struct {
 	// and fn runs of another principal than the connection's current one,
 	// never without Metrics. A token refresh for the same principal keeps
 	// the tenant it had: derive it only from UserID and ScopeKey, or from
-	// something fixed for the principal.
-	// It must be fast and safe for concurrent use; a panic counts as "".
+	// something fixed for the principal. It must be fast and safe for
+	// concurrent use; a panic, or TenantMixed ("*"), counts as "".
 	Tenant func(*Identity) string
 }
 
