@@ -31,6 +31,12 @@ export interface ConnectOptions {
   build?: string;
   /** WebSocket implementation, for non-browser environments. */
   WebSocket?: typeof WebSocket;
+  /** Sent as the `route` query parameter on every connect, for a load
+   * balancer that hashes on it to keep reconnects (and a tenant's users) on
+   * one node. Use an opaque id, e.g. the tenant id: it appears in access
+   * logs. Defaults to a random id kept for this client's lifetime. The
+   * server ignores it. */
+  routeKey?: string;
 }
 
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
@@ -168,6 +174,8 @@ export class Comet {
   serverBuild?: string;
 
   #opts: ConnectOptions;
+  // Random by default so keyless clients do not all hash to one node.
+  #routeKey: string;
   #ws?: WebSocket;
   #subs = new Map<number, Subscription<any>>();
   #calls = new Map<number, PendingCall>();
@@ -212,6 +220,7 @@ export class Comet {
 
   constructor(opts: ConnectOptions) {
     this.#opts = opts;
+    this.#routeKey = opts.routeKey ?? uuid();
     if (typeof window !== "undefined") {
       window.addEventListener("online", this.#onOnline);
       document.addEventListener("visibilitychange", this.#onVisible);
@@ -345,7 +354,7 @@ export class Comet {
     if (this.#closed || this.#ws) return;
     const WS = this.#opts.WebSocket ?? WebSocket;
     let cred = first;
-    const ws = new WS(this.#opts.url ?? defaultUrl(), [SUBPROTOCOL]);
+    const ws = new WS(routeUrl(this.#opts.url ?? defaultUrl(), this.#routeKey), [SUBPROTOCOL]);
     this.#ws = ws;
     this.#helloSent = false;
     ws.onopen = async () => {
@@ -871,6 +880,14 @@ function endClosed(sub: Subscription<any>): void {
 
 function canceled(): CometError {
   return new CometError({ code: "CANCELED", msg: "call canceled" });
+}
+
+// url with route=key set, keeping any query it has. A relative url resolves
+// against the page.
+function routeUrl(url: string, key: string): string {
+  const u = new URL(url, globalThis.location?.href);
+  u.searchParams.set("route", key);
+  return u.href;
 }
 
 function defaultUrl(): string {
