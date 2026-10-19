@@ -7,14 +7,10 @@ import "react-native-get-random-values";
 import { AppState } from "react-native";
 import NetInfo from "@react-native-community/netinfo";
 import { type Comet, connect, type ConnectOptions, type Schema, type TypedComet } from "./index.ts";
-import { nativeLifecycle } from "./native-lifecycle.ts";
+import { nativeLifecycle, withLifecycle } from "./native-lifecycle.ts";
 
 export { nativeLifecycle } from "./native-lifecycle.ts";
 export type { AppStateLike, NetInfoLike, NetInfoStateLike } from "./native-lifecycle.ts";
-
-// NetInfo's reachability check pings an external server; connected and the
-// network type are enough to know when to check the connection.
-NetInfo.configure({ reachabilityShouldRun: () => false });
 
 /**
  * connect, with the lifecycle wired to AppState and NetInfo, so the client
@@ -24,5 +20,5 @@ NetInfo.configure({ reachabilityShouldRun: () => false });
 export function connectNative(opts: ConnectOptions & { url: string }): Comet;
 export function connectNative<S extends Schema>(opts: ConnectOptions & { url: string }): TypedComet<S>;
 export function connectNative(opts: ConnectOptions & { url: string }): Comet {
-  return connect({ lifecycle: nativeLifecycle(AppState, NetInfo), ...opts });
+  return connect(withLifecycle(opts, nativeLifecycle(AppState, NetInfo)));
 }

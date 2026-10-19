@@ -6,8 +6,6 @@ declare module "react-native" {
   export const AppState: import("./native-lifecycle.ts").AppStateLike;
 }
 declare module "@react-native-community/netinfo" {
-  const NetInfo: import("./native-lifecycle.ts").NetInfoLike & {
-    configure(config: { reachabilityShouldRun?: () => boolean }): void;
-  };
+  const NetInfo: import("./native-lifecycle.ts").NetInfoLike;
   export default NetInfo;
 }

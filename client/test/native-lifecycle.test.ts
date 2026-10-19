@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { nativeLifecycle, type NetInfoStateLike } from "../src/native-lifecycle.ts";
+import { nativeLifecycle, withLifecycle, type NetInfoStateLike } from "../src/native-lifecycle.ts";
 import type { LifecycleEvent } from "../src/index.ts";
 
 // The React Native lifecycle against fake AppState and NetInfo, fed the
@@ -32,7 +32,7 @@ test("the identical events NetInfo fires at subscribe wake nothing", () => {
   assert.deepEqual(f.events, []);
 });
 
-test("signal-strength and reachability updates on the same network wake nothing", () => {
+test("signal-strength, reachability and generation updates wake nothing; only the network change does", () => {
   const f = fakes();
   f.net(wifi);
   f.net({ ...wifi, details: { ipAddress: "192.168.0.104", strength: 40 } as any });
@@ -85,4 +85,13 @@ test("unsubscribe removes both listeners", () => {
   const f = fakes();
   f.unsubscribe();
   assert.equal(f.removed(), 2);
+});
+
+test("withLifecycle: the native lifecycle unless the caller chose one", () => {
+  const native = () => () => {};
+  const own = () => () => {};
+  assert.equal(withLifecycle({ url: "ws://x" }, native).lifecycle, native);
+  assert.equal(withLifecycle({ url: "ws://x", lifecycle: undefined }, native).lifecycle, native); // spread config
+  assert.equal(withLifecycle({ url: "ws://x", lifecycle: null }, native).lifecycle, null);
+  assert.equal(withLifecycle({ url: "ws://x", lifecycle: own }, native).lifecycle, own);
 });

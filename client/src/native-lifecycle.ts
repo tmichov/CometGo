@@ -1,7 +1,7 @@
 // The React Native lifecycle for @cometgo/client/react-native, over
 // AppState- and NetInfo-shaped objects so it is tested without React Native.
 
-import type { Lifecycle } from "./index.ts";
+import type { ConnectOptions, Lifecycle } from "./index.ts";
 
 /** The part of React Native's AppState the lifecycle uses. */
 export interface AppStateLike {
@@ -19,6 +19,16 @@ export interface NetInfoStateLike {
 /** The part of NetInfo the lifecycle uses. */
 export interface NetInfoLike {
   addEventListener(fn: (state: NetInfoStateLike) => void): () => void;
+}
+
+/**
+ * opts with the native lifecycle unless the caller chose one: an explicit
+ * undefined keeps the default too (spreading it would turn the lifecycle
+ * off, since React Native has no browser lifecycle to fall back on), and
+ * null still turns it off.
+ */
+export function withLifecycle<O extends ConnectOptions>(opts: O, lifecycle: Lifecycle): Omit<O, "lifecycle"> & { lifecycle: Lifecycle | null } {
+  return { ...opts, lifecycle: opts.lifecycle === undefined ? lifecycle : opts.lifecycle };
 }
 
 /**
