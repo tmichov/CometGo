@@ -54,8 +54,51 @@ test("the default key is random per client and kept across reconnects", async ()
   // Drop a's socket; it reconnects after its backoff.
   const n = FakeWS.urls.length;
   FakeWS.all[0]!.onclose!({ code: 1006, reason: "" });
-  while (FakeWS.urls.length === n) await new Promise((r) => setTimeout(r, 10));
+  const deadline = Date.now() + 5000;
+  while (FakeWS.urls.length === n) {
+    if (Date.now() > deadline) assert.fail("no reconnect within 5 s");
+    await new Promise((r) => setTimeout(r, 10));
+  }
   a.close();
   b.close();
   assert.equal(route(FakeWS.urls.at(-1)!), ka);
+});
+
+test("the rest of the query keeps its bytes", async () => {
+  FakeWS.urls = [];
+  const comet = connect({ url: "ws://test/_comet?sig=a%20b~&route=old&flag", WebSocket: FakeWS as any, routeKey: "k/1" });
+  await settle();
+  comet.close();
+  assert.equal(FakeWS.urls[0], "ws://test/_comet?sig=a%20b~&flag&route=k%2F1");
+});
+
+test("an http(s) or relative url becomes ws(s)", async () => {
+  const saved = Object.getOwnPropertyDescriptor(globalThis, "location");
+  try {
+    FakeWS.urls = [];
+    const opts = { WebSocket: FakeWS as any, routeKey: "k" };
+    globalThis.location = { href: "https://app.test/page" } as Location;
+    const relative = connect({ ...opts, url: "/_comet" });
+    const byDefault = connect(opts);
+    globalThis.location = { href: "http://app.test/page" } as Location;
+    const http = connect({ ...opts, url: "http://other.test/c" });
+    await settle();
+    for (const c of [relative, byDefault, http]) c.close();
+    assert.deepEqual(FakeWS.urls, [
+      "wss://app.test/_comet?route=k",
+      "wss://app.test/_comet?route=k",
+      "ws://other.test/c?route=k",
+    ]);
+  } finally {
+    if (saved) Object.defineProperty(globalThis, "location", saved);
+    else delete (globalThis as any).location;
+  }
+});
+
+test("a bad url throws from connect", () => {
+  const opts = { WebSocket: FakeWS as any };
+  assert.throws(() => connect({ ...opts, url: "/_comet" }), TypeError); // relative, no page
+  assert.throws(() => connect(opts), /url is required/);
+  assert.throws(() => connect({ ...opts, url: "ws://[" }), TypeError);
+  assert.throws(() => connect({ ...opts, url: "ftp://test/c" }), /not ws/);
 });

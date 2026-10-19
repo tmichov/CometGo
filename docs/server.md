@@ -473,10 +473,28 @@ Without a `routeKey` the client uses a random id that it keeps for its lifetime,
 nginx:
 
 ```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 upstream comet {
     hash $arg_route consistent;
     server 10.0.0.1:8080;
     server 10.0.0.2:8080;
+}
+
+server {
+    listen 80;
+    location /_comet {
+        proxy_pass http://comet;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_read_timeout 1h;
+        proxy_next_upstream error timeout http_503;
+    }
 }
 ```
 
@@ -484,19 +502,29 @@ HAProxy:
 
 ```
 backend comet
+    mode http
     balance url_param route
     hash-type consistent
+    timeout tunnel 1h
+    retries 2
+    retry-on conn-failure empty-response 503
+    option redispatch
+    http-request set-header X-Forwarded-For %[src]
     server a 10.0.0.1:8080
     server b 10.0.0.2:8080
 ```
 
-Envoy: a `RING_HASH` (or `MAGLEV`) cluster, with the route's `hash_policy` set to `query_parameter: { name: route }`.
+Envoy: a `RING_HASH` (or `MAGLEV`) cluster, with the route's `hash_policy` set to `query_parameter: { name: route }`, `upgrade_configs: [{ upgrade_type: websocket }]` on the HttpConnectionManager, and a `retry_policy` with `retry_on: retriable-status-codes,connect-failure`, `retriable_status_codes: [503]` and the `previous_hosts` retry host predicate, so the retry tries another node.
 
-When a node leaves, the consistent hash moves only its keys: those clients reconnect to another node and resync, and everyone else stays put. A key that routes badly costs only observer sharing, never correctness.
+nginx and HAProxy here set `X-Forwarded-For` to the client address, replacing any the client sent. `MaxConnsPerIP` counts `ClientIP`, which defaults to the proxy's address, so with a limit set, have `ClientIP` return that header (see [Config](#config)).
+
+The retries matter: a node that refuses a connection with 503 (at `MaxConns` or `MaxConnsPerIP`, or shutting down) would otherwise get the same keys back on every reconnect, and those clients could not connect at all until it had room. With the retry, they connect to another node instead: they resync there and stop sharing that node's observers, but they work.
+
+When a node leaves, the consistent hash moves only its keys: those clients reconnect to another node and resync, and everyone else stays put. A key that routes to another node than its session's, or than its tenant's, costs a resync and observer sharing, not correctness.
 
 Two things to know:
 
-- **The key is chosen by the client.** A client can send any key, and so can pile connections onto one node. `MaxConns` and `MaxConnsPerIP` bound what that costs each node.
+- **The key is chosen by the client.** A client can send any key, and so can pile connections onto one node. `MaxConns` and `MaxConnsPerIP` cap the connections each node takes; past them, the retries above spill new connections onto other nodes.
 - **It is logged.** Load balancers log the query string by default, so use an opaque id (a tenant or user id), never an email address.
 
 ## Graceful shutdown
