@@ -24,9 +24,11 @@ services:
       - ./docker/pgbouncer:/etc/pgbouncer:ro
 
   # Consistent-hash routing on the client's route parameter, for make
-  # test-routing: two nodes on the host, behind this.
+  # test-routing: two nodes on the host, behind this. A profile, so a plain
+  # `docker compose up -d` (make db) does not start it.
   nginx:
     image: nginx:1.27-alpine
+    profiles: [routing]
     ports:
       - "54331:80"
     extra_hosts:

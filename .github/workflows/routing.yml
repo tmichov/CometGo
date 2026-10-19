@@ -18,12 +18,13 @@ jobs:
           go-version-file: go.mod
       - name: Start Postgres and nginx
         run: |
-          docker compose up -d postgres nginx
+          docker compose --profile routing up -d postgres nginx
           for i in $(seq 60); do
-            docker compose exec -T postgres pg_isready -U comet -d comet -h 127.0.0.1 && exit 0
+            docker compose exec -T postgres pg_isready -U comet -d comet -h 127.0.0.1 &&
+              curl -s -o /dev/null http://localhost:54331 && exit 0
             sleep 1
           done
-          docker compose logs
+          docker compose --profile routing logs
           exit 1
       - name: Routing test
         env:

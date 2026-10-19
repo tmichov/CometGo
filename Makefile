@@ -35,8 +35,9 @@ test-pgbouncer:
 	COMETGO_TEST_DIRECT_URL=postgres://comet:comet@localhost:54329/comet \
 	go test -count=1 .
 
-# Sticky routing through nginx (docker compose up -d nginx): the test runs two
-# nodes on ports 54341 and 54342 and connects through nginx on 54331.
+# Sticky routing through nginx (docker compose --profile routing up -d nginx):
+# the test runs two nodes on ports 54341 and 54342 and connects through nginx
+# on 54331.
 test-routing:
 	COMETGO_TEST_NGINX_URL=ws://localhost:54331 go test -count=1 -run TestRouting -v .
 

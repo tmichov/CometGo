@@ -20,9 +20,10 @@ func TestRoutingByRouteKey(t *testing.T) {
 	var nodes [2]*testEnv
 	for i, port := range []int{54341, 54342} {
 		nodes[i] = setup(t)
+		// All interfaces, not loopback: nginx reaches it over the docker bridge.
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("port %d busy (docker/nginx/nginx.conf names it): %v", port, err)
 		}
 		srv := &http.Server{Handler: nodes[i].app}
 		go srv.Serve(ln)

@@ -31,11 +31,11 @@ Creates a `Comet` and starts connecting immediately. With a schema generated fro
 
 | `ConnectOptions` field | Default | Meaning |
 |---|---|---|
-| `url?: string` | `ws(s)://<page host>/_comet` | WebSocket URL. `wss` is used when the page is served over `https`. Required outside a browser. |
+| `url?: string` | `ws(s)://<page host>/_comet` | WebSocket URL. A relative URL resolves against the page, and `http(s)` becomes `ws(s)`. Required outside a browser. An invalid URL makes `connect` throw. |
 | `token?: TokenSource` | none | Bearer token. Omit it to use cookie sessions. |
 | `build?: string` | none | This client's build id, sent to the server in `hello`. |
 | `WebSocket?: typeof WebSocket` | global `WebSocket` | WebSocket implementation, for environments without a global one. |
-| `routeKey?: string` | a random id per `Comet` | Sent as the `route` query parameter on every connect, for a load balancer that hashes on it ([routing to nodes](server.md#routing-to-nodes)). Set it to the tenant or user id so their connections share a node. It shows up in access logs, so use an opaque id, never an email address. Any `route` already in `url` is replaced. |
+| `routeKey?: string` | a random id per `Comet` | Sent as the `route` query parameter on every connect, for a load balancer that hashes on it ([routing to nodes](server.md#routing-to-nodes)). Set it to the tenant or user id so their connections share a node. It shows up in access logs, so use an opaque id, never an email address. Any `route` already in `url` is replaced. The key is fixed for the `Comet`'s lifetime: `setToken` to another tenant keeps the old key, so create a new connection to change it. |
 
 ```ts
 type TokenSource = string | null | (() => string | null | Promise<string | null>);

@@ -23,7 +23,8 @@ export class CometError extends Error {
 export type TokenSource = string | null | (() => string | null | Promise<string | null>);
 
 export interface ConnectOptions {
-  /** WebSocket URL. Defaults to ws(s)://<current host>/_comet. */
+  /** WebSocket URL; a relative or http(s) one becomes ws(s) on the page's
+   * host. Defaults to ws(s)://<current host>/_comet. */
   url?: string;
   /** Bearer token, or a function returning one. Omit for cookie sessions. */
   token?: TokenSource;
@@ -174,8 +175,9 @@ export class Comet {
   serverBuild?: string;
 
   #opts: ConnectOptions;
-  // Random by default so keyless clients do not all hash to one node.
-  #routeKey: string;
+  // The socket URL with its route key: random by default, so keyless
+  // clients do not all hash to one node.
+  #url: string;
   #ws?: WebSocket;
   #subs = new Map<number, Subscription<any>>();
   #calls = new Map<number, PendingCall>();
@@ -220,7 +222,8 @@ export class Comet {
 
   constructor(opts: ConnectOptions) {
     this.#opts = opts;
-    this.#routeKey = opts.routeKey ?? uuid();
+    // Built here so a bad url throws from connect(), not inside #open.
+    this.#url = routeUrl(opts.url, opts.routeKey ?? uuid());
     if (typeof window !== "undefined") {
       window.addEventListener("online", this.#onOnline);
       document.addEventListener("visibilitychange", this.#onVisible);
@@ -354,7 +357,7 @@ export class Comet {
     if (this.#closed || this.#ws) return;
     const WS = this.#opts.WebSocket ?? WebSocket;
     let cred = first;
-    const ws = new WS(routeUrl(this.#opts.url ?? defaultUrl(), this.#routeKey), [SUBPROTOCOL]);
+    const ws = new WS(this.#url, [SUBPROTOCOL]);
     this.#ws = ws;
     this.#helloSent = false;
     ws.onopen = async () => {
@@ -882,15 +885,17 @@ function canceled(): CometError {
   return new CometError({ code: "CANCELED", msg: "call canceled" });
 }
 
-// url with route=key set, keeping any query it has. A relative url resolves
-// against the page.
-function routeUrl(url: string, key: string): string {
-  const u = new URL(url, globalThis.location?.href);
-  u.searchParams.set("route", key);
+// url (default /_comet) resolved against the page, as ws(s), with route=key
+// replacing any route in its query. The rest of the query keeps its bytes.
+function routeUrl(url: string | undefined, key: string): string {
+  const base = globalThis.location?.href;
+  if (url === undefined && !base) throw new TypeError("cometgo: url is required outside a browser");
+  const u = new URL(url ?? "/_comet", base);
+  if (u.protocol === "https:") u.protocol = "wss:";
+  else if (u.protocol === "http:") u.protocol = "ws:";
+  if (u.protocol !== "ws:" && u.protocol !== "wss:") throw new TypeError(`cometgo: url ${u.href} is not ws(s) or http(s)`);
+  const q = u.search.slice(1).split("&").filter((p) => p && p !== "route" && !p.startsWith("route="));
+  q.push(`route=${encodeURIComponent(key)}`);
+  u.search = q.join("&");
   return u.href;
-}
-
-function defaultUrl(): string {
-  const { protocol, host } = globalThis.location;
-  return `${protocol === "https:" ? "wss" : "ws"}://${host}/_comet`;
 }
