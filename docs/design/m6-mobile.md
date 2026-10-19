@@ -88,8 +88,8 @@ React Native pauses JavaScript timers while the app is in the background, so not
 
 **Resume after expiry: changed, for a session the server knows is detached.** Today, when a detached session's identity reaches `ExpiresAt`, `expire` downgrades it to anonymous, rebinds every subscription and fills the replay buffer with resets; the phone then wakes with a fresh token for the same user, `resumeSession` refuses it (`samePrincipal`, anonymous against the user), and the work was wasted. The change:
 
-- while the session has no socket, `expire` only marks it expired and keeps its identity and subscriptions;
-- `resumeSession` accepts a hello whose freshly authenticated identity is the same principal as the stored one, installs it (as it does for a refresh today), and clears the mark;
+- while the session has no socket, `expire` leaves it alone: it keeps its identity and subscriptions (no mark is needed, since `resumeSession` compares the kept identity);
+- `resumeSession` accepts a hello whose freshly authenticated identity is the same principal as the stored one, installs it (as it does for a refresh today);
 - a hello without a valid token for that principal resyncs, as today; with no hello within the grace, the session ends, as today.
 
 **What it does not cover.** The server detaches a session only once it notices the socket is gone: up to `3 × Heartbeat` after iOS suspends the app, and on Android not until Doze or a network cut, since the native socket keeps answering pings (§9). An identity that expires before that is downgraded as today, and the resume resyncs. Apps with short-lived tokens should set `closeInBackground` (§2.5), which detaches the session at once. The check that the session has no socket runs under `authMu` and reads `c.sock` under `c.mu`; sockets attach to an existing session only inside `resumeSession`, under `authMu` too, so none can attach between the timer and the mark.
