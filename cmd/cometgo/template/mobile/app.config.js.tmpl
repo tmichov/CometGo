@@ -2,19 +2,19 @@
 // --insecure` for that one build: release builds otherwise refuse cleartext
 // (ws://) connections, and nothing here should allow them by default.
 module.exports = () => ({
-  name: {{printf "%q" .Name}},
-  slug: {{printf "%q" .Slug}},
+  name: {{json .Name}},
+  slug: {{json .Slug}},
   version: "1.0.0",
   orientation: "portrait",
   ios: {
-    bundleIdentifier: {{printf "%q" .BundleID}},
+    bundleIdentifier: {{json .BundleID}},
     infoPlist: {
       // A physical iPhone asks before reaching a server on the local network.
       NSLocalNetworkUsageDescription: "Connects to your development server on the local network.",
     },
   },
   android: {
-    package: {{printf "%q" .BundleID}},
+    package: {{json .BundleID}},
   },
   plugins: [
     ["expo-build-properties", { android: { usesCleartextTraffic: process.env.COMET_INSECURE === "1" } }],

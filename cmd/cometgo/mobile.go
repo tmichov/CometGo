@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,11 +30,34 @@ type mobileApp struct {
 }
 
 var (
-	// Android package and iOS bundle id rules together: two or more dot
-	// separated segments, each a letter followed by letters, digits or _.
-	bundleIDRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$`)
+	// What both platforms accept: Android segments start with a letter and
+	// allow _, iOS allows - but not _, so neither. Two or more segments.
+	bundleIDRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z][A-Za-z0-9]*)+$`)
 	slugRe     = regexp.MustCompile(`[^a-z0-9]+`)
+	// Java keywords and literals, which Android refuses as package segments
+	// (the list Expo's own check uses).
+	javaReserved = map[string]bool{}
 )
+
+func init() {
+	for _, w := range strings.Fields("abstract assert boolean break byte case catch char class const continue default do double else enum extends final finally float for goto if implements import instanceof int interface long native new package private protected public return short static super switch synchronized this throw throws transient try void volatile while true false null strictfp") {
+		javaReserved[w] = true
+	}
+}
+
+// validBundleID reports why id cannot be an Android package and iOS bundle
+// id, or "" if it can.
+func validBundleID(id string) string {
+	if !bundleIDRe.MatchString(id) {
+		return "use two or more dot-separated parts of letters and digits, each starting with a letter (com.example.todo)"
+	}
+	for _, seg := range strings.Split(id, ".") {
+		if javaReserved[seg] {
+			return fmt.Sprintf("%q is a Java keyword, which Android refuses in a package name", seg)
+		}
+	}
+	return ""
+}
 
 func mobileInit(args []string, stdout, stderr io.Writer) error {
 	fl := flag.NewFlagSet("cometgo mobile init", flag.ContinueOnError)
@@ -49,33 +73,48 @@ func mobileInit(args []string, stdout, stderr io.Writer) error {
 	if err := fl.Parse(args); err != nil {
 		return err
 	}
-	if fl.NArg() > 1 {
-		return errors.New("at most one directory")
-	}
 	dir := "mobile"
-	if fl.NArg() == 1 {
+	if fl.NArg() > 0 {
+		// Flags may also follow the directory.
 		dir = fl.Arg(0)
+		if err := fl.Parse(fl.Args()[1:]); err != nil {
+			return err
+		}
+		if fl.NArg() > 0 {
+			return errors.New("at most one directory")
+		}
 	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return err
 	}
-	app := mobileApp{Name: *name, BundleID: *bundleID, Port: strconv.Itoa(*port), ClientDep: *client}
+	// A path on disk becomes an absolute file: dependency: npm would read a
+	// relative one from the app's directory, not from here.
+	clientSpec := *client
+	if _, err := os.Stat(clientSpec); err == nil {
+		p, err := filepath.Abs(clientSpec)
+		if err != nil {
+			return err
+		}
+		clientSpec = "file:" + p
+	}
+	app := mobileApp{Name: *name, BundleID: *bundleID, Port: strconv.Itoa(*port), ClientDep: clientSpec}
 	if app.Name == "" {
 		app.Name = filepath.Base(abs)
 	}
 	app.Slug = strings.Trim(slugRe.ReplaceAllString(strings.ToLower(app.Name), "-"), "-")
 	if app.Slug == "" {
-		return fmt.Errorf("name %q has no letters or digits", app.Name)
+		return fmt.Errorf("name %q has no ASCII letters or digits to build the app's slug from; pass --name (and --bundle-id)", app.Name)
 	}
 	if app.BundleID == "" {
-		app.BundleID = "com.example." + strings.ReplaceAll(app.Slug, "-", "_")
-		if app.Slug[0] >= '0' && app.Slug[0] <= '9' {
-			app.BundleID = "com.example.app_" + strings.ReplaceAll(app.Slug, "-", "_")
+		last := strings.ReplaceAll(app.Slug, "-", "")
+		if last[0] >= '0' && last[0] <= '9' || javaReserved[last] {
+			last = "app" + last
 		}
+		app.BundleID = "com.example." + last
 	}
-	if !bundleIDRe.MatchString(app.BundleID) {
-		return fmt.Errorf("bundle id %q: use two or more dot-separated parts, each starting with a letter (com.example.todo)", app.BundleID)
+	if why := validBundleID(app.BundleID); why != "" {
+		return fmt.Errorf("bundle id %q: %s", app.BundleID, why)
 	}
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("port %d out of range", *port)
@@ -83,8 +122,8 @@ func mobileInit(args []string, stdout, stderr io.Writer) error {
 	if err := writeMobileApp(abs, app); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Created %s in %s.\n\nNext:\n  cd %s\n  npm install\n  cometgo run android   # or ios, on macOS\n\nThen generate the server's schema into %s (docs/codegen.md).\n",
-		app.Name, dir, dir, filepath.Join(dir, "schema.ts"))
+	fmt.Fprintf(stdout, "Created %s in %s.\n\nNext:\n  cd %q\n  npm install\n  npx expo run:android   # or run:ios, on macOS\n\nIn development the app connects to your server on port %s of the machine Metro runs on; the server must listen on all interfaces (\":%s\"). Generate the server's schema into %s (docs/codegen.md).\n",
+		app.Name, dir, dir, app.Port, app.Port, filepath.Join(dir, "schema.ts"))
 	if _, err := exec.LookPath("npm"); err != nil {
 		fmt.Fprintln(stdout, "\nnpm was not found: install Node.js 20 or later (https://nodejs.org) first.")
 	}
@@ -92,14 +131,50 @@ func mobileInit(args []string, stdout, stderr io.Writer) error {
 }
 
 // writeMobileApp copies the template into dir, which must be empty or
-// missing. *.tmpl files are rendered with app; "gitignore" becomes
-// ".gitignore" (a dotfile in the template would be left out of the embed).
+// missing. *.tmpl files are rendered with app (the json function quotes a
+// value for JSON and JavaScript alike); "gitignore" becomes ".gitignore" (a
+// dotfile in the template would be left out of the embed). It writes into a
+// temporary sibling and renames it, so a failure leaves no half app.
 func writeMobileApp(dir string, app mobileApp) error {
-	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
-		return fmt.Errorf("%s is not empty", dir)
-	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	exists := false
+	if entries, err := os.ReadDir(dir); err == nil {
+		if len(entries) > 0 {
+			return fmt.Errorf("%s is not empty", dir)
+		}
+		exists = true
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(dir), "."+filepath.Base(dir)+"-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	if err := renderTemplate(tmp, app); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return err
+	}
+	if exists {
+		if err := os.Remove(dir); err != nil { // empty, checked above
+			return err
+		}
+	}
+	return os.Rename(tmp, dir)
+}
+
+var templateFuncs = template.FuncMap{
+	"json": func(v any) (string, error) {
+		b, err := json.Marshal(v)
+		return string(b), err
+	},
+}
+
+func renderTemplate(dir string, app mobileApp) error {
 	root := "template/mobile"
 	return fs.WalkDir(mobileTemplate, root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -115,7 +190,7 @@ func writeMobileApp(dir string, app mobileApp) error {
 			return err
 		}
 		if strings.HasSuffix(out, ".tmpl") {
-			t, err := template.New(rel).Option("missingkey=error").Parse(string(b))
+			t, err := template.New(rel).Option("missingkey=error").Funcs(templateFuncs).Parse(string(b))
 			if err != nil {
 				return err
 			}

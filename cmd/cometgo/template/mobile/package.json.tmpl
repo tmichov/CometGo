@@ -1,16 +1,16 @@
 {
-  "name": "{{.Slug}}",
+  "name": {{json .Slug}},
   "version": "1.0.0",
   "main": "index.ts",
   "private": true,
   "scripts": {
     "start": "expo start --dev-client",
-    "android": "cometgo run android",
-    "ios": "cometgo run ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cometgo/client": "{{.ClientDep}}",
+    "@cometgo/client": {{json .ClientDep}},
     "@react-native-community/netinfo": "12.0.1",
     "expo": "~58.0.14",
     "expo-build-properties": "~58.0.11",
