@@ -609,6 +609,12 @@ func TestLogicalFeedCountsSnapshots(t *testing.T) {
 	fe.app.cfg.Metrics = log.hook
 	fe.start()
 	waitFor(t, "the slot", func() bool { return len(fe.notes()) > 0 }) // the restart's own snapshot
+	if len(fe.f.dropIn.Load().xip) > 0 {
+		// The restart's second pass polls too: from here on, only the gate does.
+		waitFor(t, "the second pass", func() bool {
+			return slices.ContainsFunc(fe.notes(), func(n notification) bool { return n.restart != nil && n.restart.xmax == 0 })
+		})
+	}
 	log.mu.Lock()
 	before := len(log.seen[MetricFeedSnapshots])
 	log.mu.Unlock()
