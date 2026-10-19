@@ -80,7 +80,13 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s := &socket{ws: ws, outSig: make(chan struct{}, 1), onDrain: a.engine.signal}
 	if a.cfg.Metrics != nil {
-		s.onSlow = func() { a.metric(MetricSlowClose, "", 1) }
+		s.onSlow = func() {
+			var t string
+			if c := s.owner.Load(); c != nil {
+				t = c.tenantName()
+			}
+			a.report(Metric{Name: MetricSlowClose, Tenant: t, Value: 1})
+		}
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	a.serve(s, cookieIdent, cookieErr)
@@ -189,6 +195,31 @@ type conn struct {
 	// coalescing mirrors whether the engine holds this session's changes
 	// as resets (§8.1). The engine's own map is authoritative.
 	coalescing atomic.Bool
+	// tenant is the current identity's tenant, set with it (setIdentity),
+	// so metrics need not call Config.Tenant again. Nil until then.
+	tenant atomic.Pointer[connTenant]
+}
+
+type connTenant struct {
+	ident *Identity
+	name  string
+}
+
+// tenantName is the tenant of the session's current identity.
+func (c *conn) tenantName() string {
+	if t := c.tenant.Load(); t != nil {
+		return t.name
+	}
+	return ""
+}
+
+// tenantFor is ident's tenant, from the session's cache when ident is its
+// current identity.
+func (c *conn) tenantFor(ident *Identity) string {
+	if t := c.tenant.Load(); t != nil && t.ident == ident {
+		return t.name
+	}
+	return c.a.tenantOf(ident)
 }
 
 type runningCall struct {
@@ -209,6 +240,9 @@ type socket struct {
 	outSig chan struct{}
 	// onDrain is called once the queue drops below drainAt (§8.1).
 	onDrain func()
+	// owner is the session the socket is attached to, for onSlow; nil
+	// before hello.
+	owner atomic.Pointer[conn]
 	// onSlow, if set, is called once if the socket is closed as a slow
 	// consumer (queue over its limit, or a write timeout).
 	onSlow func()
@@ -392,6 +426,7 @@ func (c *conn) identity() *Identity {
 
 // setIdentity installs ident and arms its expiry timer. Callers hold authMu.
 func (c *conn) setIdentity(ident *Identity) {
+	c.tenant.Store(&connTenant{ident: ident, name: c.a.tenantOf(ident)})
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ident = ident
@@ -471,6 +506,7 @@ func (a *App) hello(s *socket, msg *clientMsg, cookieIdent *Identity, cookieErr 
 	c.mu.Lock()
 	c.sock = s
 	c.mu.Unlock()
+	s.owner.Store(c)
 	c.send(a.welcome(c, ident, false))
 	if authErr != nil {
 		c.send(&authResMsg{T: "authRes", OK: false, Err: authErr})
@@ -542,6 +578,7 @@ func (a *App) resumeSession(s *socket, r *helloResume, ident *Identity, authErr 
 		c.grace = nil
 	}
 	c.sock = s
+	s.owner.Store(c)
 	// welcome, then the replay, then anything new: all under c.mu, so
 	// nothing interleaves.
 	s.push(welcome)
@@ -814,12 +851,21 @@ func (c *conn) call(msg *clientMsg, ident *Identity, hctx context.Context, r *ru
 		// client's cancel, so work a handler started with it survives the
 		// call (hctx's parent never cancels, so nothing leaks).
 	}()
+	var start time.Time
+	if c.a.cfg.Metrics != nil {
+		start = time.Now()
+	}
 	val, lag, err := c.runCall(msg, ident, hctx)
 	res := &resMsg{T: "res", ID: id, OK: err == nil, Val: val, Lag: lag}
 	if err != nil {
 		res.Err = c.a.toWireError(err, "method "+msg.M)
 	}
 	c.send(res)
+	// Registered methods only: msg.M comes from the client, and an exporter
+	// labelling by it would let a client create series at will.
+	if !start.IsZero() && c.a.methods[msg.M] != nil {
+		c.a.report(Metric{Name: MetricCall, Method: msg.M, Tenant: c.tenantFor(ident), Value: time.Since(start).Seconds()})
+	}
 }
 
 // runCall runs the handler with hctx, which the client's cancel cancels, and
@@ -940,9 +986,10 @@ func (c *conn) runCall(msg *clientMsg, ident *Identity, hctx context.Context) (v
 	}
 	if c.a.cfg.Metrics != nil {
 		// A lagged call's wait is observed too, so slow fences show.
-		c.a.metric(MetricFenceWait, "", time.Since(committed).Seconds())
+		t := c.tenantFor(ident)
+		c.a.report(Metric{Name: MetricFenceWait, Tenant: t, Value: time.Since(committed).Seconds()})
 		if lag {
-			c.a.metric(MetricFenceLag, "", 1)
+			c.a.report(Metric{Name: MetricFenceLag, Tenant: t, Value: 1})
 		}
 	}
 	return val, lag, nil
