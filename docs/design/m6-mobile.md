@@ -45,7 +45,7 @@ The idle age of a socket is not a signal: the server's heartbeat is a WebSocket-
 
 **Dropping never waits for `onclose`.** Dropping a socket (a failed probe, the liveness check, a `network` wake while connecting) closes it and runs the disconnect path at once, as `close()` on an unauthenticated socket already does. Everything the old socket does afterwards is ignored: `onmessage` gets the same `this.#ws !== ws` check `onopen` and `onclose` have, so a late `tx` part cannot land in the new socket's `#txParts` or move `#seq` after the resume hello went out (which would apply a replay twice); and a dropped socket that was still connecting and opens later is closed in its `onopen`. The server already handles the other side: a resume on a new socket fails the old one, and messages from a replaced socket are dropped.
 
-**On wake, the token is checked too.** Android keeps the app's timers running in the background but Doze defers them, `#refreshTimer` included. So `wake` refreshes the token if it is due (`#authExp`) before the server expires it.
+**On wake, the token is checked too.** React Native pauses JavaScript timers while the app is in the background (measured on Android 15, §9), `#refreshTimer` included, so a token can be due by the time the app returns. `wake` refreshes it if it is due (`#authExp`) before the server expires it.
 
 **Defaults.** In a browser (`window.addEventListener` and `document.addEventListener` exist): wake on `online` (`network`) and on the page becoming visible (`foreground`). Elsewhere: none, as in Node today.
 
@@ -80,7 +80,7 @@ Bearer tokens only (`Authenticate`); no cookies. The token source reads the toke
 
 ### 2.5 Background
 
-The client keeps its socket while the app is in the background; iOS suspends it within seconds, Android keeps it until Doze. An opt-in `backgroundDisconnectAfter` closes the socket after that long in the background, with a 4xxx code (1000 and 1001 end the session for good), so a long background costs neither battery nor a server connection, and the session still resumes within the grace. Off by default.
+React Native pauses JavaScript timers while the app is in the background, so nothing in the client runs there; on Android the native WebSocket stays open and keeps answering the server's heartbeat until Doze or the system cuts the network (§9), and iOS suspends the app. An opt-in `closeInBackground` closes the socket as soon as the app goes to the background (the `background` lifecycle event still runs JavaScript), with a 4xxx code (1000 and 1001 end the session for good): the session detaches at once and resumes within the grace when the app returns, and a long background costs neither a server connection nor battery. A delayed close ("after N seconds in the background") cannot work, since no timer fires there. Off by default.
 
 ## 3. Sleep and resume
 
@@ -92,7 +92,7 @@ The client keeps its socket while the app is in the background; iOS suspends it 
 - `resumeSession` accepts a hello whose freshly authenticated identity is the same principal as the stored one, installs it (as it does for a refresh today), and clears the mark;
 - a hello without a valid token for that principal resyncs, as today; with no hello within the grace, the session ends, as today.
 
-**What it does not cover.** The server detaches a session only once it notices the socket is gone: up to `3 × Heartbeat` after iOS suspends the app, and much later on Android, which keeps the socket until Doze. An identity that expires before that is downgraded as today, and the resume resyncs. Apps with short-lived tokens should set `backgroundDisconnectAfter` (§2.5), which detaches the session promptly. The check that the session has no socket runs under `authMu` and reads `c.sock` under `c.mu`; sockets attach to an existing session only inside `resumeSession`, under `authMu` too, so none can attach between the timer and the mark.
+**What it does not cover.** The server detaches a session only once it notices the socket is gone: up to `3 × Heartbeat` after iOS suspends the app, and on Android not until Doze or a network cut, since the native socket keeps answering pings (§9). An identity that expires before that is downgraded as today, and the resume resyncs. Apps with short-lived tokens should set `closeInBackground` (§2.5), which detaches the session at once. The check that the session has no socket runs under `authMu` and reads `c.sock` under `c.mu`; sockets attach to an existing session only inside `resumeSession`, under `authMu` too, so none can attach between the timer and the mark.
 
 **Security.** Replay data reaches only a client presenting a valid token for the same principal and scope, the bar any resume already has. `ExpiresAt` is not revocation: a user revoked while their phone sleeps keeps live subscriptions on the server, sending nothing, until the grace ends or a resume fails, and `Revalidate` still reaches detached sessions. The docs say so.
 
@@ -150,14 +150,15 @@ The template's `cometURL()`: `EXPO_PUBLIC_COMET_URL` if set (`build`, `run --ser
 
 The resumed/resynced outcome is observable: the client exposes whether its last connect resumed (`comet.resumed`), and the example shows it on screen.
 
-On an Android emulator and a physical Android device, with the todo example run by `cometgo run` (the same checks on an iOS simulator are a separate task, for a Mac):
+On a physical Android device, with the todo example run by `cometgo run` (the Android emulator crashes under KVM on the development machine, §9; the same checks on an iOS simulator are a separate task, for a Mac):
 
 - subscribes and shows rows; a call's result arrives after its data (read-your-writes);
-- backgrounded 30 s, then foregrounded: `resumed` is true;
-- backgrounded past `3 × Heartbeat + ResumeGrace` (run with `Heartbeat` 5 s and `ResumeGrace` 20 s, so 40 s): resyncs to the right state, no error shown;
-- with `backgroundDisconnectAfter` set, a token expiring while backgrounded, after the session detached, then foregrounded with a refreshable token: `resumed` is true (§3);
-- network off for 30 s, then on (emulator airplane mode): reconnects within 5 s of the network returning;
-- `cometgo build android --server wss://…` produces a release APK that installs and passes the checks above against that server, and, on the physical device:
+- backgrounded 30 s, then foregrounded: the data is current, with no resync and no error (the socket stays open on Android);
+- with `closeInBackground`, backgrounded 30 s: `resumed` is true;
+- with `closeInBackground`, backgrounded past `ResumeGrace` (run with `Heartbeat` 5 s and `ResumeGrace` 20 s): resyncs to the right state, no error shown;
+- with `closeInBackground`, a token expiring while backgrounded, then foregrounded with a refreshable token: `resumed` is true (§3);
+- Wi-Fi off for 30 s and back on (on Samsung phones airplane mode leaves Wi-Fi on, so Wi-Fi is switched off directly): reconnects within 5 s of the network returning;
+- `cometgo build android --server wss://…` produces a release APK that installs and passes the checks above against that server, and also:
   - Wi-Fi to cellular: reconnects within 5 s (against the public server; a dev server is reachable over only one of them),
   - forced Doze (`adb shell dumpsys battery unplug`, screen off, `adb shell dumpsys deviceidle force-idle`), then wake: reconnects within 5 s, still logged in.
 
@@ -168,6 +169,27 @@ CI bundles the example for both platforms and runs the client's React Native env
 ## 8. Out of M6
 
 Native Swift/Kotlin/Flutter clients, the Capacitor WebView build, `cometgo build ios`, hot code push served by CometGo, offline data and writes, push notifications, an emulator in CI.
+
+## 9. Device findings (CMTG-111)
+
+Measured on 2026-10-19 on a Samsung Galaxy S22 (Android 15, API 35) over USB with `adb reverse`, in an Expo SDK 58 / React Native 0.88 app (Hermes), development and release builds, against a test server with `Heartbeat` 5 s and `ResumeGrace` 20 s. The Android emulator (37.2.12) segfaults under KVM on the development machine's kernel (7.1.13), with or without a window and whatever the GPU mode; without KVM it runs but is too slow to use. iOS was not tested (CMTG-121).
+
+| Check | Result | Consequence |
+|---|---|---|
+| Globals | `window` exists without `addEventListener`; no `document`, `crypto` or `location`; `URL` exists | §1 confirmed |
+| The current client's constructor | without a polyfill: `ReferenceError: Property 'crypto' doesn't exist`; with `react-native-get-random-values`: `TypeError: undefined is not a function` (`window.addEventListener`) | §1 confirmed; both fixed by CMTG-112/113 |
+| `URL` setters (`protocol`, `search`) | work, and `searchParams` exists: Expo's `URL` is standard | §2.2 is needed for bare React Native only |
+| `onmessage` after `close()` | 6 messages delivered after `close()` on a socket receiving 1 per ms | the `onmessage` guard of §2.1 is required |
+| `close()` on a connecting socket | `readyState` becomes 2, but the socket then **opens** 3 s later and delivers a message; no `onclose` within 8 s | a dropped connecting socket must be closed in its `onopen` (§2.1); without it, it leaks |
+| `onclose` after `close()` on an unresponsive peer | 60 s, code 1006 (OkHttp waits for the close frame) | dropping must not wait for `onclose` (§2.1) |
+| `Origin` on the upgrade | `http://localhost:8080` for `ws://localhost:8080`; accepted by the same-origin check | §5: no server change |
+| NetInfo at subscribe | **three** identical events, not one | the lifecycle compares `(isConnected, type, ipAddress)` with the last seen value rather than skipping one event |
+| NetInfo on Wi-Fi off | `none` and a Wi-Fi event with `isInternetReachable: false`, then `cellular` (reachability `false`, then `true`, then again with `cellularGeneration` set); cellular has no `ipAddress` | the tuple comparison wakes once on the change to cellular; reachability flips are ignored as designed |
+| Airplane mode (`cmd connectivity airplane-mode enable`) | no NetInfo event: Samsung keeps Wi-Fi on in airplane mode when it was on | the exit criterion switches Wi-Fi off directly |
+| 40 s in the background | JavaScript timers paused (no ticks, no pings); the socket stayed open, the native WebSocket kept answering the server's heartbeat; on return everything resumed | §2.5 rewritten: no delayed close is possible; `closeInBackground` closes at once. Once, after Wi-Fi and airplane toggles, the socket was reset during a background spell and `onclose` (1006, "Connection reset") arrived on return; not reproduced |
+| Forced Doze for 60 s | the server dropped the socket (no pong); on wake `onclose` arrived at once (1006) | wake then finds no socket and reconnects (§2.1) |
+| Release build, `ws://localhost` | blocked: the WebSocket fails at once (1006) and `fetch` to `http://localhost` reaches nothing | §4.1's refusal of `ws://` for release builds is right |
+| Toolchain | Gradle 9.4.1 builds with JDK 25 (the system JDK; Fedora 44 no longer packages JDK 17); a clean debug build takes about 8 minutes; the release build is signed with the debug keystore | the CLI's prerequisite check accepts JDK 17 or later; `build android`'s debug-keystore warning is needed |
 
 ## Review
 
@@ -189,7 +211,7 @@ Filed in Backlog (module `mobile`) with these dependencies:
 | Task | What | Depends on |
 |---|---|---|
 | CMTG-111 | Verify the React Native behaviours this design takes from memory, on devices; append the findings here | |
-| CMTG-112 | Client: lifecycle hook, wake probe and its limits, dropping without `onclose`, stale-socket guards, token refresh on wake, `backgroundDisconnectAfter`, `resumed`, no `URL` setters (§2.1, §2.2, §2.5) | |
+| CMTG-112 | Client: lifecycle hook, wake probe and its limits, dropping without `onclose`, stale-socket guards, token refresh on wake, `closeInBackground`, `resumed`, no `URL` setters (§2.1, §2.2, §2.5) | |
 | CMTG-113 | `@cometgo/client/react-native`: `connectNative`, the `AppState`/`NetInfo` lifecycle, peer dependencies (§2.3) | CMTG-112 |
 | CMTG-114 | Server: resume a detached session whose identity expired, for the same principal (§3) | |
 | CMTG-115 | `cometgo` CLI and `mobile init` with the Expo template and `cometURL()` (§4.1–§4.3) | |
