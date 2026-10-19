@@ -456,9 +456,47 @@ The session is not resumed, and the client falls back to a full resync, when:
 
 A token refresh for the same user and `ScopeKey` is fine. A protocol error, or a deliberate close by the client (code 1000/1001, e.g. a page unload), ends the session for good; a heartbeat timeout or a slow-consumer close leaves it resumable. An anonymous session is resumable by whoever holds its session id, which the client keeps in memory only.
 
-**Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node (sticky sessions, e.g. by cookie or client IP). Without sticky routing everything still works, but a reconnect that lands on another node resyncs.
+**Multiple nodes.** Sessions live in the memory of the node that served them. Behind a load balancer, route a client's reconnects to the same node ([Routing to nodes](#routing-to-nodes)). Without that everything still works, but a reconnect that lands on another node resyncs.
 
 Memory cost: each disconnected session holds its subscriptions plus at most `ResumeBuffer` bytes for up to `ResumeGrace`. Connected sessions hold the unacknowledged tail, usually about one second of output. Set `ResumeGrace` negative to turn resume off.
+
+### Routing to nodes
+
+The TypeScript client sends a routing key as the `route` query parameter of the WebSocket URL, on every connect. Hash on it in the load balancer, with a consistent hash, to get two things:
+
+- a client's reconnects reach the node that holds its session, so it resumes instead of resyncing,
+- with `routeKey` set to the tenant (or user) id, a tenant's users share a node, and so share its observers: each query runs once per change on that node instead of once on every node.
+
+Without a `routeKey` the client uses a random id that it keeps for its lifetime, so keyless clients still spread across nodes and still resume. The server ignores the parameter.
+
+nginx:
+
+```nginx
+upstream comet {
+    hash $arg_route consistent;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+}
+```
+
+HAProxy:
+
+```
+backend comet
+    balance url_param route
+    hash-type consistent
+    server a 10.0.0.1:8080
+    server b 10.0.0.2:8080
+```
+
+Envoy: a `RING_HASH` (or `MAGLEV`) cluster, with the route's `hash_policy` set to `query_parameter: { name: route }`.
+
+When a node leaves, the consistent hash moves only its keys: those clients reconnect to another node and resync, and everyone else stays put. A key that routes badly costs only observer sharing, never correctness.
+
+Two things to know:
+
+- **The key is chosen by the client.** A client can send any key, and so can pile connections onto one node. `MaxConns` and `MaxConnsPerIP` bound what that costs each node.
+- **It is logged.** Load balancers log the query string by default, so use an opaque id (a tenant or user id), never an email address.
 
 ## Graceful shutdown
 

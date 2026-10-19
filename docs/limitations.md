@@ -27,7 +27,7 @@ The logical feed (`Config.Feed = FeedLogical`) avoids all three: no triggers and
 Nodes share nothing but Postgres:
 
 - **Database load grows with node count.** Every node keeps its own observers and re-runs them on every relevant change. Ten nodes that each serve subscribers of the same publication run its query ten times per change.
-- **Session resume needs sticky routing.** Sessions live in the memory of the node that served them. A reconnect that reaches another node falls back to a full resync ([Session resume](server.md#session-resume)).
+- **Session resume needs sticky routing.** Sessions live in the memory of the node that served them. A reconnect that reaches another node falls back to a full resync ([Session resume](server.md#session-resume)). Hash on the client's routing key in the load balancer to avoid that ([Routing to nodes](server.md#routing-to-nodes)).
 - Events, `Revalidate` and method fences do reach every node, through Postgres notifications.
 
 ## Re-runs are full queries

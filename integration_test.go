@@ -388,6 +388,23 @@ func TestUpgradeRequiresSubprotocol(t *testing.T) {
 	}
 }
 
+// The client's route parameter is for load balancers; the server ignores it.
+func TestRouteParamIgnored(t *testing.T) {
+	e := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(e.srv.URL, "http")+"/?route=acme", &websocket.DialOptions{Subprotocols: []string{Subprotocol}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ws.CloseNow() })
+	c := &client{t: t, ws: ws}
+	c.send(map[string]any{"t": "hello", "v": 1})
+	if w := c.next(); w["t"] != "welcome" {
+		t.Fatalf("expected welcome, got %v", w)
+	}
+}
+
 func TestSnapshotLiveDiffAndReadYourWrites(t *testing.T) {
 	e := setup(t)
 	if _, err := e.pool.Exec(context.Background(), "INSERT INTO "+e.table+" (owner, name) VALUES ('alice', 'first')"); err != nil {
