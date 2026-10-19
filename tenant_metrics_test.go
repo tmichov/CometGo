@@ -22,7 +22,7 @@ func waitRes(t *testing.T, c *client, id int) {
 }
 
 // Tenants default to Identity.ScopeKey. A single-tenant observer's runs name
-// its tenant; a shared observer with subs of two tenants names none.
+// its tenant; a shared observer with subs of two tenants names TenantMixed.
 func TestTenantMetrics(t *testing.T) {
 	log := &metricLog{}
 	e := setupWith(t, func(c *Config) { c.Metrics = log.hook })
@@ -38,7 +38,7 @@ func TestTenantMetrics(t *testing.T) {
 	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
 	waitRes(t, a, 1)
 	log.wait(t, MetricPubRun, func(m Metric) bool { return m.Pub == "items.mine" && m.Tenant == "acme" })
-	log.wait(t, MetricPubRun, func(m Metric) bool { return m.Pub == "items.all" && m.Tenant == "" })
+	log.wait(t, MetricPubRun, func(m Metric) bool { return m.Pub == "items.all" && m.Tenant == TenantMixed })
 	log.wait(t, MetricStale, func(m Metric) bool { return m.Pub == "items.mine" && m.Tenant == "acme" })
 	log.wait(t, MetricFn, func(m Metric) bool { return m.Pub == "items.mine" && m.Tenant == "acme" })
 	log.wait(t, MetricFn, func(m Metric) bool { return m.Pub == "items.all" && m.Tenant == "globex" })
@@ -80,6 +80,23 @@ func TestTenantMetricsRebindAndHook(t *testing.T) {
 	a.send(map[string]any{"t": "auth", "id": 1, "token": "alice@globex"})
 	log.wait(t, MetricTenantSubs, func(m Metric) bool { return m.Tenant == "GLOBEX" && m.Value == 1 })
 	log.wait(t, MetricTenantSubs, func(m Metric) bool { return m.Tenant == "ACME" && m.Value == 0 })
+	// One 0, then the tenant is forgotten.
+	time.Sleep(2200 * time.Millisecond)
+	log.mu.Lock()
+	var zeros, after int
+	for _, m := range log.seen[MetricTenantSubs] {
+		if m.Tenant == "ACME" {
+			if m.Value == 0 {
+				zeros++
+			} else if zeros > 0 {
+				after++
+			}
+		}
+	}
+	log.mu.Unlock()
+	if zeros != 1 || after != 0 {
+		t.Fatalf("ACME after leaving: %d zero reports, %d others; want exactly one 0", zeros, after)
+	}
 
 	a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
 	waitRes(t, a, 2)
@@ -131,4 +148,25 @@ func TestTenantKeptOnSamePrincipalRefresh(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A resumed session keeps its tenant: its subs stay bound, and its calls
+// and their observers' runs still name it.
+func TestTenantKeptOnResume(t *testing.T) {
+	log := &metricLog{}
+	e := setupWith(t, func(c *Config) { c.Metrics = log.hook })
+	auth := map[string]any{"token": "alice@acme"}
+	a, w := e.dial(t, resumeHello(map[string]any{"auth": auth}))
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
+	snap := a.next()
+	a.kill()
+	b, w2 := e.dial(t, resumeHello(map[string]any{"auth": auth, "resume": map[string]any{"session": w["session"], "seq": seqOf(snap), "subs": []int{1}}}))
+	if w2["resumed"] != true {
+		t.Fatalf("not resumed: %v", w2)
+	}
+	b.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
+	waitRes(t, b, 1)
+	log.wait(t, MetricCall, func(m Metric) bool { return m.Method == "add" && m.Tenant == "acme" })
+	log.wait(t, MetricPubRun, func(m Metric) bool { return m.Pub == "items.mine" && m.Tenant == "acme" })
+	log.wait(t, MetricTenantSubs, func(m Metric) bool { return m.Tenant == "acme" && m.Value == 1 })
 }

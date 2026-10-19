@@ -243,7 +243,7 @@ type Config struct {
 	// connection's principal (UserID and ScopeKey) changes and for calls
 	// and fn runs of another principal than the connection's current one,
 	// never without Metrics. A token refresh for the same principal keeps
-	// the tenant it had.
+	// the tenant it had. It should not return TenantMixed ("*").
 	// It must be fast and safe for concurrent use; a panic counts as "".
 	Tenant func(*Identity) string
 }
