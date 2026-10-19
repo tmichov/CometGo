@@ -213,10 +213,10 @@ func (c *conn) tenantName() string {
 	return ""
 }
 
-// tenantFor is ident's tenant, from the session's cache when ident is its
-// current identity.
+// tenantFor is ident's tenant, from the session's cache when ident is the
+// same principal as its current identity.
 func (c *conn) tenantFor(ident *Identity) string {
-	if t := c.tenant.Load(); t != nil && t.ident == ident {
+	if t := c.tenant.Load(); t != nil && samePrincipal(t.ident, ident) {
 		return t.name
 	}
 	return c.a.tenantOf(ident)
@@ -426,7 +426,13 @@ func (c *conn) identity() *Identity {
 
 // setIdentity installs ident and arms its expiry timer. Callers hold authMu.
 func (c *conn) setIdentity(ident *Identity) {
-	c.tenant.Store(&connTenant{ident: ident, name: c.a.tenantOf(ident)})
+	// A refresh to the same principal keeps the tenant: the subs bound for
+	// it are not rebound, and their tenant must match the session's.
+	if t := c.tenant.Load(); t == nil || !samePrincipal(t.ident, ident) {
+		c.tenant.Store(&connTenant{ident: ident, name: c.a.tenantOf(ident)})
+	} else {
+		c.tenant.Store(&connTenant{ident: ident, name: t.name})
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ident = ident

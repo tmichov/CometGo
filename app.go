@@ -240,8 +240,11 @@ type Config struct {
 	Metrics func(Metric)
 	// Tenant, if set, names the tenant an identity belongs to, for
 	// Metric.Tenant. Nil uses Identity.ScopeKey. It is called when a
-	// connection's identity changes and for calls and fn runs whose
-	// identity is not the connection's current one, never without Metrics.
+	// connection's principal (UserID and ScopeKey) changes and for calls
+	// and fn runs of another principal than the connection's current one,
+	// never without Metrics. A token refresh for the same principal keeps
+	// the tenant it had: derive it only from UserID and ScopeKey, or from
+	// something fixed for the principal.
 	// It must be fast and safe for concurrent use; a panic counts as "".
 	Tenant func(*Identity) string
 }

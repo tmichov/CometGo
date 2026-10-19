@@ -1,6 +1,7 @@
 package cometgo
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -97,4 +98,37 @@ func TestTenantHookPanicIsContained(t *testing.T) {
 	a.send(map[string]any{"t": "call", "id": 1, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
 	waitRes(t, a, 1)
 	log.wait(t, MetricCall, func(m Metric) bool { return m.Method == "add" && m.Tenant == "" })
+}
+
+// A token refresh for the same principal keeps its tenant, even when
+// Config.Tenant would now name another: the subs stay bound, and every
+// metric of the session keeps naming the tenant they were bound for.
+func TestTenantKeptOnSamePrincipalRefresh(t *testing.T) {
+	log := &metricLog{}
+	e := setupWith(t, func(c *Config) {
+		c.Metrics = log.hook
+		c.Authenticate = func(_ context.Context, token string) (*Identity, error) {
+			return &Identity{UserID: "alice", Data: token}, nil // same principal, other claims
+		}
+		c.Tenant = func(id *Identity) string { return id.Data.(string) }
+	})
+	a, _ := e.dial(t, map[string]any{"auth": map[string]any{"token": "one"}})
+	a.send(map[string]any{"t": "sub", "s": 1, "name": "items.mine"})
+	log.wait(t, MetricTenantSubs, func(m Metric) bool { return m.Tenant == "one" && m.Value == 1 })
+	a.send(map[string]any{"t": "auth", "id": 1, "token": "two"})
+	for m := a.next(); m["t"] != "authRes"; m = a.next() {
+	}
+	a.send(map[string]any{"t": "call", "id": 2, "m": "add", "args": map[string]any{"Owner": "alice", "Name": "n"}})
+	waitRes(t, a, 2)
+	log.wait(t, MetricCall, func(m Metric) bool { return m.Method == "add" && m.Tenant == "one" })
+	time.Sleep(1100 * time.Millisecond) // one more round of gauges
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for _, name := range []string{MetricTenantSubs, MetricTenantQueued, MetricCall, MetricFenceWait, MetricPubRun, MetricFn} {
+		for _, m := range log.seen[name] {
+			if m.Tenant == "two" {
+				t.Fatalf("%s named the refreshed claim's tenant: %+v", name, m)
+			}
+		}
+	}
 }
