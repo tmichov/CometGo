@@ -1,4 +1,4 @@
-.PHONY: db todo test test-logical test-pgbouncer test-routing chaos build gen gen-check bench bench-feed
+.PHONY: db todo test test-logical test-pgbouncer test-routing chaos build gen gen-check bench bench-feed bench-nodes
 
 db:
 	docker compose up -d
@@ -55,3 +55,10 @@ bench-feed:
 	go run ./cmd/feedbench -rounds 5 -writers 16 -out docs/bench/feedbench.md
 	go run ./cmd/feedbench -rounds 5 -writers 64 -out docs/bench/feedbench-64.md
 	go run ./cmd/feedbench -rounds 5 -writers 16 -payload 1800 -out docs/bench/feedbench-wide.md
+
+# Per-node slots at N = 1, 2, 5, 10 (M5 hub decision; docs/bench/README.md).
+bench-nodes:
+	for n in 1 2 5 10; do \
+		go run ./cmd/feedbench -rounds 5 -writers 16 -modes plain,logical,logical+fence -nodes $$n \
+			-proc "docker compose exec -T postgres cat" -out docs/bench/feedbench-nodes-$$n.md || exit 1; \
+	done

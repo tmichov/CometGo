@@ -1,8 +1,9 @@
 services:
   postgres:
     image: postgres:17-alpine
-    # Logical decoding, for the M4 change feed and cmd/feedbench.
-    command: ["postgres", "-c", "wal_level=logical"]
+    # Logical decoding, for the M4 change feed and cmd/feedbench; slots and
+    # senders for feedbench -nodes 10 plus the tests' own.
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20", "-c", "max_wal_senders=20"]
     environment:
       POSTGRES_USER: comet
       POSTGRES_PASSWORD: comet
