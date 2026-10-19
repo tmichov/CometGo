@@ -309,9 +309,14 @@ func logicalFeed(ctx context.Context, dsn string, n int, snapshots *atomic.Int64
 		}
 	}
 	var apps []*cometgo.App
+	var pools []*pgxpool.Pool
+	// Every App shuts down (dropping its slot) before any pool closes.
 	defer func() {
 		for _, app := range apps {
 			app.Shutdown(context.Background())
+		}
+		for _, pool := range pools {
+			pool.Close()
 		}
 	}()
 	for i := range n {
@@ -320,7 +325,7 @@ func logicalFeed(ctx context.Context, dsn string, n int, snapshots *atomic.Int64
 			ready <- err
 			return err
 		}
-		defer pool.Close()
+		pools = append(pools, pool)
 		app := cometgo.New(cometgo.Config{DB: pool, Feed: cometgo.FeedLogical, ReplicationDSN: dsn,
 			SlotName: fmt.Sprintf("feedbench%d", i+1), Metrics: metrics})
 		if err := app.Start(context.Background()); err != nil {
