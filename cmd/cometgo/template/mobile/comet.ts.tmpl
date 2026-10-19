@@ -1,0 +1,15 @@
+import Constants from "expo-constants";
+import { connectNative } from "@cometgo/client/react-native";
+import { cometURL } from "./comet-url";
+import type { Schema } from "./schema";
+
+// Inlined at build time by Expo: keep the full process.env.EXPO_PUBLIC_* names.
+export const comet = connectNative<Schema>({
+  url: cometURL(
+    { url: process.env.EXPO_PUBLIC_COMET_URL, port: process.env.EXPO_PUBLIC_COMET_PORT },
+    Constants.expoConfig?.hostUri,
+    __DEV__,
+    "{{.Port}}",
+  ),
+  // token: () => SecureStore.getItemAsync("token"), // bearer token auth; see docs/mobile.md
+});

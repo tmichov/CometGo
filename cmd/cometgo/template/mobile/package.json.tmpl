@@ -1,0 +1,28 @@
+{
+  "name": "{{.Slug}}",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "private": true,
+  "scripts": {
+    "start": "expo start --dev-client",
+    "android": "cometgo run android",
+    "ios": "cometgo run ios",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cometgo/client": "{{.ClientDep}}",
+    "@react-native-community/netinfo": "12.0.1",
+    "expo": "~58.0.14",
+    "expo-build-properties": "~58.0.11",
+    "expo-constants": "~58.0.12",
+    "expo-dev-client": "~58.0.14",
+    "expo-status-bar": "~58.0.3",
+    "react": "19.3.0",
+    "react-native": "0.88.0",
+    "react-native-get-random-values": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "typescript": "~6.0.3"
+  }
+}
